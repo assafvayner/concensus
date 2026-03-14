@@ -2,9 +2,13 @@
 
 ## Overview
 
-A Rust library implementing the Paxos consensus algorithm. The library provides a `Node<V, S, R>` struct that participates in the Paxos protocol to reach consensus on a sequence of values. Designed for modularity: users supply their own transport and can swap storage backends.
+A Rust library implementing the Paxos consensus algorithm. The library provides a `Node<V, S, R>` struct that participates in the Paxos protocol to reach consensus on a sequence of values. Each value is decided in an independent Paxos instance identified by a slot number. Designed for modularity: users supply their own transport and can swap storage backends.
 
-**Scope for v1:** Basic (single-decree) Paxos with in-memory storage. Architecture supports extension to Multi-Paxos and persistent storage (e.g., DuckDB) in future versions.
+**Scope for v1:** Multiple independent single-decree Paxos instances (one per slot), with in-memory acceptor state. Architecture supports extension to Multi-Paxos optimizations (stable leader, skipping prepare phase) and persistent storage (e.g., DuckDB) in future versions.
+
+**v1 limitations:**
+- Acceptor state is not persisted. A node that crashes and restarts has no memory of its promises or accepted values. Restarted nodes MUST use a new `NodeId` to avoid violating Paxos safety guarantees. Crash recovery with the same identity requires persistent acceptor state (future work).
+- No catch-up protocol. `Decide` messages are broadcast once. If a peer is disconnected when a `Decide` is sent, it will have a gap in its decision sequence. A gap-detection and catch-up mechanism (e.g., `GetDecision { slot }` request/response) is future work.
 
 ## Project Structure
 
@@ -35,35 +39,37 @@ concensus/
 // config.rs
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub struct NodeId(Arc<str>);
-// Implements: From<String>, From<&str>, Display
+// Implements: From<String>, From<&str>, Display, Ord, PartialOrd
 ```
 
-`Arc<str>` for cheap clones without lifetime parameters. Serializes as a plain string via serde.
+`Arc<str>` for cheap clones without lifetime parameters. Serializes as a plain string via serde. `Ord` is required because `NodeId` is part of `ProposalNumber` which needs total ordering. Note: `NodeId` ordering is lexicographic, so `"9" > "10"`. Users should use consistent-length identifiers (e.g., zero-padded numbers or UUIDs) if ordering matters to them.
 
 ### Transport Traits
 
 Transport operates on raw bytes. The library serializes its internal `Message<V>` types to bytes before passing to the transport layer. One sender + receiver pair per peer.
 
+Each `send()` call transmits exactly one complete message. Each `recv()` call returns exactly one complete message. Message framing (length-prefixing, delimiters, etc.) is the transport implementor's responsibility.
+
 ```rust
 // transport.rs
 #[async_trait]
-pub trait Sender: Send + 'static {
+pub trait MessageSender: Send + 'static {
     async fn send(&self, data: Bytes) -> Result<(), TransportError>;
 }
 
 #[async_trait]
-pub trait Receiver: Send + 'static {
+pub trait MessageReceiver: Send + 'static {
     async fn recv(&mut self) -> Result<Bytes, TransportError>;
 }
 ```
 
-Reconnection is the responsibility of the `Receiver` implementor. When a peer connection fails, the node continues operating with remaining peers as long as a quorum is reachable.
+Reconnection is the responsibility of the `MessageReceiver` implementor. When a peer connection fails, the node continues operating with remaining peers as long as a quorum is reachable.
 
 ### Peer Configuration
 
 ```rust
 // config.rs
-pub struct PeerConfig<S: Sender, R: Receiver> {
+pub struct PeerConfig<S: MessageSender, R: MessageReceiver> {
     pub id: NodeId,
     pub sender: S,
     pub receiver: R,
@@ -74,9 +80,12 @@ All peers use the same `S` and `R` types (one transport implementation per node)
 
 ### Node
 
+`Node::new()` returns the node and a `DecisionReceiver`. Internally, `propose()` communicates with the event loop via a channel, so a `NodeHandle` is split off to allow calling `propose()` after `run()` consumes the node.
+
 ```rust
 // node.rs
-pub struct Node<V, S: Sender, R: Receiver> { ... }
+pub struct Node<V, S: MessageSender, R: MessageReceiver> { ... }
+pub struct NodeHandle<V> { ... }
 
 pub type DecisionReceiver<V> = mpsc::Receiver<Decided<V>>;
 
@@ -89,29 +98,53 @@ pub struct Decided<V> {
 impl<V, S, R> Node<V, S, R>
 where
     V: Serialize + DeserializeOwned + Clone + Send + 'static,
-    S: Sender,
-    R: Receiver,
+    S: MessageSender,
+    R: MessageReceiver,
 {
     pub fn new(
         id: NodeId,
         peers: Vec<PeerConfig<S, R>>,
         storage: impl Storage<V> + Send + 'static,
-    ) -> (Self, DecisionReceiver<V>);
-
-    /// Submit a value for consensus. Returns when the proposal is enqueued.
-    pub async fn propose(&self, value: V) -> Result<(), ProposeError>;
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>);
 
     /// Run the protocol event loop. The caller drives this — either via
     /// tokio::spawn, on the main thread, or on a dedicated OS thread.
     pub async fn run(self) -> Result<(), NodeError>;
 }
+
+impl<V> NodeHandle<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + 'static,
+{
+    /// Submit a value for consensus. Returns when the proposal is enqueued.
+    /// The value will be assigned a slot and driven through the Paxos protocol.
+    pub async fn propose(&self, value: V) -> Result<(), ProposeError>;
+}
+
+impl<V> Clone for NodeHandle<V> { ... } // NodeHandle is cheaply cloneable (wraps an mpsc::Sender)
 ```
 
-**Future extension (not v1):** `propose()` could return a `DecisionFuture<V>` that resolves when the specific value is decided, allowing callers to await the outcome of their proposal.
+### Channel Configuration
+
+Both internal channels (proposal and decision) are bounded:
+
+- **Proposal channel** (NodeHandle -> event loop): bounded, default capacity 1024. Configurable via `NodeConfig` (future work). When full, `propose()` returns `ProposeError::ChannelFull`.
+- **Decision channel** (event loop -> DecisionReceiver): bounded, default capacity 1024. If the consumer falls behind and the channel fills, the event loop will block on sending decisions until the consumer catches up. This provides backpressure — the protocol pauses rather than dropping decisions.
+
+```rust
+// Future: NodeConfig for channel sizing
+// pub struct NodeConfig {
+//     pub proposal_channel_capacity: usize,  // default: 1024
+//     pub decision_channel_capacity: usize,  // default: 1024
+// }
+```
+```
+
+All nodes receive all decisions through `DecisionReceiver`, not just decisions for values they proposed. To correlate a proposal with its decision, the caller can scan the decision stream for their value (this requires the caller to track proposed values). **Future extension (not v1):** `propose()` could return a `DecisionFuture<V>` that resolves when the specific value is decided.
 
 ### Storage
 
-Only decided values go through the storage trait. Acceptor state (promises, accepted values) is held in memory.
+Only decided values go through the storage trait. Acceptor state (promises, accepted values) is held in memory only (see v1 limitations above).
 
 ```rust
 // storage.rs
@@ -133,11 +166,15 @@ impl<V> MemoryStorage<V> {
 }
 ```
 
+`Storage` is boxed internally by `Node` (as `Box<dyn Storage<V>>`) so it does not add a generic parameter to `Node`. The `&mut self` on `save_decision` is fine because the node event loop has exclusive ownership.
+
 Future backends (e.g., DuckDB) implement the same `Storage<V>` trait behind feature flags.
 
 ## Internal Design
 
 ### Protocol Messages
+
+All protocol messages carry a `slot` field to identify which Paxos instance they belong to.
 
 ```rust
 // message.rs (internal, serialized to JSON before transport)
@@ -146,36 +183,83 @@ pub type ProposalNumber = (u64, NodeId); // (round, proposer) — total ordering
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message<V> {
     // Phase 1
-    Prepare { proposal_number: ProposalNumber },
-    Promise {
+    Prepare {
+        slot: u64,
         proposal_number: ProposalNumber,
-        accepted: Option<(ProposalNumber, V)>,
+    },
+    Promise {
+        slot: u64,
+        proposal_number: ProposalNumber,
+        accepted: Option<(ProposalNumber, V)>, // highest previously accepted
     },
 
     // Phase 2
-    Accept { proposal_number: ProposalNumber, value: V },
-    Accepted { proposal_number: ProposalNumber },
+    Accept {
+        slot: u64,
+        proposal_number: ProposalNumber,
+        value: V,
+    },
+    Accepted {
+        slot: u64,
+        proposal_number: ProposalNumber,
+        value: V, // echo back accepted value for confirmation
+    },
 
     // Decision announcement
     Decide { slot: u64, value: V },
+
+    // Rejections (optimization — without these, stale proposers rely on timeouts)
+    Nack {
+        slot: u64,
+        proposal_number: ProposalNumber,       // the rejected proposal
+        highest_promised: ProposalNumber,       // so proposer can pick a higher number
+    },
 }
 ```
 
 `ProposalNumber` is `(u64, NodeId)` — compare by round first, break ties by node ID. Standard Paxos approach for total ordering.
 
+`Nack` messages allow a proposer to quickly learn its proposal was rejected and retry with a higher number, rather than waiting for a timeout. Sent by an acceptor when it receives a `Prepare` or `Accept` with a proposal number lower than its current promise.
+
+### Slot Allocation
+
+Each node maintains a `next_slot` counter, initialized to 0 (or to the highest known decided slot + 1 on startup via `load_decisions()`). When `propose()` is called:
+
+1. The node claims `next_slot` and increments the counter.
+2. It starts a new `PaxosInstance` for that slot.
+3. If the proposal fails (another value is decided for that slot), the node retries the value in a new slot.
+
+Multiple nodes may contend for the same slot. This is safe — Paxos guarantees at most one value is decided per slot. The losing proposer discovers this when it receives a `Decide` for a different value in that slot, and retries its value in the next available slot.
+
+**v1 known inefficiency:** On a fresh cluster, all nodes start at slot 0, so concurrent proposals always collide. This is correct but wasteful — every slot contention triggers a retry. Slot partitioning (e.g., interleaving by node index) or leader-based slot assignment would reduce contention but is deferred to Multi-Paxos optimizations.
+
 ### Paxos State Machine
 
 ```rust
 // protocol.rs (internal)
+
+/// Manages all active Paxos instances
+struct ProtocolState<V> {
+    node_id: NodeId,
+    instances: HashMap<u64, PaxosInstance<V>>,
+    next_slot: u64,
+    quorum_size: usize,
+}
+
+/// Per-slot Paxos instance
 struct PaxosInstance<V> {
     slot: u64,
     // Proposer state
     proposal_number: ProposalNumber,
     promises_received: HashSet<NodeId>,
+    accepts_received: HashSet<NodeId>,   // tracks Phase 2 Accepted responses for quorum
     highest_accepted: Option<(ProposalNumber, V)>,
+    proposed_value: Option<V>,
     // Acceptor state
     highest_promised: Option<ProposalNumber>,
     accepted: Option<(ProposalNumber, V)>,
+    // Resolution
+    decided: bool,
 }
 ```
 
@@ -184,14 +268,31 @@ struct PaxosInstance<V> {
 The `run()` method uses `tokio::select!` to multiplex:
 
 1. **Peer receivers** — incoming protocol messages from all peers
-2. **Proposal channel** — values submitted via `propose()`
-3. **Timers** — retries and timeouts for in-progress proposals
+2. **Proposal channel** — values submitted via `NodeHandle::propose()`
+3. **Retry timers** — for in-progress proposals that haven't received a quorum response
 
-Each event drives the state machine for the relevant slot. When a quorum of `Accepted` messages is received, the value is decided: stored via `Storage`, sent on the `DecisionReceiver`, and a `Decide` message is broadcast to all peers.
+Each event drives the state machine for the relevant slot. When a quorum of `Accepted` messages is received (tracked via `accepts_received`), the value is decided: stored via `Storage`, sent on the `DecisionReceiver`, and a `Decide` message is broadcast to all peers.
+
+### Instance Garbage Collection
+
+Once a slot is decided and the `Decide` message has been broadcast, the `PaxosInstance` for that slot is removed from the `instances` map. Late-arriving messages for a decided slot are ignored (the node checks `Storage` or a decided-slots set to recognize already-decided slots without keeping the full instance in memory).
+
+### Livelock Mitigation
+
+When multiple nodes propose simultaneously for the same slot, they can preempt each other with increasing proposal numbers. To mitigate:
+
+- On receiving a `Nack`, the proposer waits a random backoff (with exponential increase) before retrying with a higher proposal number.
+- The backoff introduces asymmetry that allows one proposer to complete. This is standard for Basic Paxos; full leader election is a Multi-Paxos optimization (future work).
 
 ### Quorum
 
 Quorum size = `(total_nodes / 2) + 1` where `total_nodes` includes the local node. The node can make progress as long as a quorum of nodes is reachable (including itself).
+
+**Cluster size notes:** Minimum cluster size is 1 (single node, trivially decides). A 2-node cluster requires unanimity (quorum = 2) and has zero fault tolerance. Recommended minimum for fault tolerance is 3 nodes (tolerates 1 failure). Odd-numbered clusters are preferred since even-numbered clusters waste a node (e.g., 4 nodes tolerates 1 failure, same as 3).
+
+### `NoQuorum` Error Semantics
+
+`Node::run()` returns `Err(NodeError::NoQuorum)` when the number of reachable peers drops below `quorum_size - 1` (i.e., even counting the local node, a quorum cannot be formed) AND there are active proposals that cannot make progress. The node does not immediately terminate on transient disconnections — it waits for peers to potentially reconnect (since reconnection is handled by the `MessageReceiver` implementor). If all peer receivers return permanent errors, the node concludes no quorum is possible and returns.
 
 ## Error Types
 
@@ -252,15 +353,27 @@ tracing = "0.1"
 
 | Decision | Rationale |
 |---|---|
-| Basic Paxos first | Correct, testable foundation; Multi-Paxos layered later |
+| Multiple single-decree instances | Each slot is an independent Paxos instance; simple and correct. Multi-Paxos optimizations are future work. |
 | Generic `V` with serde bounds | Type-safe; serde already needed for transport |
 | `NodeId(Arc<str>)` | Cheap clones, no lifetime params, clean serde |
 | Transport traits on `Bytes` | Decouples transport from protocol; transport doesn't know about `V` |
+| `MessageSender`/`MessageReceiver` names | Avoids collision with `std::marker::Send` and other common trait names |
 | Static dispatch for transport | Performance; all peers use same transport type |
+| `NodeHandle` split from `Node` | `run()` consumes `Node`; handle allows proposing after the event loop starts |
 | Caller-driven `run()` | User decides threading model (tokio::spawn, main thread, OS thread) |
 | `propose()` returns on enqueue | Simple for v1; decision-tracking future documented as extension |
 | `DecisionReceiver<V>` type alias | Clean API; wraps as stream trivially via `tokio_stream` |
-| Storage trait for decisions only | Acceptor state is ephemeral; keeps storage interface minimal |
+| All nodes receive all decisions | `DecisionReceiver` emits every decided value, not just local proposals |
+| Storage trait for decisions only | Acceptor state is ephemeral in v1; keeps storage interface minimal |
+| Storage boxed internally | Avoids adding a storage generic parameter to `Node` |
 | JSON serialization for v1 | Readable/debuggable; configurable serialization planned for later |
 | `tracing` for observability | De facto standard; opt-in for consumers |
 | Peer failure = continue | Paxos tolerates minority failures; reconnection is transport's job |
+| Nack messages included | Optimization over pure timeout-based retry; speeds up convergence |
+| Random backoff on Nack | Mitigates livelock without full leader election (future work) |
+| New NodeId required after crash | Without persistent acceptor state, reusing NodeId would violate safety |
+| One send/recv = one message | Message framing is transport implementor's responsibility |
+| Bounded channels with defaults | 1024 capacity for both proposal and decision channels; backpressure over dropping |
+| GC decided instances immediately | Prevents unbounded memory growth; late messages checked against decided-slots set |
+| No catch-up protocol in v1 | Simplicity; nodes may have gaps if disconnected during Decide broadcast |
+| Lexicographic NodeId ordering | Simple `Arc<str>` Ord; users use consistent-length IDs if ordering matters |
