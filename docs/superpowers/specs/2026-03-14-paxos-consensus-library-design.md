@@ -138,7 +138,6 @@ Both internal channels (proposal and decision) are bounded:
 //     pub decision_channel_capacity: usize,  // default: 1024
 // }
 ```
-```
 
 All nodes receive all decisions through `DecisionReceiver`, not just decisions for values they proposed. To correlate a proposal with its decision, the caller can scan the decision stream for their value (this requires the caller to track proposed values). **Future extension (not v1):** `propose()` could return a `DecisionFuture<V>` that resolves when the specific value is decided.
 
@@ -154,7 +153,7 @@ where
     V: Serialize + DeserializeOwned + Clone + Send,
 {
     async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError>;
-    async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError>;
+    async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError>; // unordered; node computes max(slot)+1
 }
 
 pub struct MemoryStorage<V> {
@@ -177,7 +176,7 @@ Future backends (e.g., DuckDB) implement the same `Storage<V>` trait behind feat
 All protocol messages carry a `slot` field to identify which Paxos instance they belong to.
 
 ```rust
-// message.rs (internal, serialized to JSON before transport)
+// message.rs (pub(crate), serialized to JSON before transport)
 pub type ProposalNumber = (u64, NodeId); // (round, proposer) — total ordering
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -209,7 +208,12 @@ pub enum Message<V> {
     Decide { slot: u64, value: V },
 
     // Rejections (optimization — without these, stale proposers rely on timeouts)
-    Nack {
+    NackPrepare {
+        slot: u64,
+        proposal_number: ProposalNumber,       // the rejected proposal
+        highest_promised: ProposalNumber,       // so proposer can pick a higher number
+    },
+    NackAccept {
         slot: u64,
         proposal_number: ProposalNumber,       // the rejected proposal
         highest_promised: ProposalNumber,       // so proposer can pick a higher number
@@ -219,17 +223,22 @@ pub enum Message<V> {
 
 `ProposalNumber` is `(u64, NodeId)` — compare by round first, break ties by node ID. Standard Paxos approach for total ordering.
 
-`Nack` messages allow a proposer to quickly learn its proposal was rejected and retry with a higher number, rather than waiting for a timeout. Sent by an acceptor when it receives a `Prepare` or `Accept` with a proposal number lower than its current promise.
+`Message<V>` is `pub(crate)` — it is not part of the public API. Transport implementors only see `Bytes`.
+
+`NackPrepare` and `NackAccept` are separate variants so the proposer knows which phase was rejected. On `NackPrepare`, the proposer must restart from Phase 1 with a higher proposal number. On `NackAccept`, the proposer must also restart from Phase 1 (since another proposer has made a higher promise, Phase 2 cannot succeed). Both carry `highest_promised` so the proposer can pick a number higher than any known promise.
 
 ### Slot Allocation
 
-Each node maintains a `next_slot` counter, initialized to 0 (or to the highest known decided slot + 1 on startup via `load_decisions()`). When `propose()` is called:
+Each node maintains a `next_slot` counter, initialized to 0 (or to `max(slot) + 1` over all slots returned by `load_decisions()` on startup). The counter is also advanced when the node learns of decided slots from other nodes: `next_slot = max(next_slot, decided_slot + 1)`. Gaps in the slot sequence are allowed in v1 (see v1 limitations — no catch-up protocol).
+
+When `propose()` is called:
 
 1. The node claims `next_slot` and increments the counter.
 2. It starts a new `PaxosInstance` for that slot.
-3. If the proposal fails (another value is decided for that slot), the node retries the value in a new slot.
+3. If a `Decide` for a **different value** arrives for that slot, the proposal has lost — the node retries its value in a new slot (using the current `next_slot`).
+4. If the proposer receives a `Nack` or times out waiting for a quorum, it retries in the **same slot** with a higher proposal number (after backoff). It only moves to a new slot when a different value is decided for the current slot.
 
-Multiple nodes may contend for the same slot. This is safe — Paxos guarantees at most one value is decided per slot. The losing proposer discovers this when it receives a `Decide` for a different value in that slot, and retries its value in the next available slot.
+Multiple nodes may contend for the same slot. This is safe — Paxos guarantees at most one value is decided per slot.
 
 **v1 known inefficiency:** On a fresh cluster, all nodes start at slot 0, so concurrent proposals always collide. This is correct but wasteful — every slot contention triggers a retry. Slot partitioning (e.g., interleaving by node index) or leader-based slot assignment would reduce contention but is deferred to Multi-Paxos optimizations.
 
@@ -262,6 +271,12 @@ struct PaxosInstance<V> {
     decided: bool,
 }
 ```
+
+### Protocol Rules
+
+**Self-vote:** When a node initiates Phase 1 (Prepare) or Phase 2 (Accept), it immediately processes the message as its own acceptor and records itself in the corresponding response set (`promises_received` or `accepts_received`). This is required for single-node clusters (quorum = 1) to decide trivially, and is standard Paxos behavior.
+
+**Phase 2 value selection:** When a proposer collects a quorum of `Promise` responses, it MUST use the value associated with the highest `ProposalNumber` among all `Promise` responses that carry an `accepted` value. Only if no `Promise` carries an accepted value may the proposer use its own originally proposed value. This is the core Paxos safety rule — it ensures that once a value is accepted by any majority, all future proposals will converge on that value.
 
 ### Event Loop (`Node::run`)
 
@@ -369,7 +384,7 @@ tracing = "0.1"
 | JSON serialization for v1 | Readable/debuggable; configurable serialization planned for later |
 | `tracing` for observability | De facto standard; opt-in for consumers |
 | Peer failure = continue | Paxos tolerates minority failures; reconnection is transport's job |
-| Nack messages included | Optimization over pure timeout-based retry; speeds up convergence |
+| Separate NackPrepare/NackAccept | Proposer knows which phase was rejected; both restart from Phase 1 |
 | Random backoff on Nack | Mitigates livelock without full leader election (future work) |
 | New NodeId required after crash | Without persistent acceptor state, reusing NodeId would violate safety |
 | One send/recv = one message | Message framing is transport implementor's responsibility |
@@ -377,3 +392,8 @@ tracing = "0.1"
 | GC decided instances immediately | Prevents unbounded memory growth; late messages checked against decided-slots set |
 | No catch-up protocol in v1 | Simplicity; nodes may have gaps if disconnected during Decide broadcast |
 | Lexicographic NodeId ordering | Simple `Arc<str>` Ord; users use consistent-length IDs if ordering matters |
+| Self-vote on propose | Proposer acts as own acceptor; required for single-node clusters |
+| Phase 2 highest-value rule | Core Paxos safety: adopt highest-numbered accepted value from promises |
+| `Message<V>` is `pub(crate)` | Internal protocol detail; transport only sees `Bytes` |
+| Retry same slot on Nack/timeout | Move to new slot only when different value decided for current slot |
+| `load_decisions` unordered | Node computes `max(slot)+1` from the vec; no ordering requirement on storage |
