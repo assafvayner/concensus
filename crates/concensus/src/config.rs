@@ -1,6 +1,13 @@
 use std::fmt;
 use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use crate::transport::{MessageSender, MessageReceiver};
+
+pub struct PeerConfig<S: MessageSender, R: MessageReceiver> {
+    pub id: NodeId,
+    pub sender: S,
+    pub receiver: R,
+}
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct NodeId {
@@ -95,5 +102,29 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(id1);
         assert!(set.contains(&id2));
+    }
+
+    #[test]
+    fn peer_config_holds_sender_and_receiver() {
+        use crate::transport::{MessageSender, MessageReceiver};
+        use crate::error::TransportError;
+        use bytes::Bytes;
+
+        struct DummySender;
+        #[async_trait::async_trait]
+        impl MessageSender for DummySender {
+            async fn send(&self, _data: Bytes) -> Result<(), TransportError> { Ok(()) }
+        }
+        struct DummyReceiver;
+        #[async_trait::async_trait]
+        impl MessageReceiver for DummyReceiver {
+            async fn recv(&mut self) -> Result<Bytes, TransportError> { Err(TransportError::Closed) }
+        }
+
+        let _config = PeerConfig {
+            id: NodeId::new("peer-1", 1000),
+            sender: DummySender,
+            receiver: DummyReceiver,
+        };
     }
 }
