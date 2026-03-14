@@ -7,7 +7,7 @@ A Rust library implementing the Paxos consensus algorithm. The library provides 
 **Scope for v1:** Multiple independent single-decree Paxos instances (one per slot), with in-memory acceptor state. Architecture supports extension to Multi-Paxos optimizations (stable leader, skipping prepare phase) and persistent storage (e.g., DuckDB) in future versions.
 
 **v1 limitations:**
-- Acceptor state is not persisted. A node that crashes and restarts has no memory of its promises or accepted values. Restarted nodes MUST use a new `NodeId` to avoid violating Paxos safety guarantees. Crash recovery with the same identity requires persistent acceptor state (future work).
+- Acceptor state is not persisted. A node that crashes and restarts has no memory of its promises or accepted values. This is safe because restarted nodes automatically get a new `NodeId` (same name, different incarnation timestamp), so the cluster treats them as a fresh participant. Crash recovery with the same identity (preserving promises) requires persistent acceptor state (future work).
 - No catch-up protocol. `Decide` messages are broadcast once. If a peer is disconnected when a `Decide` is sent, it will have a gap in its decision sequence. A gap-detection and catch-up mechanism (e.g., `GetDecision { slot }` request/response) is future work.
 
 ## Project Structure
@@ -37,12 +37,17 @@ concensus/
 
 ```rust
 // config.rs
-#[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
-pub struct NodeId(Arc<str>);
-// Implements: From<String>, From<&str>, Display, Ord, PartialOrd
+#[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct NodeId {
+    name: Arc<str>,       // user-provided, stable across restarts
+    incarnation: u64,     // unix timestamp (seconds), set automatically in Node::new()
+}
+// Implements: Display (formats as "name/incarnation"), e.g. "node-1/1710412800"
 ```
 
-`Arc<str>` for cheap clones without lifetime parameters. Serializes as a plain string via serde. `Ord` is required because `NodeId` is part of `ProposalNumber` which needs total ordering. Note: `NodeId` ordering is lexicographic, so `"9" > "10"`. Users should use consistent-length identifiers (e.g., zero-padded numbers or UUIDs) if ordering matters to them.
+`NodeId` combines a stable human-readable name with a per-run incarnation timestamp. This ensures a restarted node automatically gets a distinct identity (avoiding Paxos safety violations from stale promises) while remaining identifiable. The `name` component uses `Arc<str>` for cheap clones. `Node::new()` takes the name as a string and sets the incarnation to the current unix timestamp.
+
+`Ord` ordering: compares by `name` first (lexicographic), then by `incarnation`. Since `incarnation` is a `u64`, numeric ordering is correct. Users should use consistent naming if name-based ordering matters to them.
 
 ### Transport Traits
 
@@ -102,7 +107,7 @@ where
     R: MessageReceiver,
 {
     pub fn new(
-        id: NodeId,
+        name: impl Into<Arc<str>>,   // stable node name; incarnation set automatically
         peers: Vec<PeerConfig<S, R>>,
         storage: impl Storage<V> + Send + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>);
@@ -370,7 +375,7 @@ tracing = "0.1"
 |---|---|
 | Multiple single-decree instances | Each slot is an independent Paxos instance; simple and correct. Multi-Paxos optimizations are future work. |
 | Generic `V` with serde bounds | Type-safe; serde already needed for transport |
-| `NodeId(Arc<str>)` | Cheap clones, no lifetime params, clean serde |
+| `NodeId { name, incarnation }` | Name is stable/human-readable; incarnation (unix timestamp) ensures uniqueness per run, avoiding Paxos safety violations on restart |
 | Transport traits on `Bytes` | Decouples transport from protocol; transport doesn't know about `V` |
 | `MessageSender`/`MessageReceiver` names | Avoids collision with `std::marker::Send` and other common trait names |
 | Static dispatch for transport | Performance; all peers use same transport type |
@@ -386,12 +391,12 @@ tracing = "0.1"
 | Peer failure = continue | Paxos tolerates minority failures; reconnection is transport's job |
 | Separate NackPrepare/NackAccept | Proposer knows which phase was rejected; both restart from Phase 1 |
 | Random backoff on Nack | Mitigates livelock without full leader election (future work) |
-| New NodeId required after crash | Without persistent acceptor state, reusing NodeId would violate safety |
+| Auto-new incarnation on restart | Incarnation timestamp in NodeId ensures restarted nodes are distinct without user action |
 | One send/recv = one message | Message framing is transport implementor's responsibility |
 | Bounded channels with defaults | 1024 capacity for both proposal and decision channels; backpressure over dropping |
 | GC decided instances immediately | Prevents unbounded memory growth; late messages checked against decided-slots set |
 | No catch-up protocol in v1 | Simplicity; nodes may have gaps if disconnected during Decide broadcast |
-| Lexicographic NodeId ordering | Simple `Arc<str>` Ord; users use consistent-length IDs if ordering matters |
+| NodeId ordering: name then incarnation | Name-first lexicographic, then incarnation (u64); stable across restarts for same-named nodes |
 | Self-vote on propose | Proposer acts as own acceptor; required for single-node clusters |
 | Phase 2 highest-value rule | Core Paxos safety: adopt highest-numbered accepted value from promises |
 | `Message<V>` is `pub(crate)` | Internal protocol detail; transport only sees `Bytes` |
