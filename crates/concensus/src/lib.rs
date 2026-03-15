@@ -14,3 +14,6 @@ pub use transport::{MessageReceiver, MessageSender};
 
 #[cfg(feature = "channel-transport")]
 pub use transport::channel::{self as channel, channel, unbounded_channel, ChannelReceiver, ChannelSender};
+
+#[cfg(feature = "tcp-transport")]
+pub use transport::tcp::{TcpReceiver, TcpSender, TcpTransport};

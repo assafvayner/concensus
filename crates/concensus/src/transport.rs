@@ -5,6 +5,9 @@ use crate::error::TransportError;
 #[cfg(feature = "channel-transport")]
 pub mod channel;
 
+#[cfg(feature = "tcp-transport")]
+pub mod tcp;
+
 #[async_trait]
 pub trait MessageSender: Send + 'static {
     async fn send(&self, data: Bytes) -> Result<(), TransportError>;
