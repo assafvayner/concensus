@@ -41,8 +41,19 @@ struct Config {
     grpc_port: u16,
 }
 
+fn resolve_node_name() -> String {
+    // Prefer explicit NODE_NAME, fall back to container hostname
+    if let Ok(name) = std::env::var("NODE_NAME") {
+        return name;
+    }
+    hostname::get()
+        .expect("failed to get hostname")
+        .into_string()
+        .expect("hostname is not valid UTF-8")
+}
+
 fn parse_config() -> Config {
-    let node_name = std::env::var("NODE_NAME").expect("NODE_NAME env var required");
+    let node_name = resolve_node_name();
     let transport_str = std::env::var("TRANSPORT").expect("TRANSPORT env var required");
     let peers_str = std::env::var("PEERS").unwrap_or_default();
     let grpc_port: u16 = std::env::var("GRPC_PORT")
@@ -56,14 +67,16 @@ fn parse_config() -> Config {
                 .expect("BIND_ADDR required for tcp transport")
                 .parse()
                 .expect("BIND_ADDR must be a valid socket address");
-            let peers = parse_tcp_peers(&peers_str);
+            let mut peers = parse_tcp_peers(&peers_str);
+            peers.retain(|(id, _)| id.name() != node_name);
             Transport::Tcp { bind_addr, peers }
         }
         "uds" => {
             let bind_path: PathBuf = std::env::var("BIND_PATH")
-                .expect("BIND_PATH required for uds transport")
+                .unwrap_or_else(|_| format!("/sockets/{}.sock", node_name))
                 .into();
-            let peers = parse_uds_peers(&peers_str);
+            let mut peers = parse_uds_peers(&peers_str);
+            peers.retain(|(id, _)| id.name() != node_name);
             Transport::Uds { bind_path, peers }
         }
         other => panic!("TRANSPORT must be 'tcp' or 'uds', got '{}'", other),

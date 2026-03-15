@@ -1,59 +1,32 @@
+x-node: &node-base
+  build: .
+  environment: &node-env
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "node-1=node-1:9000,node-2=node-2:9000,node-3=node-3:9000"
+    GRPC_PORT: "50051"
+    RUST_LOG: info
+  healthcheck:
+    test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - consensus-net
+
 services:
   node-1:
-    build: .
-    environment:
-      TRANSPORT: tcp
-      NODE_NAME: node-1
-      BIND_ADDR: "0.0.0.0:9000"
-      PEERS: "node-2=node-2:9000,node-3=node-3:9000"
-      GRPC_PORT: "50051"
-      RUST_LOG: info
+    <<: *node-base
+    hostname: node-1
     ports:
       - "50051:50051"
-    healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    networks:
-      - consensus-net
-
   node-2:
-    build: .
-    environment:
-      TRANSPORT: tcp
-      NODE_NAME: node-2
-      BIND_ADDR: "0.0.0.0:9000"
-      PEERS: "node-1=node-1:9000,node-3=node-3:9000"
-      GRPC_PORT: "50051"
-      RUST_LOG: info
-    healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    networks:
-      - consensus-net
-
+    <<: *node-base
+    hostname: node-2
   node-3:
-    build: .
-    environment:
-      TRANSPORT: tcp
-      NODE_NAME: node-3
-      BIND_ADDR: "0.0.0.0:9000"
-      PEERS: "node-1=node-1:9000,node-2=node-2:9000"
-      GRPC_PORT: "50051"
-      RUST_LOG: info
-    healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    networks:
-      - consensus-net
+    <<: *node-base
+    hostname: node-3
 
 networks:
   consensus-net:
