@@ -1,5 +1,7 @@
 x-node: &node-base
-  build: ../..
+  build:
+    context: ../..
+    dockerfile: crates/concensus-demo/Dockerfile
   environment: &node-env
     TRANSPORT: tcp
     BIND_ADDR: "0.0.0.0:9000"
