@@ -1,6 +1,6 @@
 x-node: &node-base
   build:
-    context: ../..
+    context: ..
     dockerfile: concensus-demo/Dockerfile
     args:
       FEATURES: multi-paxos

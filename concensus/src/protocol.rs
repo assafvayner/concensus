@@ -344,7 +344,15 @@ where
             tracing::debug!(slot, "promise quorum reached, starting Phase 2");
             #[cfg(feature = "multi-paxos")]
             {
-                let term = self.instances.get(&slot).unwrap().proposal_number.0;
+                let inst = self.instances.get(&slot).unwrap();
+                let term = inst.proposal_number.0;
+                // If this is an election-only slot (no proposed value), just become
+                // leader and clean up. No Phase 2 needed.
+                if inst.proposed_value.is_none() {
+                    self.become_leader(term);
+                    self.instances.remove(&slot);
+                    return vec![];
+                }
                 self.become_leader(term);
             }
             self.start_phase2(slot)
