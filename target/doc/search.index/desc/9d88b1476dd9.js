@@ -1,1 +1,0 @@
-rd_("AoReturns the argument unchanged.000000000000000000000000BaCalls <code>U::from(self)</code>.000000000000000000000000DjCreates a bounded channel pair. <code>send()</code> waits for capacity \xe2\x80\xa6DdCreates an unbounded channel pair. <code>send()</code> never blocks.")
