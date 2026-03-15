@@ -1,5 +1,5 @@
 x-node: &node-base
-  build: .
+  build: ../..
   environment: &node-env
     TRANSPORT: tcp
     BIND_ADDR: "0.0.0.0:9000"
