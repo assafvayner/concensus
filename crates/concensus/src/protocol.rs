@@ -39,7 +39,6 @@ pub(crate) struct ProtocolState<V> {
 
 /// Per-slot Paxos instance
 pub(crate) struct PaxosInstance<V> {
-    slot: u64,
     // Proposer state (Phase 1 promise tracking + Phase 2 accept tracking)
     pub(crate) proposal_number: ProposalNumber,
     promises_received: HashSet<NodeId>,
@@ -63,9 +62,8 @@ pub(crate) struct PaxosInstance<V> {
 }
 
 impl<V> PaxosInstance<V> {
-    fn new(slot: u64) -> Self {
+    fn new(_slot: u64) -> Self {
         Self {
-            slot,
             proposal_number: (0, NodeId::new("", 0)),
             promises_received: HashSet::new(),
             accepts_received: HashSet::new(),
@@ -173,7 +171,7 @@ where
 
         let instance = self.get_or_create_instance(slot);
 
-        if instance.highest_promised.as_ref().map_or(true, |hp| proposal_number > *hp) {
+        if instance.highest_promised.as_ref().is_none_or(|hp| proposal_number > *hp) {
             instance.highest_promised = Some(proposal_number.clone());
             vec![Outgoing {
                 target: SendTarget::Peer(from),
@@ -211,7 +209,7 @@ where
 
         let instance = self.get_or_create_instance(slot);
 
-        if instance.highest_promised.as_ref().map_or(true, |hp| proposal_number >= *hp) {
+        if instance.highest_promised.as_ref().is_none_or(|hp| proposal_number >= *hp) {
             instance.highest_promised = Some(proposal_number.clone());
             instance.accepted = Some((proposal_number.clone(), value.clone()));
             vec![Outgoing {
@@ -252,12 +250,13 @@ where
 
         // Track highest accepted value from promises (core Paxos safety rule)
         if let Some((pn, val)) = accepted {
-            if instance.highest_accepted.as_ref().map_or(true, |(existing_pn, _)| pn > *existing_pn) {
+            if instance.highest_accepted.as_ref().is_none_or(|(existing_pn, _)| pn > *existing_pn) {
                 instance.highest_accepted = Some((pn, val));
             }
         }
 
         if instance.promises_received.len() >= quorum_size {
+            tracing::debug!(slot, "promise quorum reached, starting Phase 2");
             self.start_phase2(slot)
         } else {
             vec![]
@@ -285,6 +284,7 @@ where
         instance.accepts_received.insert(from);
 
         if instance.accepts_received.len() >= quorum_size {
+            tracing::debug!(slot, "accepted quorum reached, deciding");
             // Use the value from our own accepted state (proposer knows what it sent)
             let value = instance.accepted.as_ref().unwrap().1.clone();
             instance.decided = true;
@@ -322,10 +322,11 @@ where
     // -- Nack handler --
     fn handle_nack(&mut self, slot: u64, highest_promised: ProposalNumber) {
         if let Some(instance) = self.instances.get_mut(&slot) {
+            let round = highest_promised.0;
+            tracing::debug!(slot, round, "nacked, will retry");
             instance.nacked = true;
             instance.last_nack_time = Some(Instant::now());
-            let round = highest_promised.0;
-            if instance.highest_seen_nack.map_or(true, |r| round > r) {
+            if instance.highest_seen_nack.is_none_or(|r| round > r) {
                 instance.highest_seen_nack = Some(round);
             }
         }
@@ -389,7 +390,7 @@ where
         // have updated highest_promised.
         let can_self_accept = instance.highest_promised
             .as_ref()
-            .map_or(true, |hp| proposal_number >= *hp);
+            .is_none_or(|hp| proposal_number >= *hp);
 
         if can_self_accept {
             instance.highest_promised = Some(proposal_number.clone());

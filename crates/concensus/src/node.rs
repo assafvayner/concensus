@@ -53,7 +53,7 @@ where
     pub fn new(
         name: impl Into<Arc<str>>,
         peers: Vec<PeerConfig<S, R>>,
-        storage: impl Storage<V> + Send + 'static,
+        storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let incarnation = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -67,7 +67,7 @@ where
     pub fn with_id(
         node_id: NodeId,
         peers: Vec<PeerConfig<S, R>>,
-        storage: impl Storage<V> + Send + 'static,
+        storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         Self::with_id_inner(node_id, peers, storage)
     }
@@ -75,7 +75,7 @@ where
     fn with_id_inner(
         node_id: NodeId,
         peers: Vec<PeerConfig<S, R>>,
-        storage: impl Storage<V> + Send + 'static,
+        storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
         let protocol = ProtocolState::new(node_id.clone(), total_nodes);
