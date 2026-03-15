@@ -8,6 +8,7 @@ channel-transport = []
 test-support = []
 tcp-transport = ["tokio/net", "tokio/io-util"]
 uds-transport = ["tokio/net", "tokio/io-util"]
+duckdb-storage = ["dep:duckdb"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
@@ -18,6 +19,7 @@ async-trait = "0.1"
 thiserror = "2"
 tracing = "0.1"
 rand = "0.10"
+duckdb = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
