@@ -3,6 +3,10 @@ name = "concensus"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+channel-transport = []
+tcp-transport = ["tokio/net", "tokio/io-util"]
+
 [dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 serde = { version = "1", features = ["derive"] }
