@@ -217,6 +217,18 @@ where
             .map_err(NodeError::Storage)?;
         self.protocol.initialize_from_decisions(decisions);
 
+        // Load and restore acceptor state for crash recovery
+        let acceptor_states = self
+            .storage
+            .load_acceptor_states()
+            .await
+            .map_err(NodeError::Storage)?;
+        let valid_states: Vec<_> = acceptor_states
+            .into_iter()
+            .filter(|s| s.is_valid())
+            .collect();
+        self.protocol.initialize_from_acceptor_states(valid_states);
+
         // Build senders list
         let mut senders: Vec<(NodeId, S)> = Vec::new();
         let peers = std::mem::take(&mut self.peers);
@@ -282,6 +294,17 @@ where
         }
     }
 
+    async fn persist_dirty_acceptor_slots(&mut self) -> Result<(), NodeError> {
+        let dirty = self.protocol.take_dirty_acceptor_slots();
+        for (slot, highest_promised, accepted) in dirty {
+            self.storage
+                .save_acceptor_state(slot, highest_promised, accepted)
+                .await
+                .map_err(NodeError::Storage)?;
+        }
+        Ok(())
+    }
+
     async fn handle_proposal(
         &mut self,
         value: V,
@@ -289,6 +312,7 @@ where
     ) -> Result<(), NodeError> {
         let (slot, outgoing) = self.protocol.propose(value);
         tracing::debug!(slot, "new proposal");
+        self.persist_dirty_acceptor_slots().await?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
         Ok(())
@@ -304,13 +328,14 @@ where
                 let from = msg.sender;
                 let variant = msg.variant;
                 let outgoing = self.protocol.handle_message(from, variant);
+                self.persist_dirty_acceptor_slots().await?;
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
-                // Re-propose any lost proposals
                 let lost = self.protocol.take_lost_proposals();
                 for value in lost {
                     let (_, outgoing) = self.protocol.propose(value);
+                    self.persist_dirty_acceptor_slots().await?;
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                     self.process_decisions().await?;
                 }
