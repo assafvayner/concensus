@@ -92,7 +92,7 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
-    storage: Box<dyn Storage<V> + Send>,
+    storage: Box<dyn Storage<V> + Send + Sync>,
     protocol: ProtocolState<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
@@ -136,7 +136,7 @@ where
         name: impl Into<Arc<str>>,
         peers: Vec<PeerInfo<S>>,
         receiver: R,
-        storage: impl Storage<V> + 'static,
+        storage: impl Storage<V> + Sync + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let incarnation = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -158,7 +158,7 @@ where
         node_id: NodeId,
         peers: Vec<PeerInfo<S>>,
         receiver: R,
-        storage: impl Storage<V> + 'static,
+        storage: impl Storage<V> + Sync + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         Self::with_id_inner(node_id, peers, receiver, storage)
     }
@@ -167,7 +167,7 @@ where
         node_id: NodeId,
         peers: Vec<PeerInfo<S>>,
         receiver: R,
-        storage: impl Storage<V> + 'static,
+        storage: impl Storage<V> + Sync + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
         let protocol = ProtocolState::new(node_id.clone(), total_nodes);

@@ -50,8 +50,13 @@ where
             .collect())
     }
 
-    async fn save_acceptor_state(&mut self, state: AcceptorState<V>) -> Result<(), StorageError> {
-        self.acceptor_states.insert(state.slot, state);
+    async fn save_acceptor_state(
+        &mut self,
+        slot: u64,
+        highest_promised: Option<crate::message::ProposalNumber>,
+        accepted: Option<(crate::message::ProposalNumber, V)>,
+    ) -> Result<(), StorageError> {
+        self.acceptor_states.insert(slot, AcceptorState { slot, highest_promised, accepted });
         Ok(())
     }
 
@@ -122,12 +127,7 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_acceptor_state() {
         let mut storage = MemoryStorage::<String>::new();
-        let state = AcceptorState {
-            slot: 1,
-            highest_promised: Some(make_pn(1)),
-            accepted: None,
-        };
-        storage.save_acceptor_state(state.clone()).await.unwrap();
+        storage.save_acceptor_state(1, Some(make_pn(1)), None).await.unwrap();
 
         let states = storage.load_acceptor_states().await.unwrap();
         assert_eq!(states.len(), 1);
@@ -139,30 +139,17 @@ mod tests {
     #[tokio::test]
     async fn save_decision_cleans_acceptor_state() {
         let mut storage = MemoryStorage::new();
-        let state = AcceptorState {
-            slot: 1,
-            highest_promised: Some(make_pn(1)),
-            accepted: Some((make_pn(1), "hello".to_string())),
-        };
-        storage.save_acceptor_state(state).await.unwrap();
+        storage.save_acceptor_state(1, Some(make_pn(1)), Some((make_pn(1), "hello".to_string()))).await.unwrap();
         assert_eq!(storage.load_acceptor_states().await.unwrap().len(), 1);
 
-        storage
-            .save_decision(1, "hello".to_string())
-            .await
-            .unwrap();
+        storage.save_decision(1, "hello".to_string()).await.unwrap();
         assert!(storage.load_acceptor_states().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn delete_acceptor_state() {
         let mut storage = MemoryStorage::<String>::new();
-        let state = AcceptorState {
-            slot: 5,
-            highest_promised: Some(make_pn(2)),
-            accepted: None,
-        };
-        storage.save_acceptor_state(state).await.unwrap();
+        storage.save_acceptor_state(5, Some(make_pn(2)), None).await.unwrap();
         assert_eq!(storage.load_acceptor_states().await.unwrap().len(), 1);
 
         storage.delete_acceptor_state(5).await.unwrap();

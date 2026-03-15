@@ -95,7 +95,12 @@ where
     ///
     /// Called whenever the acceptor's promise or accepted value changes for a
     /// slot that has not yet been decided.
-    async fn save_acceptor_state(&mut self, state: AcceptorState<V>) -> Result<(), StorageError>;
+    async fn save_acceptor_state(
+        &mut self,
+        slot: u64,
+        highest_promised: Option<ProposalNumber>,
+        accepted: Option<(ProposalNumber, V)>,
+    ) -> Result<(), StorageError>;
 
     /// Load all persisted acceptor states.
     ///
@@ -121,8 +126,13 @@ where
         (**self).load_decisions().await
     }
 
-    async fn save_acceptor_state(&mut self, state: AcceptorState<V>) -> Result<(), StorageError> {
-        (**self).save_acceptor_state(state).await
+    async fn save_acceptor_state(
+        &mut self,
+        slot: u64,
+        highest_promised: Option<ProposalNumber>,
+        accepted: Option<(ProposalNumber, V)>,
+    ) -> Result<(), StorageError> {
+        (**self).save_acceptor_state(slot, highest_promised, accepted).await
     }
 
     async fn load_acceptor_states(&self) -> Result<Vec<AcceptorState<V>>, StorageError> {

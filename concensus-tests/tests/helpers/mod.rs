@@ -72,8 +72,13 @@ where
         self.inner.lock().await.load_decisions().await
     }
 
-    async fn save_acceptor_state(&mut self, state: AcceptorState<V>) -> Result<(), StorageError> {
-        self.inner.lock().await.save_acceptor_state(state).await
+    async fn save_acceptor_state(
+        &mut self,
+        slot: u64,
+        highest_promised: Option<concensus::ProposalNumber>,
+        accepted: Option<(concensus::ProposalNumber, V)>,
+    ) -> Result<(), StorageError> {
+        self.inner.lock().await.save_acceptor_state(slot, highest_promised, accepted).await
     }
 
     async fn load_acceptor_states(&self) -> Result<Vec<AcceptorState<V>>, StorageError> {
