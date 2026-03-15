@@ -12,7 +12,7 @@ name = "concensus-cli"
 path = "src/cli.rs"
 
 [dependencies]
-concensus = { path = "../concensus", features = ["tcp-transport", "uds-transport", "test-support"] }
+concensus = { path = "../concensus", features = ["tcp-transport", "uds-transport", "test-support", "duckdb-storage"] }
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }

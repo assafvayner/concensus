@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use concensus::{
-    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, ProposeError, TcpTransport,
-    UdsTransport,
+    DecisionReceiver, DuckDbStorage, MemoryStorage, Node, NodeHandle, NodeId, ProposeError,
+    Storage, TcpTransport, UdsTransport,
 };
 
 pub mod consensus_proto {
@@ -35,10 +35,17 @@ enum Transport {
 }
 
 #[derive(Debug)]
+enum StorageBackend {
+    Memory,
+    DuckDb { path: PathBuf },
+}
+
+#[derive(Debug)]
 struct Config {
     node_name: String,
     transport: Transport,
     grpc_port: u16,
+    storage: StorageBackend,
 }
 
 fn resolve_node_name() -> String {
@@ -82,10 +89,26 @@ fn parse_config() -> Config {
         other => panic!("TRANSPORT must be 'tcp' or 'uds', got '{}'", other),
     };
 
+    let storage = match std::env::var("STORAGE")
+        .unwrap_or_else(|_| "memory".to_string())
+        .as_str()
+    {
+        "memory" => StorageBackend::Memory,
+        "duckdb" => {
+            let path = std::env::var("DUCKDB_PATH")
+                .expect("DUCKDB_PATH required when STORAGE=duckdb");
+            StorageBackend::DuckDb {
+                path: PathBuf::from(path),
+            }
+        }
+        other => panic!("STORAGE must be 'memory' or 'duckdb', got '{}'", other),
+    };
+
     Config {
         node_name,
         transport,
         grpc_port,
+        storage,
     }
 }
 
@@ -207,9 +230,9 @@ async fn start_node_tcp(
     node_name: &str,
     bind_addr: SocketAddr,
     peers: Vec<(NodeId, String)>,
+    storage: Box<dyn Storage<String> + Send + Sync>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
     let peers = resolve_tcp_peers(peers).await;
-    let storage = MemoryStorage::<String>::new();
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
         .await
         .expect("failed to bind TCP transport");
@@ -232,8 +255,8 @@ async fn start_node_uds(
     node_name: &str,
     bind_path: PathBuf,
     peers: Vec<(NodeId, PathBuf)>,
+    storage: Box<dyn Storage<String> + Send + Sync>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
-    let storage = MemoryStorage::<String>::new();
     let (peer_infos, receiver) = UdsTransport::create(bind_path, peers)
         .await
         .expect("failed to bind UDS transport");
@@ -266,6 +289,17 @@ async fn main() {
 
     let config = parse_config();
 
+    let storage: Box<dyn Storage<String> + Send + Sync> = match &config.storage {
+        StorageBackend::Memory => {
+            tracing::info!("using in-memory storage");
+            Box::new(MemoryStorage::<String>::new())
+        }
+        StorageBackend::DuckDb { path } => {
+            tracing::info!(path = ?path, "using DuckDB storage");
+            Box::new(DuckDbStorage::<String>::new(path).expect("failed to open DuckDB"))
+        }
+    };
+
     let (handle, decision_rx) = match config.transport {
         Transport::Tcp { bind_addr, peers } => {
             tracing::info!(
@@ -275,7 +309,7 @@ async fn main() {
                 grpc_port = config.grpc_port,
                 "node started"
             );
-            start_node_tcp(&config.node_name, bind_addr, peers).await
+            start_node_tcp(&config.node_name, bind_addr, peers, storage).await
         }
         Transport::Uds { bind_path, peers } => {
             tracing::info!(
@@ -285,7 +319,7 @@ async fn main() {
                 grpc_port = config.grpc_port,
                 "node started"
             );
-            start_node_uds(&config.node_name, bind_path, peers).await
+            start_node_uds(&config.node_name, bind_path, peers, storage).await
         }
     };
 
