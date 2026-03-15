@@ -1,0 +1,69 @@
+services:
+  node-1:
+    build: .
+    environment:
+      TRANSPORT: uds
+      NODE_NAME: node-1
+      BIND_PATH: "/sockets/node-1.sock"
+      PEERS: "node-2=/sockets/node-2.sock,node-3=/sockets/node-3.sock"
+      GRPC_PORT: "50051"
+      RUST_LOG: info
+    ports:
+      - "50051:50051"
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - consensus-net
+
+  node-2:
+    build: .
+    environment:
+      TRANSPORT: uds
+      NODE_NAME: node-2
+      BIND_PATH: "/sockets/node-2.sock"
+      PEERS: "node-1=/sockets/node-1.sock,node-3=/sockets/node-3.sock"
+      GRPC_PORT: "50051"
+      RUST_LOG: info
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - consensus-net
+
+  node-3:
+    build: .
+    environment:
+      TRANSPORT: uds
+      NODE_NAME: node-3
+      BIND_PATH: "/sockets/node-3.sock"
+      PEERS: "node-1=/sockets/node-1.sock,node-2=/sockets/node-2.sock"
+      GRPC_PORT: "50051"
+      RUST_LOG: info
+    volumes:
+      - sockets:/sockets
+    healthcheck:
+      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - consensus-net
+
+volumes:
+  sockets:
+
+networks:
+  consensus-net:
+    driver: bridge
