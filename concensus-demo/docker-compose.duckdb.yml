@@ -1,0 +1,52 @@
+x-node: &node-base
+  build:
+    context: ../..
+    dockerfile: concensus-demo/Dockerfile
+  environment: &node-env
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "node-1=node-1:9000,node-2=node-2:9000,node-3=node-3:9000"
+    GRPC_PORT: "50051"
+    STORAGE: duckdb
+    DUCKDB_PATH: "/data/consensus.db"
+    RUST_LOG: info
+  healthcheck:
+    test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - consensus-net
+
+services:
+  node-1:
+    <<: *node-base
+    hostname: node-1
+    ports:
+      - "50051:50051"
+    volumes:
+      - node1-data:/data
+  node-2:
+    <<: *node-base
+    hostname: node-2
+    ports:
+      - "50052:50051"
+    volumes:
+      - node2-data:/data
+  node-3:
+    <<: *node-base
+    hostname: node-3
+    ports:
+      - "50053:50051"
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  consensus-net:
+    driver: bridge
