@@ -6,10 +6,8 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use concensus::{
-    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId,
-    TcpTransport,
+    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, ProposeError, TcpTransport,
     UdsTransport,
-    ProposeError,
 };
 
 pub mod consensus_proto {
@@ -28,7 +26,7 @@ use consensus_proto::{
 enum Transport {
     Tcp {
         bind_addr: SocketAddr,
-        peers: Vec<(NodeId, SocketAddr)>,
+        peers: Vec<(NodeId, String)>,
     },
     Uds {
         bind_path: PathBuf,
@@ -78,7 +76,7 @@ fn parse_config() -> Config {
     }
 }
 
-fn parse_tcp_peers(peers_str: &str) -> Vec<(NodeId, SocketAddr)> {
+fn parse_tcp_peers(peers_str: &str) -> Vec<(NodeId, String)> {
     if peers_str.is_empty() {
         return Vec::new();
     }
@@ -88,12 +86,22 @@ fn parse_tcp_peers(peers_str: &str) -> Vec<(NodeId, SocketAddr)> {
             let (name, addr_str) = entry
                 .split_once('=')
                 .unwrap_or_else(|| panic!("invalid peer format '{}', expected 'name=addr'", entry));
-            let addr: SocketAddr = addr_str
-                .parse()
-                .unwrap_or_else(|_| panic!("invalid socket address '{}' for peer '{}'", addr_str, name));
-            (NodeId::new(name, 0), addr)
+            (NodeId::new(name, 0), addr_str.to_string())
         })
         .collect()
+}
+
+async fn resolve_tcp_peers(peers: Vec<(NodeId, String)>) -> Vec<(NodeId, SocketAddr)> {
+    let mut resolved = Vec::with_capacity(peers.len());
+    for (id, addr_str) in peers {
+        let addr = tokio::net::lookup_host(&addr_str)
+            .await
+            .unwrap_or_else(|e| panic!("failed to resolve '{}': {}", addr_str, e))
+            .next()
+            .unwrap_or_else(|| panic!("no addresses found for '{}'", addr_str));
+        resolved.push((id, addr));
+    }
+    resolved
 }
 
 fn parse_uds_peers(peers_str: &str) -> Vec<(NodeId, PathBuf)> {
@@ -136,9 +144,7 @@ impl ConsensusService for ConsensusServiceImpl {
             Err(ProposeError::ChannelFull) => {
                 Err(Status::resource_exhausted("proposal channel full"))
             }
-            Err(ProposeError::NotRunning) => {
-                Err(Status::unavailable("node is not running"))
-            }
+            Err(ProposeError::NotRunning) => Err(Status::unavailable("node is not running")),
         }
     }
 
@@ -187,8 +193,9 @@ async fn collect_decisions(
 async fn start_node_tcp(
     node_name: &str,
     bind_addr: SocketAddr,
-    peers: Vec<(NodeId, SocketAddr)>,
+    peers: Vec<(NodeId, String)>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
+    let peers = resolve_tcp_peers(peers).await;
     let storage = MemoryStorage::<String>::new();
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
         .await
@@ -281,10 +288,7 @@ async fn main() {
         .parse()
         .expect("invalid gRPC address");
 
-    let service = ConsensusServiceImpl {
-        handle,
-        decisions,
-    };
+    let service = ConsensusServiceImpl { handle, decisions };
 
     tracing::info!(addr = %grpc_addr, "gRPC server starting");
 
