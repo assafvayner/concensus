@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crate::error::TransportError;
 
+#[cfg(feature = "channel-transport")]
+pub mod channel;
+
 #[async_trait]
 pub trait MessageSender: Send + 'static {
     async fn send(&self, data: Bytes) -> Result<(), TransportError>;

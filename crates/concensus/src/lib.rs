@@ -11,3 +11,6 @@ pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use node::{Decided, DecisionReceiver, Node, NodeHandle};
 pub use storage::{MemoryStorage, Storage};
 pub use transport::{MessageReceiver, MessageSender};
+
+#[cfg(feature = "channel-transport")]
+pub use transport::channel::{self as channel, channel, unbounded_channel, ChannelReceiver, ChannelSender};
