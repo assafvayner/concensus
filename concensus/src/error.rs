@@ -32,6 +32,9 @@ pub enum StorageError {
     /// Failed to load previously decided values during recovery.
     #[error("failed to load decisions: {0}")]
     Load(String),
+    /// Failed to delete acceptor state.
+    #[error("failed to delete acceptor state: {0}")]
+    Delete(String),
 }
 
 /// Errors from the [`MessageSender`](crate::MessageSender) and

@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use concensus::{
-    channel, unbounded_channel, ChannelReceiver, ChannelSender, Decided, DecisionReceiver,
-    MemoryStorage, Node, NodeHandle, NodeId, PeerInfo, Storage, StorageError,
+    channel, unbounded_channel, AcceptorState, ChannelReceiver, ChannelSender, Decided,
+    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, PeerInfo, ProposalNumber, Storage,
+    StorageError,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
@@ -69,6 +70,18 @@ where
 
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
         self.inner.lock().await.load_decisions().await
+    }
+
+    async fn save_acceptor_state(&mut self, state: AcceptorState<V>) -> Result<(), StorageError> {
+        self.inner.lock().await.save_acceptor_state(state).await
+    }
+
+    async fn load_acceptor_states(&self) -> Result<Vec<AcceptorState<V>>, StorageError> {
+        self.inner.lock().await.load_acceptor_states().await
+    }
+
+    async fn delete_acceptor_state(&mut self, slot: u64) -> Result<(), StorageError> {
+        self.inner.lock().await.delete_acceptor_state(slot).await
     }
 }
 

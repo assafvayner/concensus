@@ -3,7 +3,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::config::NodeId;
 
-pub(crate) type ProposalNumber = (u64, NodeId);
+pub type ProposalNumber = (u64, NodeId);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) enum MessageVariant<V> {
