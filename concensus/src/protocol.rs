@@ -40,6 +40,8 @@ pub(crate) struct ProtocolState<V> {
     /// Recent decisions to re-broadcast during retries so peers that missed
     /// the original Decide message can learn the outcome.
     recent_decisions: Vec<(Instant, u64, V)>,
+    /// Slots whose acceptor state has been modified since the last drain.
+    dirty_acceptor_slots: Vec<u64>,
 }
 
 /// Per-slot Paxos instance
@@ -108,6 +110,7 @@ where
             pending_decisions: Vec::new(),
             lost_proposals: Vec::new(),
             recent_decisions: Vec::new(),
+            dirty_acceptor_slots: Vec::new(),
         }
     }
 
@@ -130,6 +133,37 @@ where
 
     pub(crate) fn take_lost_proposals(&mut self) -> Vec<V> {
         std::mem::take(&mut self.lost_proposals)
+    }
+
+    pub(crate) fn take_dirty_acceptor_slots(
+        &mut self,
+    ) -> Vec<(u64, Option<ProposalNumber>, Option<(ProposalNumber, V)>)> {
+        let slots = std::mem::take(&mut self.dirty_acceptor_slots);
+        let mut result = Vec::new();
+        for slot in slots {
+            if let Some(instance) = self.instances.get(&slot) {
+                result.push((
+                    slot,
+                    instance.highest_promised.clone(),
+                    instance.accepted.clone(),
+                ));
+            }
+        }
+        result
+    }
+
+    pub(crate) fn initialize_from_acceptor_states(
+        &mut self,
+        states: Vec<crate::storage::AcceptorState<V>>,
+    ) {
+        for state in states {
+            if self.decided_slots.contains_key(&state.slot) {
+                continue;
+            }
+            let instance = self.get_or_create_instance(state.slot);
+            instance.highest_promised = state.highest_promised;
+            instance.accepted = state.accepted;
+        }
     }
 
     /// Handle an incoming message. Returns outgoing messages to send.
@@ -206,30 +240,42 @@ where
 
         let instance = self.get_or_create_instance(slot);
 
-        if instance
+        let result = if instance
             .highest_promised
             .as_ref()
             .is_none_or(|hp| proposal_number > *hp)
         {
             instance.highest_promised = Some(proposal_number.clone());
-            vec![Outgoing {
-                target: SendTarget::Peer(from),
-                message: MessageVariant::Promise {
-                    slot,
-                    proposal_number,
-                    accepted: instance.accepted.clone(),
-                },
-            }]
+            let accepted = instance.accepted.clone();
+            (
+                true,
+                vec![Outgoing {
+                    target: SendTarget::Peer(from),
+                    message: MessageVariant::Promise {
+                        slot,
+                        proposal_number,
+                        accepted,
+                    },
+                }],
+            )
         } else {
-            vec![Outgoing {
-                target: SendTarget::Peer(from),
-                message: MessageVariant::NackPrepare {
-                    slot,
-                    proposal_number,
-                    highest_promised: instance.highest_promised.clone().unwrap(),
-                },
-            }]
+            (
+                false,
+                vec![Outgoing {
+                    target: SendTarget::Peer(from),
+                    message: MessageVariant::NackPrepare {
+                        slot,
+                        proposal_number,
+                        highest_promised: instance.highest_promised.clone().unwrap(),
+                    },
+                }],
+            )
+        };
+
+        if result.0 {
+            self.dirty_acceptor_slots.push(slot);
         }
+        result.1
     }
 
     // -- Phase 2: Accept/Accepted (Acceptor side) --
@@ -255,31 +301,42 @@ where
 
         let instance = self.get_or_create_instance(slot);
 
-        if instance
+        let (dirty, result) = if instance
             .highest_promised
             .as_ref()
             .is_none_or(|hp| proposal_number >= *hp)
         {
             instance.highest_promised = Some(proposal_number.clone());
             instance.accepted = Some((proposal_number.clone(), value.clone()));
-            vec![Outgoing {
-                target: SendTarget::Peer(from),
-                message: MessageVariant::Accepted {
-                    slot,
-                    proposal_number,
-                    value,
-                },
-            }]
+            (
+                true,
+                vec![Outgoing {
+                    target: SendTarget::Peer(from),
+                    message: MessageVariant::Accepted {
+                        slot,
+                        proposal_number,
+                        value,
+                    },
+                }],
+            )
         } else {
-            vec![Outgoing {
-                target: SendTarget::Peer(from),
-                message: MessageVariant::NackAccept {
-                    slot,
-                    proposal_number,
-                    highest_promised: instance.highest_promised.clone().unwrap(),
-                },
-            }]
+            (
+                false,
+                vec![Outgoing {
+                    target: SendTarget::Peer(from),
+                    message: MessageVariant::NackAccept {
+                        slot,
+                        proposal_number,
+                        highest_promised: instance.highest_promised.clone().unwrap(),
+                    },
+                }],
+            )
+        };
+
+        if dirty {
+            self.dirty_acceptor_slots.push(slot);
         }
+        result
     }
 
     // -- Promise handler (Proposer side) --
@@ -419,23 +476,27 @@ where
         let node_id = self.node_id.clone();
         let proposal_number: ProposalNumber = (round, node_id.clone());
 
-        let instance = self.get_or_create_instance(slot);
-        instance.proposal_number = proposal_number.clone();
-        instance.proposed_value = Some(value);
-        instance.is_proposer = true;
-        instance.last_send_time = Some(Instant::now());
-        // Set initial stale retry time
-        let stale_ms = 100u64;
-        let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
-        instance.next_retry_at =
-            Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
+        let has_quorum = {
+            let instance = self.get_or_create_instance(slot);
+            instance.proposal_number = proposal_number.clone();
+            instance.proposed_value = Some(value);
+            instance.is_proposer = true;
+            instance.last_send_time = Some(Instant::now());
+            // Set initial stale retry time
+            let stale_ms = 100u64;
+            let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
+            instance.next_retry_at =
+                Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
 
-        // Self-vote as acceptor for Phase 1
-        instance.highest_promised = Some(proposal_number.clone());
-        instance.promises_received.insert(node_id);
+            // Self-vote as acceptor for Phase 1
+            instance.highest_promised = Some(proposal_number.clone());
+            instance.promises_received.insert(node_id);
+            instance.promises_received.len() >= self.quorum_size
+        };
+        self.dirty_acceptor_slots.push(slot);
 
         // Check if we already have a quorum (single-node case)
-        if instance.promises_received.len() >= self.quorum_size {
+        if has_quorum {
             return (slot, self.start_phase2(slot));
         }
 
@@ -452,36 +513,45 @@ where
     }
 
     fn start_phase2(&mut self, slot: u64) -> Vec<Outgoing<V>> {
-        let instance = self.instances.get_mut(&slot).unwrap();
+        let (value, proposal_number, did_self_accept, has_quorum) = {
+            let instance = self.instances.get_mut(&slot).unwrap();
 
-        // Phase 2 value selection: use highest accepted value from promises, or own value.
-        // This is the core Paxos safety rule.
-        let value = if let Some((_, v)) = &instance.highest_accepted {
-            v.clone()
-        } else {
-            instance.proposed_value.clone().unwrap()
+            // Phase 2 value selection: use highest accepted value from promises, or own value.
+            // This is the core Paxos safety rule.
+            let value = if let Some((_, v)) = &instance.highest_accepted {
+                v.clone()
+            } else {
+                instance.proposed_value.clone().unwrap()
+            };
+
+            let proposal_number = instance.proposal_number.clone();
+
+            // Self-vote as acceptor for Phase 2.
+            // SAFETY CHECK: only self-accept if our acceptor hasn't promised a higher
+            // number to another proposer since our Phase 1. Between collecting promise
+            // quorum and starting Phase 2, a remote Prepare with a higher number could
+            // have updated highest_promised.
+            let can_self_accept = instance
+                .highest_promised
+                .as_ref()
+                .is_none_or(|hp| proposal_number >= *hp);
+
+            if can_self_accept {
+                instance.highest_promised = Some(proposal_number.clone());
+                instance.accepted = Some((proposal_number.clone(), value.clone()));
+                instance.accepts_received.insert(self.node_id.clone());
+            }
+
+            let has_quorum = instance.accepts_received.len() >= self.quorum_size;
+            (value, proposal_number, can_self_accept, has_quorum)
         };
 
-        let proposal_number = instance.proposal_number.clone();
-
-        // Self-vote as acceptor for Phase 2.
-        // SAFETY CHECK: only self-accept if our acceptor hasn't promised a higher
-        // number to another proposer since our Phase 1. Between collecting promise
-        // quorum and starting Phase 2, a remote Prepare with a higher number could
-        // have updated highest_promised.
-        let can_self_accept = instance
-            .highest_promised
-            .as_ref()
-            .is_none_or(|hp| proposal_number >= *hp);
-
-        if can_self_accept {
-            instance.highest_promised = Some(proposal_number.clone());
-            instance.accepted = Some((proposal_number.clone(), value.clone()));
-            instance.accepts_received.insert(self.node_id.clone());
+        if did_self_accept {
+            self.dirty_acceptor_slots.push(slot);
         }
 
         // Check if we already have a quorum (single-node case)
-        if instance.accepts_received.len() >= self.quorum_size {
+        if has_quorum {
             self.decide(slot, value.clone());
             self.instances.remove(&slot);
             return vec![Outgoing {
@@ -559,44 +629,49 @@ where
     }
 
     pub(crate) fn retry_proposal(&mut self, slot: u64) -> Vec<Outgoing<V>> {
-        let instance = match self.instances.get_mut(&slot) {
-            Some(i) if !i.decided && i.is_proposer => i,
-            _ => return vec![],
+        let (proposal_number, has_quorum) = {
+            let instance = match self.instances.get_mut(&slot) {
+                Some(i) if !i.decided && i.is_proposer => i,
+                _ => return vec![],
+            };
+
+            // Compute new_round that exceeds BOTH the highest nack AND the acceptor's
+            // current highest_promised. This ensures the new proposal number doesn't
+            // violate the acceptor's existing promise (which may have been updated by
+            // a remote Prepare since our last attempt).
+            let acceptor_round = instance.highest_promised.as_ref().map_or(0, |hp| hp.0);
+            let nack_round = instance.highest_seen_nack.unwrap_or(0);
+            let proposer_round = instance.proposal_number.0;
+            let new_round = acceptor_round.max(nack_round).max(proposer_round) + 1;
+            let proposal_number: ProposalNumber = (new_round, self.node_id.clone());
+
+            // Reset PROPOSER state for new round.
+            // highest_accepted tracks promises from current round — must be reset.
+            // Acceptor state (accepted) is independent — NOT reset.
+            instance.proposal_number = proposal_number.clone();
+            instance.promises_received.clear();
+            instance.accepts_received.clear();
+            instance.highest_accepted = None;
+            instance.nacked = false;
+            instance.highest_seen_nack = None;
+            instance.last_nack_time = None;
+            instance.retry_count += 1;
+            instance.last_send_time = Some(Instant::now());
+            // Compute next stale retry time with jitter
+            let stale_ms = 100u64.saturating_mul(1u64 << instance.retry_count.min(3));
+            let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
+            instance.next_retry_at =
+                Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
+
+            // Self-vote for new round — safe because new_round > any prior promise
+            instance.highest_promised = Some(proposal_number.clone());
+            instance.promises_received.insert(self.node_id.clone());
+            let has_quorum = instance.promises_received.len() >= self.quorum_size;
+            (proposal_number, has_quorum)
         };
+        self.dirty_acceptor_slots.push(slot);
 
-        // Compute new_round that exceeds BOTH the highest nack AND the acceptor's
-        // current highest_promised. This ensures the new proposal number doesn't
-        // violate the acceptor's existing promise (which may have been updated by
-        // a remote Prepare since our last attempt).
-        let acceptor_round = instance.highest_promised.as_ref().map_or(0, |hp| hp.0);
-        let nack_round = instance.highest_seen_nack.unwrap_or(0);
-        let proposer_round = instance.proposal_number.0;
-        let new_round = acceptor_round.max(nack_round).max(proposer_round) + 1;
-        let proposal_number: ProposalNumber = (new_round, self.node_id.clone());
-
-        // Reset PROPOSER state for new round.
-        // highest_accepted tracks promises from current round — must be reset.
-        // Acceptor state (accepted) is independent — NOT reset.
-        instance.proposal_number = proposal_number.clone();
-        instance.promises_received.clear();
-        instance.accepts_received.clear();
-        instance.highest_accepted = None;
-        instance.nacked = false;
-        instance.highest_seen_nack = None;
-        instance.last_nack_time = None;
-        instance.retry_count += 1;
-        instance.last_send_time = Some(Instant::now());
-        // Compute next stale retry time with jitter
-        let stale_ms = 100u64.saturating_mul(1u64 << instance.retry_count.min(3));
-        let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
-        instance.next_retry_at =
-            Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
-
-        // Self-vote for new round — safe because new_round > any prior promise
-        instance.highest_promised = Some(proposal_number.clone());
-        instance.promises_received.insert(self.node_id.clone());
-
-        if instance.promises_received.len() >= self.quorum_size {
+        if has_quorum {
             return self.start_phase2(slot);
         }
 
@@ -1287,6 +1362,185 @@ mod tests {
             // Self should NOT be in accepts_received
             assert!(!inst.accepts_received.contains(&proto.node_id));
         }
+    }
+
+    // -- Dirty acceptor slot tracking tests --
+
+    #[test]
+    fn handle_prepare_marks_dirty_acceptor_slot() {
+        let mut proto = make_protocol("a", 3);
+        let from = node("b");
+        let pn = (1, from.clone());
+        proto.handle_message(from, MessageVariant::Prepare { slot: 0, proposal_number: pn });
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0);
+        assert!(dirty[0].1.is_some());
+    }
+
+    #[test]
+    fn handle_accept_marks_dirty_acceptor_slot() {
+        let mut proto = make_protocol("a", 3);
+        let from = node("b");
+        let pn = (1, from.clone());
+        proto.handle_message(
+            from,
+            MessageVariant::Accept {
+                slot: 0,
+                proposal_number: pn,
+                value: "hello".to_string(),
+            },
+        );
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0);
+        assert!(dirty[0].1.is_some());
+        assert!(dirty[0].2.is_some());
+    }
+
+    #[test]
+    fn take_dirty_clears_dirty_set() {
+        let mut proto = make_protocol("a", 3);
+        let from = node("b");
+        proto.handle_message(
+            from,
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: (1, node("b")),
+            },
+        );
+        let dirty1 = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty1.len(), 1);
+        let dirty2 = proto.take_dirty_acceptor_slots();
+        assert!(dirty2.is_empty());
+    }
+
+    #[test]
+    fn propose_self_vote_marks_dirty() {
+        let mut proto = make_protocol("a", 3);
+        proto.propose("hello".to_string());
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0);
+        assert!(dirty[0].1.is_some());
+    }
+
+    #[test]
+    fn retry_proposal_marks_dirty() {
+        let mut proto = make_protocol("a", 3);
+        let (_, _) = proto.propose("hello".to_string());
+        proto.take_dirty_acceptor_slots(); // clear
+        let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
+        proto.handle_message(
+            node("b"),
+            MessageVariant::NackPrepare {
+                slot: 0,
+                proposal_number: pn,
+                highest_promised: (5, node("b")),
+            },
+        );
+        proto.take_dirty_acceptor_slots(); // clear nack
+        proto.retry_proposal(0);
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0);
+    }
+
+    #[test]
+    fn decided_slot_prepare_does_not_mark_dirty() {
+        let mut proto = make_protocol("a", 3);
+        proto.handle_message(
+            node("b"),
+            MessageVariant::Decide {
+                slot: 0,
+                value: "decided".to_string(),
+            },
+        );
+        proto.take_decisions();
+        proto.take_dirty_acceptor_slots(); // clear any
+        proto.handle_message(
+            node("c"),
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: (10, node("c")),
+            },
+        );
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert!(dirty.is_empty());
+    }
+
+    // -- initialize_from_acceptor_states tests --
+
+    #[test]
+    fn initialize_from_acceptor_states_restores_promise() {
+        use crate::storage::AcceptorState;
+        let mut proto = make_protocol("a", 3);
+        let pn = (5, node("b"));
+        let states = vec![AcceptorState {
+            slot: 0,
+            highest_promised: Some(pn.clone()),
+            accepted: None,
+        }];
+        proto.initialize_from_acceptor_states(states);
+        let responses = proto.handle_message(
+            node("c"),
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: (3, node("c")),
+            },
+        );
+        assert!(matches!(
+            &responses[0].message,
+            MessageVariant::NackPrepare { .. }
+        ));
+    }
+
+    #[test]
+    fn initialize_from_acceptor_states_restores_accepted() {
+        use crate::storage::AcceptorState;
+        let mut proto = make_protocol("a", 3);
+        let pn = (5, node("b"));
+        let states = vec![AcceptorState {
+            slot: 0,
+            highest_promised: Some(pn.clone()),
+            accepted: Some((pn.clone(), "previous".to_string())),
+        }];
+        proto.initialize_from_acceptor_states(states);
+        let responses = proto.handle_message(
+            node("c"),
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: (10, node("c")),
+            },
+        );
+        match &responses[0].message {
+            MessageVariant::Promise {
+                accepted: Some((_, val)),
+                ..
+            } => assert_eq!(val, "previous"),
+            _ => panic!("expected Promise with accepted value"),
+        }
+    }
+
+    #[test]
+    fn initialize_from_acceptor_states_skips_decided_slots() {
+        use crate::storage::AcceptorState;
+        let mut proto = make_protocol("a", 3);
+        proto.handle_message(
+            node("b"),
+            MessageVariant::Decide {
+                slot: 0,
+                value: "done".to_string(),
+            },
+        );
+        proto.take_decisions();
+        let states = vec![AcceptorState {
+            slot: 0,
+            highest_promised: Some((5, node("b"))),
+            accepted: None,
+        }];
+        proto.initialize_from_acceptor_states(states);
+        assert!(!proto.instances.contains_key(&0));
     }
 
     #[test]
