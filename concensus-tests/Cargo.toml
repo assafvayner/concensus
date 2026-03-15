@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
-concensus = { path = "../concensus", features = ["channel-transport", "test-support"] }
+concensus = { path = "../concensus", features = ["channel-transport", "test-support", "duckdb-storage"] }
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
 rand = "0.10"
 async-trait = "0.1"
