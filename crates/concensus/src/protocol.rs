@@ -4,7 +4,7 @@ use std::time::Instant;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
-use crate::message::{Message, ProposalNumber};
+use crate::message::{MessageVariant, ProposalNumber};
 
 /// Where to send an outgoing message
 pub(crate) enum SendTarget {
@@ -17,7 +17,7 @@ pub(crate) enum SendTarget {
 /// An outgoing message produced by the protocol state machine
 pub(crate) struct Outgoing<V> {
     pub target: SendTarget,
-    pub message: Message<V>,
+    pub message: MessageVariant<V>,
 }
 
 /// A decided value ready to be delivered
@@ -122,30 +122,30 @@ where
     pub(crate) fn handle_message(
         &mut self,
         from: NodeId,
-        msg: Message<V>,
+        msg: MessageVariant<V>,
     ) -> Vec<Outgoing<V>> {
         match msg {
-            Message::Prepare { slot, proposal_number } => {
+            MessageVariant::Prepare { slot, proposal_number } => {
                 self.handle_prepare(from, slot, proposal_number)
             }
-            Message::Promise { slot, proposal_number, accepted } => {
+            MessageVariant::Promise { slot, proposal_number, accepted } => {
                 self.handle_promise(from, slot, proposal_number, accepted)
             }
-            Message::Accept { slot, proposal_number, value } => {
+            MessageVariant::Accept { slot, proposal_number, value } => {
                 self.handle_accept(from, slot, proposal_number, value)
             }
-            Message::Accepted { slot, proposal_number, value } => {
+            MessageVariant::Accepted { slot, proposal_number, value } => {
                 self.handle_accepted(from, slot, proposal_number, value)
             }
-            Message::Decide { slot, value } => {
+            MessageVariant::Decide { slot, value } => {
                 self.handle_decide(slot, value);
                 vec![]
             }
-            Message::NackPrepare { slot, highest_promised, .. } => {
+            MessageVariant::NackPrepare { slot, highest_promised, .. } => {
                 self.handle_nack(slot, highest_promised);
                 vec![]
             }
-            Message::NackAccept { slot, highest_promised, .. } => {
+            MessageVariant::NackAccept { slot, highest_promised, .. } => {
                 self.handle_nack(slot, highest_promised);
                 vec![]
             }
@@ -175,7 +175,7 @@ where
             instance.highest_promised = Some(proposal_number.clone());
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: Message::Promise {
+                message: MessageVariant::Promise {
                     slot,
                     proposal_number,
                     accepted: instance.accepted.clone(),
@@ -184,7 +184,7 @@ where
         } else {
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: Message::NackPrepare {
+                message: MessageVariant::NackPrepare {
                     slot,
                     proposal_number,
                     highest_promised: instance.highest_promised.clone().unwrap(),
@@ -214,12 +214,12 @@ where
             instance.accepted = Some((proposal_number.clone(), value.clone()));
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: Message::Accepted { slot, proposal_number, value },
+                message: MessageVariant::Accepted { slot, proposal_number, value },
             }]
         } else {
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: Message::NackAccept {
+                message: MessageVariant::NackAccept {
                     slot,
                     proposal_number,
                     highest_promised: instance.highest_promised.clone().unwrap(),
@@ -292,7 +292,7 @@ where
             self.instances.remove(&slot);
             vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: Message::Decide { slot, value },
+                message: MessageVariant::Decide { slot, value },
             }]
         } else {
             vec![]
@@ -366,7 +366,7 @@ where
 
         (slot, vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: Message::Prepare { slot, proposal_number },
+            message: MessageVariant::Prepare { slot, proposal_number },
         }])
     }
 
@@ -404,13 +404,13 @@ where
             self.instances.remove(&slot);
             return vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: Message::Decide { slot, value },
+                message: MessageVariant::Decide { slot, value },
             }];
         }
 
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: Message::Accept { slot, proposal_number, value },
+            message: MessageVariant::Accept { slot, proposal_number, value },
         }]
     }
 
@@ -474,7 +474,7 @@ where
 
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: Message::Prepare { slot, proposal_number },
+            message: MessageVariant::Prepare { slot, proposal_number },
         }]
     }
 }
@@ -500,14 +500,14 @@ mod tests {
         let from = node("b");
         let pn = (1, from.clone());
 
-        let responses = proto.handle_message(from, Message::Prepare {
+        let responses = proto.handle_message(from, MessageVariant::Prepare {
             slot: 0,
             proposal_number: pn.clone(),
         });
 
         assert_eq!(responses.len(), 1);
         match &responses[0].message {
-            Message::Promise { slot, proposal_number, accepted } => {
+            MessageVariant::Promise { slot, proposal_number, accepted } => {
                 assert_eq!(*slot, 0);
                 assert_eq!(proposal_number, &pn);
                 assert!(accepted.is_none());
@@ -522,19 +522,19 @@ mod tests {
         let from = node("b");
 
         // First prepare with higher number
-        proto.handle_message(from.clone(), Message::Prepare {
+        proto.handle_message(from.clone(), MessageVariant::Prepare {
             slot: 0,
             proposal_number: (5, from.clone()),
         });
 
         // Second prepare with lower number
-        let responses = proto.handle_message(from.clone(), Message::Prepare {
+        let responses = proto.handle_message(from.clone(), MessageVariant::Prepare {
             slot: 0,
             proposal_number: (1, from.clone()),
         });
 
         assert_eq!(responses.len(), 1);
-        assert!(matches!(&responses[0].message, Message::NackPrepare { .. }));
+        assert!(matches!(&responses[0].message, MessageVariant::NackPrepare { .. }));
     }
 
     // -- Acceptor tests (Phase 2) --
@@ -548,7 +548,7 @@ mod tests {
         let from = node("b");
         let pn = (1, from.clone());
 
-        let responses = proto.handle_message(from.clone(), Message::Accept {
+        let responses = proto.handle_message(from.clone(), MessageVariant::Accept {
             slot: 0,
             proposal_number: pn.clone(),
             value: "hello".to_string(),
@@ -556,7 +556,7 @@ mod tests {
 
         assert_eq!(responses.len(), 1);
         match &responses[0].message {
-            Message::Accepted { slot, proposal_number, value } => {
+            MessageVariant::Accepted { slot, proposal_number, value } => {
                 assert_eq!(*slot, 0);
                 assert_eq!(proposal_number, &pn);
                 assert_eq!(value, "hello");
@@ -571,20 +571,20 @@ mod tests {
         let from = node("b");
 
         // Promise a higher number first
-        proto.handle_message(from.clone(), Message::Prepare {
+        proto.handle_message(from.clone(), MessageVariant::Prepare {
             slot: 0,
             proposal_number: (5, from.clone()),
         });
 
         // Try to accept with lower number
-        let responses = proto.handle_message(from.clone(), Message::Accept {
+        let responses = proto.handle_message(from.clone(), MessageVariant::Accept {
             slot: 0,
             proposal_number: (1, from.clone()),
             value: "hello".to_string(),
         });
 
         assert_eq!(responses.len(), 1);
-        assert!(matches!(&responses[0].message, Message::NackAccept { .. }));
+        assert!(matches!(&responses[0].message, MessageVariant::NackAccept { .. }));
     }
 
     #[test]
@@ -594,7 +594,7 @@ mod tests {
         let pn1 = (1, from.clone());
 
         // Accept a value
-        proto.handle_message(from.clone(), Message::Accept {
+        proto.handle_message(from.clone(), MessageVariant::Accept {
             slot: 0,
             proposal_number: pn1.clone(),
             value: "hello".to_string(),
@@ -602,13 +602,13 @@ mod tests {
 
         // New prepare should return the accepted value
         let pn2 = (2, from.clone());
-        let responses = proto.handle_message(from.clone(), Message::Prepare {
+        let responses = proto.handle_message(from.clone(), MessageVariant::Prepare {
             slot: 0,
             proposal_number: pn2.clone(),
         });
 
         match &responses[0].message {
-            Message::Promise { accepted: Some((pn, val)), .. } => {
+            MessageVariant::Promise { accepted: Some((pn, val)), .. } => {
                 assert_eq!(pn, &pn1);
                 assert_eq!(val, "hello");
             }
@@ -627,7 +627,7 @@ mod tests {
         // Should produce Prepare broadcast
         assert!(!outgoing.is_empty());
         for out in &outgoing {
-            assert!(matches!(&out.message, Message::Prepare { slot: 0, .. }));
+            assert!(matches!(&out.message, MessageVariant::Prepare { slot: 0, .. }));
             assert!(matches!(&out.target, SendTarget::Broadcast));
         }
 
@@ -652,7 +652,7 @@ mod tests {
 
         // With quorum_size=1, self-vote gives immediate decision
         // Should produce Decide broadcast
-        assert!(outgoing.iter().any(|o| matches!(&o.message, Message::Decide { .. })));
+        assert!(outgoing.iter().any(|o| matches!(&o.message, MessageVariant::Decide { .. })));
 
         let decisions = proto.take_decisions();
         assert_eq!(decisions.len(), 1);
@@ -667,7 +667,7 @@ mod tests {
 
         // We need one more promise (already have self-vote)
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
-        let responses = proto.handle_message(node("b"), Message::Promise {
+        let responses = proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0,
             proposal_number: pn.clone(),
             accepted: None,
@@ -677,7 +677,7 @@ mod tests {
         assert!(!responses.is_empty());
         for out in &responses {
             match &out.message {
-                Message::Accept { value, .. } => assert_eq!(value, "hello"),
+                MessageVariant::Accept { value, .. } => assert_eq!(value, "hello"),
                 _ => panic!("expected Accept, got {:?}", out.message),
             }
         }
@@ -691,7 +691,7 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Peer b already accepted a value at a lower proposal number
-        let responses = proto.handle_message(node("b"), Message::Promise {
+        let responses = proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0,
             proposal_number: pn.clone(),
             accepted: Some(((1, node("c")), "previous-value".to_string())),
@@ -700,7 +700,7 @@ mod tests {
         // Phase 2 should use "previous-value", not "my-value"
         for out in &responses {
             match &out.message {
-                Message::Accept { value, .. } => assert_eq!(value, "previous-value"),
+                MessageVariant::Accept { value, .. } => assert_eq!(value, "previous-value"),
                 _ => panic!("expected Accept"),
             }
         }
@@ -713,14 +713,14 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Peer b accepted at round 1
-        proto.handle_message(node("b"), Message::Promise {
+        proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0,
             proposal_number: pn.clone(),
             accepted: Some(((1, node("x")), "old-value".to_string())),
         });
 
         // Peer c accepted at round 3 (higher)
-        let responses = proto.handle_message(node("c"), Message::Promise {
+        let responses = proto.handle_message(node("c"), MessageVariant::Promise {
             slot: 0,
             proposal_number: pn.clone(),
             accepted: Some(((3, node("y")), "newer-value".to_string())),
@@ -729,7 +729,7 @@ mod tests {
         // Should use "newer-value" (highest proposal number)
         for out in &responses {
             match &out.message {
-                Message::Accept { value, .. } => assert_eq!(value, "newer-value"),
+                MessageVariant::Accept { value, .. } => assert_eq!(value, "newer-value"),
                 _ => panic!("expected Accept"),
             }
         }
@@ -742,10 +742,10 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Same peer sends Promise twice
-        proto.handle_message(node("b"), Message::Promise {
+        proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0, proposal_number: pn.clone(), accepted: None,
         });
-        let responses = proto.handle_message(node("b"), Message::Promise {
+        let responses = proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0, proposal_number: pn.clone(), accepted: None,
         });
 
@@ -762,17 +762,17 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Get quorum of promises to move to Phase 2
-        proto.handle_message(node("b"), Message::Promise {
+        proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0, proposal_number: pn.clone(), accepted: None,
         });
 
         // Now we need one more Accepted (already have self-vote from Phase 2)
-        let responses = proto.handle_message(node("b"), Message::Accepted {
+        let responses = proto.handle_message(node("b"), MessageVariant::Accepted {
             slot: 0, proposal_number: pn.clone(), value: "hello".to_string(),
         });
 
         // Should broadcast Decide
-        assert!(responses.iter().any(|o| matches!(&o.message, Message::Decide { .. })));
+        assert!(responses.iter().any(|o| matches!(&o.message, MessageVariant::Decide { .. })));
 
         let decisions = proto.take_decisions();
         assert_eq!(decisions.len(), 1);
@@ -786,18 +786,18 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Get quorum of promises (self + b + c = 3)
-        proto.handle_message(node("b"), Message::Promise {
+        proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0, proposal_number: pn.clone(), accepted: None,
         });
-        proto.handle_message(node("c"), Message::Promise {
+        proto.handle_message(node("c"), MessageVariant::Promise {
             slot: 0, proposal_number: pn.clone(), accepted: None,
         });
 
         // Same peer sends Accepted twice — should not trigger early quorum
-        proto.handle_message(node("b"), Message::Accepted {
+        proto.handle_message(node("b"), MessageVariant::Accepted {
             slot: 0, proposal_number: pn.clone(), value: "hello".to_string(),
         });
-        let responses = proto.handle_message(node("b"), Message::Accepted {
+        let responses = proto.handle_message(node("b"), MessageVariant::Accepted {
             slot: 0, proposal_number: pn.clone(), value: "hello".to_string(),
         });
 
@@ -810,7 +810,7 @@ mod tests {
     fn handle_decide_from_peer() {
         let mut proto = make_protocol("a", 3);
 
-        proto.handle_message(node("b"), Message::Decide {
+        proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 5,
             value: "remote-decision".to_string(),
         });
@@ -827,12 +827,12 @@ mod tests {
     #[test]
     fn decided_slot_ignores_further_messages() {
         let mut proto = make_protocol("a", 3);
-        proto.handle_message(node("b"), Message::Decide {
+        proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 0, value: "decided".to_string(),
         });
         proto.take_decisions();
 
-        let responses = proto.handle_message(node("c"), Message::Prepare {
+        let responses = proto.handle_message(node("c"), MessageVariant::Prepare {
             slot: 0, proposal_number: (10, node("c")),
         });
         assert!(responses.is_empty());
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn instance_garbage_collected_after_decision() {
         let mut proto = make_protocol("a", 3);
-        proto.handle_message(node("b"), Message::Decide {
+        proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 0, value: "done".to_string(),
         });
         proto.take_decisions();
@@ -858,7 +858,7 @@ mod tests {
         let mut proto = make_protocol("a", 3);
         let (_, _) = proto.propose("my-value".to_string());
 
-        proto.handle_message(node("b"), Message::Decide {
+        proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 0, value: "my-value".to_string(),
         });
 
@@ -872,7 +872,7 @@ mod tests {
         let (_, _) = proto.propose("my-value".to_string());
 
         // A different value decided for our slot
-        proto.handle_message(node("b"), Message::Decide {
+        proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 0, value: "other-value".to_string(),
         });
 
@@ -889,7 +889,7 @@ mod tests {
         let (_, _) = proto.propose("hello".to_string());
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
-        proto.handle_message(node("b"), Message::NackPrepare {
+        proto.handle_message(node("b"), MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: pn,
             highest_promised: (10, node("b")),
@@ -908,7 +908,7 @@ mod tests {
         let old_pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Nack so retry is allowed
-        proto.handle_message(node("b"), Message::NackPrepare {
+        proto.handle_message(node("b"), MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: old_pn.clone(),
             highest_promised: (5, node("b")),
@@ -930,14 +930,14 @@ mod tests {
 
         // Accept a value as acceptor
         let from = node("b");
-        proto.handle_message(from.clone(), Message::Accept {
+        proto.handle_message(from.clone(), MessageVariant::Accept {
             slot: 0,
             proposal_number: (5, from.clone()),
             value: "other".to_string(),
         });
 
         // Nack and retry
-        proto.handle_message(from.clone(), Message::NackPrepare {
+        proto.handle_message(from.clone(), MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
             highest_promised: (10, from),
@@ -957,13 +957,13 @@ mod tests {
         let (_, _) = proto.propose("hello".to_string());
 
         // Another proposer's Prepare updates our acceptor's highest_promised to round 20
-        proto.handle_message(node("c"), Message::Prepare {
+        proto.handle_message(node("c"), MessageVariant::Prepare {
             slot: 0,
             proposal_number: (20, node("c")),
         });
 
         // Our proposal gets nacked with a lower round (5)
-        proto.handle_message(node("b"), Message::NackPrepare {
+        proto.handle_message(node("b"), MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
             highest_promised: (5, node("b")),
@@ -983,13 +983,13 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
 
         // Another proposer updates our highest_promised to a high round
-        proto.handle_message(node("c"), Message::Prepare {
+        proto.handle_message(node("c"), MessageVariant::Prepare {
             slot: 0,
             proposal_number: (100, node("c")),
         });
 
         // Now peer b sends Promise for our original (low) proposal number
-        let _responses = proto.handle_message(node("b"), Message::Promise {
+        let _responses = proto.handle_message(node("b"), MessageVariant::Promise {
             slot: 0,
             proposal_number: pn.clone(),
             accepted: None,
@@ -1010,7 +1010,7 @@ mod tests {
         let mut proto = make_protocol("a", 3);
         let (_, _) = proto.propose("hello".to_string());
 
-        proto.handle_message(node("b"), Message::NackPrepare {
+        proto.handle_message(node("b"), MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
             highest_promised: (5, node("b")),

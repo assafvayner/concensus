@@ -6,7 +6,7 @@ use crate::config::NodeId;
 pub(crate) type ProposalNumber = (u64, NodeId);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) enum Message<V> {
+pub(crate) enum MessageVariant<V> {
     Prepare {
         slot: u64,
         proposal_number: ProposalNumber,
@@ -40,6 +40,12 @@ pub(crate) enum Message<V> {
         proposal_number: ProposalNumber,
         highest_promised: ProposalNumber,
     },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct Message<V> {
+    pub sender: NodeId,
+    pub variant: MessageVariant<V>,
 }
 
 impl<V> Message<V>
@@ -82,37 +88,37 @@ mod tests {
 
     #[test]
     fn prepare_message_serde_roundtrip() {
-        let msg: Message<String> = Message::Prepare {
+        let msg: MessageVariant<String> = MessageVariant::Prepare {
             slot: 0,
             proposal_number: (1, test_node_id()),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message<String> = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, Message::Prepare { slot: 0, .. }));
+        let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, MessageVariant::Prepare { slot: 0, .. }));
     }
 
     #[test]
     fn promise_with_accepted_value_serde_roundtrip() {
-        let msg: Message<String> = Message::Promise {
+        let msg: MessageVariant<String> = MessageVariant::Promise {
             slot: 0,
             proposal_number: (1, test_node_id()),
             accepted: Some(((0, test_node_id()), "hello".to_string())),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message<String> = serde_json::from_str(&json).unwrap();
+        let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
         match deserialized {
-            Message::Promise { accepted: Some((_, val)), .. } => assert_eq!(val, "hello"),
+            MessageVariant::Promise { accepted: Some((_, val)), .. } => assert_eq!(val, "hello"),
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
     fn decide_message_serde_roundtrip() {
-        let msg = Message::Decide { slot: 5, value: 42u64 };
+        let msg = MessageVariant::Decide { slot: 5, value: 42u64 };
         let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message<u64> = serde_json::from_str(&json).unwrap();
+        let deserialized: MessageVariant<u64> = serde_json::from_str(&json).unwrap();
         match deserialized {
-            Message::Decide { slot, value } => {
+            MessageVariant::Decide { slot, value } => {
                 assert_eq!(slot, 5);
                 assert_eq!(value, 42);
             }
@@ -122,43 +128,58 @@ mod tests {
 
     #[test]
     fn nack_prepare_serde_roundtrip() {
-        let msg: Message<String> = Message::NackPrepare {
+        let msg: MessageVariant<String> = MessageVariant::NackPrepare {
             slot: 0,
             proposal_number: (1, test_node_id()),
             highest_promised: (2, test_node_id()),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message<String> = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, Message::NackPrepare { .. }));
+        let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, MessageVariant::NackPrepare { .. }));
     }
 
     #[test]
     fn nack_accept_serde_roundtrip() {
-        let msg: Message<String> = Message::NackAccept {
+        let msg: MessageVariant<String> = MessageVariant::NackAccept {
             slot: 0,
             proposal_number: (1, test_node_id()),
             highest_promised: (2, test_node_id()),
         };
         let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: Message<String> = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, Message::NackAccept { .. }));
+        let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, MessageVariant::NackAccept { .. }));
     }
 
     #[test]
     fn message_to_bytes_and_back() {
-        let msg = Message::Accept {
+        let variant = MessageVariant::Accept {
             slot: 3,
             proposal_number: (1, test_node_id()),
             value: "test".to_string(),
         };
+        let msg = Message { sender: test_node_id(), variant };
         let bytes = msg.to_bytes().unwrap();
         let decoded: Message<String> = Message::from_bytes(&bytes).unwrap();
-        match decoded {
-            Message::Accept { slot, value, .. } => {
+        match decoded.variant {
+            MessageVariant::Accept { slot, value, .. } => {
                 assert_eq!(slot, 3);
                 assert_eq!(value, "test");
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn message_wrapper_roundtrip() {
+        let sender = test_node_id();
+        let variant = MessageVariant::Prepare {
+            slot: 7,
+            proposal_number: (2, test_node_id()),
+        };
+        let msg: Message<String> = Message { sender: sender.clone(), variant };
+        let bytes = msg.to_bytes().unwrap();
+        let decoded: Message<String> = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.sender, sender);
+        assert!(matches!(decoded.variant, MessageVariant::Prepare { slot: 7, .. }));
     }
 }

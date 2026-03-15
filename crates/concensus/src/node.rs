@@ -5,8 +5,8 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc;
 
-use crate::config::{NodeId, PeerConfig};
-use crate::error::{NodeError, ProposeError, TransportError};
+use crate::config::{NodeId, PeerInfo};
+use crate::error::{NodeError, ProposeError};
 use crate::message::Message;
 use crate::protocol::{Outgoing, ProtocolState, SendTarget};
 use crate::storage::Storage;
@@ -25,7 +25,8 @@ const DECISION_CHANNEL_CAPACITY: usize = 1024;
 
 pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
-    peers: Vec<PeerConfig<S, R>>,
+    peers: Vec<PeerInfo<S>>,
+    receiver: Option<R>,
     storage: Box<dyn Storage<V> + Send>,
     protocol: ProtocolState<V>,
     proposal_rx: mpsc::Receiver<V>,
@@ -52,7 +53,8 @@ where
 {
     pub fn new(
         name: impl Into<Arc<str>>,
-        peers: Vec<PeerConfig<S, R>>,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let incarnation = SystemTime::now()
@@ -60,21 +62,23 @@ where
             .expect("system clock before UNIX epoch")
             .as_secs();
         let node_id = NodeId::new(name, incarnation);
-        Self::with_id_inner(node_id, peers, storage)
+        Self::with_id_inner(node_id, peers, receiver, storage)
     }
 
     #[cfg(test)]
     pub fn with_id(
         node_id: NodeId,
-        peers: Vec<PeerConfig<S, R>>,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
-        Self::with_id_inner(node_id, peers, storage)
+        Self::with_id_inner(node_id, peers, receiver, storage)
     }
 
     fn with_id_inner(
         node_id: NodeId,
-        peers: Vec<PeerConfig<S, R>>,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
@@ -85,6 +89,7 @@ where
         let node = Self {
             node_id,
             peers,
+            receiver: Some(receiver),
             storage: Box::new(storage),
             protocol,
             proposal_rx,
@@ -101,35 +106,18 @@ where
         let decisions = self.storage.load_decisions().await.map_err(NodeError::Storage)?;
         self.protocol.initialize_from_decisions(decisions);
 
-        // Split peers into senders and receivers
+        // Build senders list
         let mut senders: Vec<(NodeId, S)> = Vec::new();
-        let (incoming_tx, mut incoming_rx) =
-            mpsc::channel::<(NodeId, Result<Bytes, TransportError>)>(1024);
-
         let peers = std::mem::take(&mut self.peers);
         let has_peers = !peers.is_empty();
 
         for peer in peers {
-            senders.push((peer.id.clone(), peer.sender));
-            let peer_id = peer.id;
-            let tx = incoming_tx.clone();
-            let mut receiver = peer.receiver;
-            tokio::spawn(async move {
-                loop {
-                    let result = receiver.recv().await;
-                    let is_err = result.is_err();
-                    if tx.send((peer_id.clone(), result)).await.is_err() {
-                        break; // Node dropped
-                    }
-                    if is_err {
-                        break; // Peer disconnected
-                    }
-                }
-            });
+            senders.push((peer.id, peer.sender));
         }
-        drop(incoming_tx); // Only spawned tasks hold senders now
 
-        let mut active_peers = senders.len();
+        // Take receiver out of Option
+        let mut receiver = self.receiver.take().unwrap();
+
         let total_cluster = senders.len() + 1; // including self
         let quorum = (total_cluster / 2) + 1;
 
@@ -149,20 +137,13 @@ where
                             }
                         }
                     }
-                    incoming = incoming_rx.recv() => {
-                        match incoming {
-                            Some((from, Ok(data))) => {
-                                self.handle_incoming_message(from, &data, &senders).await?;
+                    result = receiver.recv() => {
+                        match result {
+                            Ok(data) => {
+                                self.handle_incoming_bytes(&data, &senders).await?;
                             }
-                            Some((from, Err(e))) => {
-                                tracing::warn!(peer = %from, error = %e, "peer disconnected");
-                                active_peers -= 1;
-                                if active_peers + 1 < quorum && !self.protocol.is_idle() {
-                                    return Err(NodeError::NoQuorum);
-                                }
-                            }
-                            None => {
-                                // All receiver tasks exited
+                            Err(e) => {
+                                tracing::warn!(error = %e, "receiver error");
                                 if 1 < quorum && !self.protocol.is_idle() {
                                     return Err(NodeError::NoQuorum);
                                 }
@@ -193,28 +174,29 @@ where
     async fn handle_proposal(&mut self, value: V, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
         let (slot, outgoing) = self.protocol.propose(value);
         tracing::debug!(slot, "new proposal");
-        Self::send_outgoing(&outgoing, senders).await;
+        Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
         Ok(())
     }
 
-    async fn handle_incoming_message(
+    async fn handle_incoming_bytes(
         &mut self,
-        from: NodeId,
         data: &[u8],
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
         match Message::<V>::from_bytes(data) {
             Ok(msg) => {
-                let outgoing = self.protocol.handle_message(from, msg);
-                Self::send_outgoing(&outgoing, senders).await;
+                let from = msg.sender;
+                let variant = msg.variant;
+                let outgoing = self.protocol.handle_message(from, variant);
+                Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
                 // Re-propose any lost proposals
                 let lost = self.protocol.take_lost_proposals();
                 for value in lost {
                     let (_, outgoing) = self.protocol.propose(value);
-                    Self::send_outgoing(&outgoing, senders).await;
+                    Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                     self.process_decisions().await?;
                 }
             }
@@ -230,13 +212,17 @@ where
         for slot in slots {
             tracing::debug!(slot, "retrying proposal");
             let outgoing = self.protocol.retry_proposal(slot);
-            Self::send_outgoing(&outgoing, senders).await;
+            Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         }
     }
 
-    async fn send_outgoing(outgoing: &[Outgoing<V>], senders: &[(NodeId, S)]) {
+    async fn send_outgoing(node_id: &NodeId, outgoing: &[Outgoing<V>], senders: &[(NodeId, S)]) {
         for out in outgoing {
-            let bytes = match out.message.to_bytes() {
+            let msg = Message {
+                sender: node_id.clone(),
+                variant: out.message.clone(),
+            };
+            let bytes = match msg.to_bytes() {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to serialize message");
@@ -301,7 +287,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PeerConfig;
+    use crate::config::PeerInfo;
     use crate::error::TransportError;
     use crate::storage::MemoryStorage;
 
@@ -326,6 +312,7 @@ mod tests {
         let (_node, _handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::new(
             "test-node",
             vec![],
+            DummyReceiver,
             MemoryStorage::new(),
         );
     }
@@ -335,6 +322,7 @@ mod tests {
         let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::new(
             "test-node",
             vec![],
+            DummyReceiver,
             MemoryStorage::new(),
         );
         let _handle2 = handle.clone();
@@ -345,6 +333,7 @@ mod tests {
         let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::new(
             "test-node",
             vec![],
+            DummyReceiver,
             MemoryStorage::new(),
         );
         // Fill the channel (capacity 1024)
@@ -361,6 +350,7 @@ mod tests {
         let (node, handle, mut decision_rx) = Node::<String, DummySender, DummyReceiver>::new(
             "solo",
             vec![],
+            DummyReceiver,
             MemoryStorage::new(),
         );
 
@@ -407,13 +397,10 @@ mod tests {
             }
         }
 
-        // Bidirectional channels: A<->B, A<->C, B<->C
-        let (ab_tx, ab_rx) = tokio_mpsc::channel(64);
-        let (ba_tx, ba_rx) = tokio_mpsc::channel(64);
-        let (ac_tx, ac_rx) = tokio_mpsc::channel(64);
-        let (ca_tx, ca_rx) = tokio_mpsc::channel(64);
-        let (bc_tx, bc_rx) = tokio_mpsc::channel(64);
-        let (cb_tx, cb_rx) = tokio_mpsc::channel(64);
+        // One channel per node for receiving (all senders write to target node's channel)
+        let (a_tx, a_rx) = tokio_mpsc::channel::<Bytes>(64);
+        let (b_tx, b_rx) = tokio_mpsc::channel::<Bytes>(64);
+        let (c_tx, c_rx) = tokio_mpsc::channel::<Bytes>(64);
 
         let id_a = NodeId::new("a", 1000);
         let id_b = NodeId::new("b", 1000);
@@ -422,49 +409,28 @@ mod tests {
         let (node_a, handle_a, mut rx_a) = Node::with_id(
             id_a.clone(),
             vec![
-                PeerConfig {
-                    id: id_b.clone(),
-                    sender: ChannelSender(ab_tx),
-                    receiver: ChannelReceiver(ba_rx),
-                },
-                PeerConfig {
-                    id: id_c.clone(),
-                    sender: ChannelSender(ac_tx),
-                    receiver: ChannelReceiver(ca_rx),
-                },
+                PeerInfo { id: id_b.clone(), sender: ChannelSender(b_tx.clone()) },
+                PeerInfo { id: id_c.clone(), sender: ChannelSender(c_tx.clone()) },
             ],
+            ChannelReceiver(a_rx),
             MemoryStorage::<String>::new(),
         );
         let (node_b, _handle_b, mut rx_b) = Node::with_id(
             id_b.clone(),
             vec![
-                PeerConfig {
-                    id: id_a.clone(),
-                    sender: ChannelSender(ba_tx),
-                    receiver: ChannelReceiver(ab_rx),
-                },
-                PeerConfig {
-                    id: id_c.clone(),
-                    sender: ChannelSender(bc_tx),
-                    receiver: ChannelReceiver(cb_rx),
-                },
+                PeerInfo { id: id_a.clone(), sender: ChannelSender(a_tx.clone()) },
+                PeerInfo { id: id_c.clone(), sender: ChannelSender(c_tx.clone()) },
             ],
+            ChannelReceiver(b_rx),
             MemoryStorage::<String>::new(),
         );
         let (node_c, _handle_c, mut rx_c) = Node::with_id(
             id_c.clone(),
             vec![
-                PeerConfig {
-                    id: id_a.clone(),
-                    sender: ChannelSender(ca_tx),
-                    receiver: ChannelReceiver(ac_rx),
-                },
-                PeerConfig {
-                    id: id_b.clone(),
-                    sender: ChannelSender(cb_tx),
-                    receiver: ChannelReceiver(bc_rx),
-                },
+                PeerInfo { id: id_a.clone(), sender: ChannelSender(a_tx.clone()) },
+                PeerInfo { id: id_b.clone(), sender: ChannelSender(b_tx.clone()) },
             ],
+            ChannelReceiver(c_rx),
             MemoryStorage::<String>::new(),
         );
 
