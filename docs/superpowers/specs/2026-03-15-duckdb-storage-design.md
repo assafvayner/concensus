@@ -106,7 +106,7 @@ When a slot is decided, `save_decision` handles cleanup of acceptor state intern
 
 ### Location
 
-`crates/concensus/src/storage/duckdb.rs`, gated behind a `duckdb-storage` feature flag in `Cargo.toml`.
+`concensus/src/storage/duckdb.rs`, gated behind a `duckdb-storage` feature flag in `Cargo.toml`.
 
 ### Schema
 
@@ -151,7 +151,7 @@ The `Connection` is wrapped in `Arc<Mutex<>>` (from `std::sync`) so that it can 
 
 ### Dependency
 
-`duckdb` crate added as an optional dependency in `crates/concensus/Cargo.toml`:
+`duckdb` crate added as an optional dependency in `concensus/Cargo.toml`:
 
 ```toml
 [features]
@@ -184,7 +184,7 @@ All new types re-exported from `lib.rs`.
 
 ### Config Changes
 
-The demo node (`crates/concensus-demo/src/node.rs`) gains a new environment variable:
+The demo node (`concensus-demo/src/node.rs`) gains a new environment variable:
 
 - `STORAGE` — `"memory"` (default) or `"duckdb"`
 - `DUCKDB_PATH` — file path for DuckDB database (required when `STORAGE=duckdb`, e.g. `/data/consensus.db`)
@@ -202,7 +202,7 @@ enum StorageBackend {
 
 ### Demo Dependency Changes
 
-`crates/concensus-demo/Cargo.toml` adds the `duckdb-storage` feature:
+`concensus-demo/Cargo.toml` adds the `duckdb-storage` feature:
 
 ```toml
 concensus = { path = "../concensus", features = ["tcp-transport", "uds-transport", "test-support", "duckdb-storage"] }
@@ -215,8 +215,8 @@ New compose file `docker-compose.duckdb.yml` (TCP transport + DuckDB storage) wi
 ```yaml
 x-node: &node-base
   build:
-    context: ../..
-    dockerfile: crates/concensus-demo/Dockerfile
+    context: ..
+    dockerfile: concensus-demo/Dockerfile
   environment: &node-env
     TRANSPORT: tcp
     BIND_ADDR: "0.0.0.0:9000"
