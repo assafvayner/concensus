@@ -28,6 +28,14 @@ pub(crate) struct Decision<V> {
     pub value: V,
 }
 
+#[cfg(feature = "multi-paxos")]
+#[derive(Debug)]
+pub(crate) enum LeaderState {
+    Leader { term: u64 },
+    Follower { leader: Option<NodeId>, last_contact: Instant },
+    Candidate,
+}
+
 /// Manages all active Paxos instances
 pub(crate) struct ProtocolState<V> {
     pub(crate) node_id: NodeId,
@@ -40,6 +48,12 @@ pub(crate) struct ProtocolState<V> {
     /// Recent decisions to re-broadcast during retries so peers that missed
     /// the original Decide message can learn the outcome.
     recent_decisions: Vec<(Instant, u64, V)>,
+    #[cfg(feature = "multi-paxos")]
+    leader_state: LeaderState,
+    #[cfg(feature = "multi-paxos")]
+    highest_seen_round: u64,
+    #[cfg(feature = "multi-paxos")]
+    last_decide_time: Option<Instant>,
 }
 
 /// Per-slot Paxos instance
@@ -108,6 +122,15 @@ where
             pending_decisions: Vec::new(),
             lost_proposals: Vec::new(),
             recent_decisions: Vec::new(),
+            #[cfg(feature = "multi-paxos")]
+            leader_state: LeaderState::Follower {
+                leader: None,
+                last_contact: Instant::now(),
+            },
+            #[cfg(feature = "multi-paxos")]
+            highest_seen_round: 0,
+            #[cfg(feature = "multi-paxos")]
+            last_decide_time: None,
         }
     }
 
@@ -159,7 +182,7 @@ where
                 value,
             } => self.handle_accepted(from, slot, proposal_number, value),
             MessageVariant::Decide { slot, value } => {
-                self.handle_decide(slot, value);
+                self.handle_decide(from, slot, value);
                 vec![]
             }
             MessageVariant::NackPrepare {
@@ -178,6 +201,10 @@ where
                 self.handle_nack(slot, highest_promised);
                 vec![]
             }
+            #[cfg(feature = "multi-paxos")]
+            MessageVariant::Forward { value } => self.handle_forward(from, value),
+            #[cfg(feature = "multi-paxos")]
+            MessageVariant::Heartbeat { term } => self.handle_heartbeat(from, term),
         }
     }
 
@@ -315,6 +342,11 @@ where
 
         if instance.promises_received.len() >= quorum_size {
             tracing::debug!(slot, "promise quorum reached, starting Phase 2");
+            #[cfg(feature = "multi-paxos")]
+            {
+                let term = self.instances.get(&slot).unwrap().proposal_number.0;
+                self.become_leader(term);
+            }
             self.start_phase2(slot)
         } else {
             vec![]
@@ -358,7 +390,14 @@ where
     }
 
     // -- Decide handler --
-    fn handle_decide(&mut self, slot: u64, value: V) {
+    fn handle_decide(&mut self, from: NodeId, slot: u64, value: V) {
+        #[cfg(feature = "multi-paxos")]
+        {
+            self.update_leader_contact(&from, self.highest_seen_round);
+        }
+        #[cfg(not(feature = "multi-paxos"))]
+        let _ = &from;
+
         if self.decided_slots.contains_key(&slot) {
             return;
         }
@@ -397,6 +436,13 @@ where
             instance.next_retry_at =
                 Some(Instant::now() + std::time::Duration::from_millis(backoff_ms + jitter_ms));
         }
+        #[cfg(feature = "multi-paxos")]
+        {
+            self.update_highest_seen_round(highest_promised.0);
+            if matches!(self.leader_state, LeaderState::Leader { .. }) {
+                self.step_down(None);
+            }
+        }
     }
 
     // -- Decide helper --
@@ -408,10 +454,29 @@ where
             self.next_slot = slot + 1;
         }
         self.pending_decisions.push(Decision { slot, value });
+        #[cfg(feature = "multi-paxos")]
+        {
+            self.last_decide_time = Some(Instant::now());
+        }
     }
 
-    // -- Propose: starts Phase 1, self-votes as acceptor --
+    // -- Propose: entry point --
+    #[cfg(feature = "multi-paxos")]
     pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
+        if let LeaderState::Leader { term } = self.leader_state {
+            self.propose_fast_path(value, term)
+        } else {
+            self.propose_full_paxos(value)
+        }
+    }
+
+    #[cfg(not(feature = "multi-paxos"))]
+    pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
+        self.propose_full_paxos(value)
+    }
+
+    // -- Full Paxos propose: Phase 1 + self-vote --
+    fn propose_full_paxos(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
         let slot = self.next_slot;
         self.next_slot += 1;
 
@@ -446,6 +511,60 @@ where
                 message: MessageVariant::Prepare {
                     slot,
                     proposal_number,
+                },
+            }],
+        )
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn propose_fast_path(&mut self, value: V, term: u64) -> (u64, Vec<Outgoing<V>>) {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+
+        let node_id = self.node_id.clone();
+        let proposal_number: ProposalNumber = (term, node_id.clone());
+
+        let instance = self.get_or_create_instance(slot);
+        instance.proposal_number = proposal_number.clone();
+        instance.proposed_value = Some(value.clone());
+        instance.is_proposer = true;
+        instance.last_send_time = Some(Instant::now());
+        let stale_ms = 100u64;
+        let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
+        instance.next_retry_at =
+            Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
+
+        // Skip Phase 1 — go directly to Phase 2
+        // Self-vote as acceptor
+        instance.highest_promised = Some(proposal_number.clone());
+        instance.accepted = Some((proposal_number.clone(), value.clone()));
+        instance.accepts_received.insert(node_id.clone());
+        // Also count self in promises (for retry logic consistency)
+        instance.promises_received.insert(node_id);
+
+        tracing::debug!(slot, term, "leader fast path: skipping Phase 1");
+
+        // Check single-node quorum
+        if instance.accepts_received.len() >= self.quorum_size {
+            self.decide(slot, value.clone());
+            self.instances.remove(&slot);
+            return (
+                slot,
+                vec![Outgoing {
+                    target: SendTarget::Broadcast,
+                    message: MessageVariant::Decide { slot, value },
+                }],
+            );
+        }
+
+        (
+            slot,
+            vec![Outgoing {
+                target: SendTarget::Broadcast,
+                message: MessageVariant::Accept {
+                    slot,
+                    proposal_number,
+                    value,
                 },
             }],
         )
@@ -607,6 +726,167 @@ where
                 proposal_number,
             },
         }]
+    }
+
+    // =======================================================================
+    // Multi-Paxos leader methods
+    // =======================================================================
+
+    #[cfg(feature = "multi-paxos")]
+    fn become_leader(&mut self, term: u64) {
+        tracing::info!(term, node = %self.node_id, "became leader");
+        self.leader_state = LeaderState::Leader { term };
+        self.highest_seen_round = self.highest_seen_round.max(term);
+        self.last_decide_time = None;
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn step_down(&mut self, new_leader: Option<NodeId>) {
+        if matches!(self.leader_state, LeaderState::Leader { .. }) {
+            tracing::info!(node = %self.node_id, ?new_leader, "stepping down from leader");
+        }
+        self.leader_state = LeaderState::Follower {
+            leader: new_leader,
+            last_contact: Instant::now(),
+        };
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn update_leader_contact(&mut self, from: &NodeId, term: u64) {
+        self.highest_seen_round = self.highest_seen_round.max(term);
+        match &mut self.leader_state {
+            LeaderState::Follower {
+                leader,
+                last_contact,
+            } => {
+                *leader = Some(from.clone());
+                *last_contact = Instant::now();
+            }
+            LeaderState::Candidate => {
+                self.leader_state = LeaderState::Follower {
+                    leader: Some(from.clone()),
+                    last_contact: Instant::now(),
+                };
+            }
+            LeaderState::Leader { term: my_term } => {
+                if term > *my_term {
+                    self.step_down(Some(from.clone()));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn update_highest_seen_round(&mut self, round: u64) {
+        self.highest_seen_round = self.highest_seen_round.max(round);
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    pub(crate) fn get_leader(&self) -> Option<NodeId> {
+        match &self.leader_state {
+            LeaderState::Leader { .. } => Some(self.node_id.clone()),
+            LeaderState::Follower { leader, .. } => leader.clone(),
+            LeaderState::Candidate => None,
+        }
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    pub(crate) fn should_send_heartbeat(&self) -> bool {
+        if let LeaderState::Leader { .. } = &self.leader_state {
+            let heartbeat_interval = std::time::Duration::from_millis(100);
+            match self.last_decide_time {
+                Some(t) => Instant::now().duration_since(t) >= heartbeat_interval,
+                None => true,
+            }
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    pub(crate) fn make_heartbeat(&self) -> Vec<Outgoing<V>> {
+        if let LeaderState::Leader { term } = &self.leader_state {
+            vec![Outgoing {
+                target: SendTarget::Broadcast,
+                message: MessageVariant::Heartbeat { term: *term },
+            }]
+        } else {
+            vec![]
+        }
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    pub(crate) fn check_leader_timeout(&self) -> bool {
+        let leader_timeout = std::time::Duration::from_millis(500);
+        if let LeaderState::Follower {
+            leader: Some(_),
+            last_contact,
+        } = &self.leader_state
+        {
+            Instant::now().duration_since(*last_contact) >= leader_timeout
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    pub(crate) fn start_election(&mut self) -> Vec<Outgoing<V>> {
+        tracing::info!(node = %self.node_id, "starting leader election");
+        self.leader_state = LeaderState::Candidate;
+
+        let round = self.highest_seen_round + 1;
+        let slot = self.next_slot;
+        self.next_slot += 1;
+
+        let node_id = self.node_id.clone();
+        let proposal_number: ProposalNumber = (round, node_id.clone());
+        let instance = self.get_or_create_instance(slot);
+        instance.proposal_number = proposal_number.clone();
+        instance.is_proposer = true;
+        instance.last_send_time = Some(Instant::now());
+        let stale_ms = 100u64;
+        let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
+        instance.next_retry_at =
+            Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
+
+        // Self-vote
+        instance.highest_promised = Some(proposal_number.clone());
+        instance.promises_received.insert(node_id);
+
+        if instance.promises_received.len() >= self.quorum_size {
+            self.become_leader(round);
+            return vec![];
+        }
+
+        self.update_highest_seen_round(round);
+
+        vec![Outgoing {
+            target: SendTarget::Broadcast,
+            message: MessageVariant::Prepare {
+                slot,
+                proposal_number,
+            },
+        }]
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn handle_heartbeat(&mut self, from: NodeId, term: u64) -> Vec<Outgoing<V>> {
+        if term >= self.highest_seen_round {
+            self.update_leader_contact(&from, term);
+        }
+        vec![]
+    }
+
+    #[cfg(feature = "multi-paxos")]
+    fn handle_forward(&mut self, _from: NodeId, value: V) -> Vec<Outgoing<V>> {
+        if let LeaderState::Leader { .. } = &self.leader_state {
+            tracing::debug!(node = %self.node_id, "received forwarded proposal");
+            let (_, outgoing) = self.propose(value);
+            outgoing
+        } else {
+            tracing::debug!(node = %self.node_id, "received forward but not leader, ignoring");
+            vec![]
+        }
     }
 }
 
