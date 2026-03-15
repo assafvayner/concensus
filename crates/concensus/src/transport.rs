@@ -1,3 +1,13 @@
+//! Transport traits and implementations for inter-node communication.
+//!
+//! The consensus protocol is transport-agnostic. Any type implementing
+//! [`MessageSender`] and [`MessageReceiver`] can be used to connect nodes.
+//! Three implementations are provided behind feature flags:
+//!
+//! - [`channel`] — in-memory channels (feature: `channel-transport`)
+//! - [`tcp`] — TCP with length-prefixed framing (feature: `tcp-transport`)
+//! - [`uds`] — Unix domain sockets (feature: `uds-transport`)
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use crate::error::TransportError;
@@ -8,13 +18,33 @@ pub mod channel;
 #[cfg(feature = "tcp-transport")]
 pub mod tcp;
 
+#[cfg(feature = "uds-transport")]
+pub mod uds;
+
+/// Sends serialized Paxos messages to a single remote peer.
+///
+/// Each [`PeerInfo`](crate::PeerInfo) holds one `MessageSender` for its peer.
+/// The [`Node`](crate::Node) calls `send` to deliver protocol messages;
+/// transient failures are tolerated since the Paxos protocol retries.
+///
+/// Implementations must be `Send + 'static` so they can be held across `.await` points.
 #[async_trait]
 pub trait MessageSender: Send + 'static {
+    /// Send `data` to the peer. Returns an error if the connection is closed
+    /// or unrecoverable.
     async fn send(&self, data: Bytes) -> Result<(), TransportError>;
 }
 
+/// Receives serialized Paxos messages from any peer in the cluster.
+///
+/// A single `MessageReceiver` is passed to [`Node::new`](crate::Node::new)
+/// and polled in the event loop to process incoming protocol messages.
+///
+/// Implementations must be `Send + 'static`.
 #[async_trait]
 pub trait MessageReceiver: Send + 'static {
+    /// Wait for the next incoming message. Returns [`TransportError::Closed`]
+    /// when no more messages will arrive.
     async fn recv(&mut self) -> Result<Bytes, TransportError>;
 }
 

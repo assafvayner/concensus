@@ -1,3 +1,8 @@
+//! In-memory channel transport for testing and single-process clusters.
+//!
+//! Uses tokio mpsc channels under the hood. Create pairs with [`channel`]
+//! (bounded, with backpressure) or [`unbounded_channel`].
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -15,10 +20,12 @@ enum ReceiverInner {
     Unbounded(mpsc::UnboundedReceiver<Bytes>),
 }
 
+/// Sender half of an in-memory channel transport. Cloneable.
 pub struct ChannelSender {
     inner: SenderInner,
 }
 
+/// Receiver half of an in-memory channel transport.
 pub struct ChannelReceiver {
     inner: ReceiverInner,
 }

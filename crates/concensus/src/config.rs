@@ -3,11 +3,30 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::transport::MessageSender;
 
+/// A remote peer's identity paired with a sender for delivering messages to it.
+///
+/// Each peer in the cluster is represented by a `PeerInfo` that the [`Node`](crate::Node)
+/// uses to route outgoing Paxos messages.
 pub struct PeerInfo<S: MessageSender> {
+    /// The peer's unique identity.
     pub id: NodeId,
+    /// A transport sender connected to this peer.
     pub sender: S,
 }
 
+/// Unique identity of a node in the cluster.
+///
+/// A `NodeId` consists of a human-readable name (e.g. `"node-1"`) and a numeric
+/// incarnation. The incarnation distinguishes restarts of the same named node so
+/// that stale messages from a previous process are not confused with the current one.
+///
+/// `NodeId` is cheaply cloneable (the name is reference-counted) and implements
+/// `Ord` — ordering is lexicographic by name first, then by incarnation. This
+/// ordering is used internally for proposal number tie-breaking.
+///
+/// # Display
+///
+/// Formats as `name/incarnation`, e.g. `"node-1/1710412800"`.
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct NodeId {
     name: Arc<str>,
@@ -15,10 +34,15 @@ pub struct NodeId {
 }
 
 impl NodeId {
+    /// Creates a new `NodeId` with the given name and incarnation number.
     pub fn new(name: impl Into<Arc<str>>, incarnation: u64) -> Self {
         Self { name: name.into(), incarnation }
     }
+
+    /// Returns the human-readable name portion of this node identity.
     pub fn name(&self) -> &str { &self.name }
+
+    /// Returns the incarnation number, typically a UNIX timestamp set at node startup.
     pub fn incarnation(&self) -> u64 { self.incarnation }
 }
 

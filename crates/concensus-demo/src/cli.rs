@@ -8,7 +8,10 @@ use consensus_proto::consensus_service_client::ConsensusServiceClient;
 use consensus_proto::{GetDecisionsRequest, HealthRequest, ProposeRequest};
 
 #[derive(Parser)]
-#[command(name = "concensus-cli", about = "CLI client for concensus-node gRPC API")]
+#[command(
+    name = "concensus-cli",
+    about = "CLI client for concensus-node gRPC API"
+)]
 struct Cli {
     /// gRPC server address (e.g. http://localhost:50051)
     #[arg(long)]
@@ -50,46 +53,40 @@ async fn main() {
         });
 
     match cli.command {
-        Command::Propose { value } => {
-            match client.propose(ProposeRequest { value }).await {
-                Ok(response) => {
-                    println!("{}", response.into_inner().status);
-                }
-                Err(status) => {
-                    eprintln!("error: {} ({})", status.message(), status.code());
-                    std::process::exit(1);
-                }
+        Command::Propose { value } => match client.propose(ProposeRequest { value }).await {
+            Ok(response) => {
+                println!("{}", response.into_inner().status);
             }
-        }
-        Command::Decisions => {
-            match client.get_decisions(GetDecisionsRequest {}).await {
-                Ok(response) => {
-                    let decisions = response.into_inner().decisions;
-                    if decisions.is_empty() {
-                        println!("no decisions yet");
-                    } else {
-                        println!("{:<8} VALUE", "SLOT");
-                        for d in decisions {
-                            println!("{:<8} {}", d.slot, d.value);
-                        }
+            Err(status) => {
+                eprintln!("error: {} ({})", status.message(), status.code());
+                std::process::exit(1);
+            }
+        },
+        Command::Decisions => match client.get_decisions(GetDecisionsRequest {}).await {
+            Ok(response) => {
+                let decisions = response.into_inner().decisions;
+                if decisions.is_empty() {
+                    println!("no decisions yet");
+                } else {
+                    println!("{:<8} VALUE", "SLOT");
+                    for d in decisions {
+                        println!("{:<8} {}", d.slot, d.value);
                     }
                 }
-                Err(status) => {
-                    eprintln!("error: {} ({})", status.message(), status.code());
-                    std::process::exit(1);
-                }
             }
-        }
-        Command::Health => {
-            match client.health(HealthRequest {}).await {
-                Ok(response) => {
-                    println!("{}", response.into_inner().status);
-                }
-                Err(status) => {
-                    eprintln!("error: {} ({})", status.message(), status.code());
-                    std::process::exit(1);
-                }
+            Err(status) => {
+                eprintln!("error: {} ({})", status.message(), status.code());
+                std::process::exit(1);
             }
-        }
+        },
+        Command::Health => match client.health(HealthRequest {}).await {
+            Ok(response) => {
+                println!("{}", response.into_inner().status);
+            }
+            Err(status) => {
+                eprintln!("error: {} ({})", status.message(), status.code());
+                std::process::exit(1);
+            }
+        },
     }
 }

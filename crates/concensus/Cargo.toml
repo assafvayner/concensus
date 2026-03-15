@@ -5,7 +5,9 @@ edition = "2021"
 
 [features]
 channel-transport = []
+test-support = []
 tcp-transport = ["tokio/net", "tokio/io-util"]
+uds-transport = ["tokio/net", "tokio/io-util"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }

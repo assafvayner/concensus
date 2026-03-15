@@ -1,33 +1,47 @@
 use thiserror::Error;
 
+/// Errors returned by [`NodeHandle::propose`](crate::NodeHandle::propose).
 #[derive(Error, Debug)]
 pub enum ProposeError {
+    /// The node's event loop has stopped (all handles dropped or fatal error).
     #[error("node is not running")]
     NotRunning,
+    /// The internal proposal queue is full. Back off and retry.
     #[error("proposal channel full")]
     ChannelFull,
 }
 
+/// Errors returned by [`Node::run`](crate::Node::run).
 #[derive(Error, Debug)]
 pub enum NodeError {
+    /// The transport receiver closed and the cluster cannot form a quorum,
+    /// making further progress impossible.
     #[error("all peers disconnected, cannot form quorum")]
     NoQuorum,
+    /// A storage operation failed during decision persistence or recovery.
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 }
 
+/// Errors from the [`Storage`](crate::Storage) trait.
 #[derive(Error, Debug)]
 pub enum StorageError {
+    /// Failed to persist a decided value.
     #[error("failed to persist decision: {0}")]
     Persist(String),
+    /// Failed to load previously decided values during recovery.
     #[error("failed to load decisions: {0}")]
     Load(String),
 }
 
+/// Errors from the [`MessageSender`](crate::MessageSender) and
+/// [`MessageReceiver`](crate::MessageReceiver) traits.
 #[derive(Error, Debug)]
 pub enum TransportError {
+    /// The underlying connection or channel has been closed.
     #[error("connection closed")]
     Closed,
+    /// A transport-specific error (I/O failure, bind error, etc.).
     #[error("transport error: {0}")]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }

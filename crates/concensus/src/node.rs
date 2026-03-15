@@ -1,3 +1,5 @@
+//! Core consensus node and its associated handle types.
+
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,17 +13,81 @@ use crate::protocol::{Outgoing, ProtocolState, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
 
+/// Channel receiver for consensus decisions.
+///
+/// Yields [`Decided`] values in the order they are finalized by the Paxos protocol.
+/// Obtain one from [`Node::new`] or [`Node::with_id`].
 pub type DecisionReceiver<V> = mpsc::Receiver<Decided<V>>;
 
+/// A value that has reached consensus, paired with its slot number.
+///
+/// All nodes in a healthy cluster will produce the same `Decided` value for each
+/// slot. Slots are assigned sequentially starting from 0.
 #[derive(Clone, Debug)]
 pub struct Decided<V> {
+    /// The slot number this value was decided in.
     pub slot: u64,
+    /// The decided value.
     pub value: V,
 }
 
 const PROPOSAL_CHANNEL_CAPACITY: usize = 1024;
 const DECISION_CHANNEL_CAPACITY: usize = 1024;
 
+/// A Paxos consensus node.
+///
+/// `Node` is the central type in this crate. It runs the Multi-Paxos protocol
+/// over a set of peers using pluggable transport and storage backends.
+///
+/// # Type Parameters
+///
+/// - `V` — the value type being decided. Must be serializable, cloneable, and
+///   comparable for equality (used to detect lost proposals).
+/// - `S` — the [`MessageSender`] implementation used to reach peers.
+/// - `R` — the [`MessageReceiver`] implementation for incoming messages.
+///
+/// # Lifecycle
+///
+/// 1. **Construct** via [`Node::new`] (production) or [`Node::with_id`] (testing).
+///    This returns `(Node, NodeHandle, DecisionReceiver)`.
+/// 2. **Spawn** the node's event loop with [`Node::run`] on a tokio task.
+/// 3. **Propose** values through the [`NodeHandle`].
+/// 4. **Consume** decided values from the [`DecisionReceiver`].
+/// 5. **Shut down** by dropping all [`NodeHandle`] clones — the event loop exits
+///    gracefully once the proposal channel closes.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use concensus::*;
+/// # async fn example<S: MessageSender + Sync, R: MessageReceiver>(
+/// #     peers: Vec<PeerInfo<S>>, receiver: R,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
+/// let storage = MemoryStorage::<String>::new();
+/// let (node, handle, mut decisions) = Node::new("my-node", peers, receiver, storage);
+///
+/// // Run the event loop
+/// tokio::spawn(async move {
+///     if let Err(e) = node.run().await {
+///         eprintln!("node error: {e}");
+///     }
+/// });
+///
+/// // Propose a value
+/// handle.propose("hello".into()).await?;
+///
+/// // Wait for the decision
+/// if let Some(decided) = decisions.recv().await {
+///     println!("slot {}: {}", decided.slot, decided.value);
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Single-Node Mode
+///
+/// When constructed with an empty peer list, the node acts as a single-node
+/// cluster and decides values immediately without network communication.
 pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
     peers: Vec<PeerInfo<S>>,
@@ -32,6 +98,13 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     decision_tx: mpsc::Sender<Decided<V>>,
 }
 
+/// A cloneable handle for submitting proposals to a running [`Node`].
+///
+/// Obtain a `NodeHandle` from [`Node::new`] or [`Node::with_id`]. Cloning is
+/// cheap (wraps a tokio mpsc sender) and allows multiple producers to submit
+/// proposals concurrently.
+///
+/// The node shuts down gracefully when all `NodeHandle` clones are dropped.
 pub struct NodeHandle<V> {
     proposal_tx: mpsc::Sender<V>,
 }
@@ -46,10 +119,19 @@ impl<V> Clone for NodeHandle<V> {
 
 impl<V, S, R> Node<V, S, R>
 where
-    V: Serialize + DeserializeOwned + Clone + Send + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
     S: MessageSender,
     R: MessageReceiver,
 {
+    /// Creates a new consensus node with an auto-generated [`NodeId`].
+    ///
+    /// The node ID is formed from the given `name` and the current UNIX timestamp
+    /// as the incarnation number, ensuring uniqueness across restarts.
+    ///
+    /// Returns `(node, handle, decision_rx)`:
+    /// - `node` — call [`Node::run`] to start the event loop
+    /// - `handle` — use [`NodeHandle::propose`] to submit values
+    /// - `decision_rx` — receives [`Decided`] values as consensus is reached
     pub fn new(
         name: impl Into<Arc<str>>,
         peers: Vec<PeerInfo<S>>,
@@ -64,7 +146,14 @@ where
         Self::with_id_inner(node_id, peers, receiver, storage)
     }
 
-    #[cfg(test)]
+    /// Creates a new consensus node with an explicit [`NodeId`].
+    ///
+    /// This is useful in tests where you need deterministic, matching node
+    /// identities across peers. In production, prefer [`Node::new`] which
+    /// generates the incarnation automatically.
+    ///
+    /// Requires the `test-support` feature flag (always available in `#[cfg(test)]`).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_id(
         node_id: NodeId,
         peers: Vec<PeerInfo<S>>,
@@ -98,6 +187,25 @@ where
         (node, NodeHandle { proposal_tx }, decision_rx)
     }
 
+    /// Runs the Paxos event loop until shutdown or fatal error.
+    ///
+    /// This method consumes the `Node` and drives the consensus protocol:
+    /// - Loads previously decided values from [`Storage`]
+    /// - Listens for proposals via the internal channel (from [`NodeHandle`])
+    /// - Processes incoming Paxos messages from peers
+    /// - Periodically retries stalled proposals with exponential backoff
+    /// - Re-broadcasts recent decisions so late peers can catch up
+    ///
+    /// # Shutdown
+    ///
+    /// The event loop exits when all [`NodeHandle`] clones are dropped (the
+    /// proposal channel closes). It returns `Ok(())` in this case.
+    ///
+    /// # Errors
+    ///
+    /// - [`NodeError::NoQuorum`] — the transport receiver closed while the node
+    ///   had outstanding proposals and needs a quorum to make progress.
+    /// - [`NodeError::Storage`] — a storage operation failed.
     pub async fn run(mut self) -> Result<(), NodeError> {
         tracing::info!(node_id = %self.node_id, "node starting");
 
@@ -213,6 +321,13 @@ where
             let outgoing = self.protocol.retry_proposal(slot);
             Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         }
+
+        // Re-broadcast recent decisions so peers that missed the original
+        // Decide message can learn the outcome.
+        let rebroadcasts = self.protocol.get_decision_rebroadcasts();
+        if !rebroadcasts.is_empty() {
+            Self::send_outgoing(&self.node_id, &rebroadcasts, senders).await;
+        }
     }
 
     async fn send_outgoing(node_id: &NodeId, outgoing: &[Outgoing<V>], senders: &[(NodeId, S)]) {
@@ -273,6 +388,20 @@ impl<V> NodeHandle<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
+    /// Submit a value for consensus.
+    ///
+    /// The value is enqueued for the node's event loop to process. It will
+    /// eventually be assigned a slot and decided by the cluster, or
+    /// re-proposed if another value wins the slot.
+    ///
+    /// This method uses non-blocking `try_send` semantics internally, so it
+    /// returns immediately.
+    ///
+    /// # Errors
+    ///
+    /// - [`ProposeError::ChannelFull`] — the internal proposal queue (capacity
+    ///   1024) is full. Back off and retry.
+    /// - [`ProposeError::NotRunning`] — the node's event loop has stopped.
     pub async fn propose(&self, value: V) -> Result<(), ProposeError> {
         self.proposal_tx
             .try_send(value)

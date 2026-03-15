@@ -3,20 +3,42 @@ use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use crate::error::StorageError;
 
+/// Durable storage for consensus decisions.
+///
+/// Implementations persist decided slot-value pairs so that a node can recover
+/// its state after a restart. The [`Node`](crate::Node) calls
+/// [`load_decisions`](Storage::load_decisions) once at startup and
+/// [`save_decision`](Storage::save_decision) each time a new value is decided.
+///
+/// For production use, implement this trait with a database or file-backed store.
+/// For testing, use [`MemoryStorage`].
 #[async_trait]
 pub trait Storage<V>: Send + 'static
 where
     V: Serialize + DeserializeOwned + Clone + Send,
 {
+    /// Persist a decided value for the given slot.
+    ///
+    /// Called exactly once per slot when a value reaches consensus.
     async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError>;
+
+    /// Load all previously persisted decisions.
+    ///
+    /// Called once during [`Node::run`](crate::Node::run) startup to recover
+    /// prior state. Returns `(slot, value)` pairs in any order.
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError>;
 }
 
+/// In-memory [`Storage`] implementation backed by a `HashMap`.
+///
+/// Decisions are lost when the process exits. Suitable for tests and
+/// ephemeral deployments where durability is not required.
 pub struct MemoryStorage<V> {
     decisions: HashMap<u64, V>,
 }
 
 impl<V> MemoryStorage<V> {
+    /// Creates an empty `MemoryStorage`.
     pub fn new() -> Self { Self { decisions: HashMap::new() } }
 }
 

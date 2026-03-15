@@ -1,0 +1,12 @@
+[package]
+name = "concensus-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+concensus = { path = "../concensus", features = ["channel-transport", "test-support"] }
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
+rand = "0.8"
+async-trait = "0.1"
+bytes = "1"

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use rand::Rng;
+
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
@@ -32,9 +34,12 @@ pub(crate) struct ProtocolState<V> {
     pub(crate) instances: HashMap<u64, PaxosInstance<V>>,
     next_slot: u64,
     quorum_size: usize,
-    decided_slots: HashSet<u64>,
+    decided_slots: HashMap<u64, V>,
     pending_decisions: Vec<Decision<V>>,
     lost_proposals: Vec<V>,
+    /// Recent decisions to re-broadcast during retries so peers that missed
+    /// the original Decide message can learn the outcome.
+    recent_decisions: Vec<(Instant, u64, V)>,
 }
 
 /// Per-slot Paxos instance
@@ -59,6 +64,12 @@ pub(crate) struct PaxosInstance<V> {
     highest_seen_nack: Option<u64>,
     last_nack_time: Option<Instant>,
     retry_count: u32,
+    /// When this instance last sent messages (propose or retry). Used to
+    /// detect proposals stuck without any response (e.g. lost messages).
+    last_send_time: Option<Instant>,
+    /// Earliest time at which the next retry is allowed. Computed once with
+    /// jitter when a nack or stale condition is detected.
+    next_retry_at: Option<Instant>,
 }
 
 impl<V> PaxosInstance<V> {
@@ -77,13 +88,15 @@ impl<V> PaxosInstance<V> {
             highest_seen_nack: None,
             last_nack_time: None,
             retry_count: 0,
+            last_send_time: None,
+            next_retry_at: None,
         }
     }
 }
 
 impl<V> ProtocolState<V>
 where
-    V: Serialize + DeserializeOwned + Clone + Send,
+    V: Serialize + DeserializeOwned + Clone + Send + PartialEq,
 {
     pub(crate) fn new(node_id: NodeId, total_nodes: usize) -> Self {
         Self {
@@ -91,16 +104,17 @@ where
             instances: HashMap::new(),
             next_slot: 0,
             quorum_size: (total_nodes / 2) + 1,
-            decided_slots: HashSet::new(),
+            decided_slots: HashMap::new(),
             pending_decisions: Vec::new(),
             lost_proposals: Vec::new(),
+            recent_decisions: Vec::new(),
         }
     }
 
     pub(crate) fn initialize_from_decisions(&mut self, decisions: Vec<(u64, V)>) {
-        for (slot, _) in &decisions {
-            self.decided_slots.insert(*slot);
-            if *slot >= self.next_slot {
+        for (slot, value) in decisions {
+            self.decided_slots.insert(slot, value);
+            if slot >= self.next_slot {
                 self.next_slot = slot + 1;
             }
         }
@@ -165,8 +179,12 @@ where
         slot: u64,
         proposal_number: ProposalNumber,
     ) -> Vec<Outgoing<V>> {
-        if self.decided_slots.contains(&slot) {
-            return vec![];
+        if let Some(value) = self.decided_slots.get(&slot).cloned() {
+            // Inform the sender about the decision they missed
+            return vec![Outgoing {
+                target: SendTarget::Peer(from),
+                message: MessageVariant::Decide { slot, value },
+            }];
         }
 
         let instance = self.get_or_create_instance(slot);
@@ -203,8 +221,12 @@ where
         proposal_number: ProposalNumber,
         value: V,
     ) -> Vec<Outgoing<V>> {
-        if self.decided_slots.contains(&slot) {
-            return vec![];
+        if let Some(decided_value) = self.decided_slots.get(&slot).cloned() {
+            // Inform the sender about the decision they missed
+            return vec![Outgoing {
+                target: SendTarget::Peer(from),
+                message: MessageVariant::Decide { slot, value: decided_value },
+            }];
         }
 
         let instance = self.get_or_create_instance(slot);
@@ -236,7 +258,7 @@ where
         proposal_number: ProposalNumber,
         accepted: Option<(ProposalNumber, V)>,
     ) -> Vec<Outgoing<V>> {
-        if self.decided_slots.contains(&slot) {
+        if self.decided_slots.contains_key(&slot) {
             return vec![];
         }
 
@@ -271,7 +293,7 @@ where
         proposal_number: ProposalNumber,
         _value: V,
     ) -> Vec<Outgoing<V>> {
-        if self.decided_slots.contains(&slot) {
+        if self.decided_slots.contains_key(&slot) {
             return vec![];
         }
 
@@ -301,16 +323,19 @@ where
 
     // -- Decide handler --
     fn handle_decide(&mut self, slot: u64, value: V) {
-        if self.decided_slots.contains(&slot) {
+        if self.decided_slots.contains_key(&slot) {
             return;
         }
 
-        // Check if we had an active proposal for this slot
+        // Check if we had an active proposal for this slot with a different value.
+        // Only re-propose if our value lost — if the decided value matches our
+        // proposed value, we won this slot and no re-proposal is needed.
         if let Some(instance) = self.instances.get(&slot) {
             if instance.is_proposer {
                 if let Some(ref proposed) = instance.proposed_value {
-                    // We lost this slot — queue our value for re-proposal.
-                    self.lost_proposals.push(proposed.clone());
+                    if *proposed != value {
+                        self.lost_proposals.push(proposed.clone());
+                    }
                 }
             }
         }
@@ -329,12 +354,18 @@ where
             if instance.highest_seen_nack.is_none_or(|r| round > r) {
                 instance.highest_seen_nack = Some(round);
             }
+            // Compute next retry time with jitter
+            let base_ms = 100u64;
+            let backoff_ms = base_ms.saturating_mul(1u64 << instance.retry_count.min(3));
+            let jitter_ms = rand::thread_rng().gen_range(0..=backoff_ms / 2);
+            instance.next_retry_at = Some(Instant::now() + std::time::Duration::from_millis(backoff_ms + jitter_ms));
         }
     }
 
     // -- Decide helper --
     fn decide(&mut self, slot: u64, value: V) {
-        self.decided_slots.insert(slot);
+        self.decided_slots.insert(slot, value.clone());
+        self.recent_decisions.push((Instant::now(), slot, value.clone()));
         if slot >= self.next_slot {
             self.next_slot = slot + 1;
         }
@@ -354,6 +385,11 @@ where
         instance.proposal_number = proposal_number.clone();
         instance.proposed_value = Some(value);
         instance.is_proposer = true;
+        instance.last_send_time = Some(Instant::now());
+        // Set initial stale retry time
+        let stale_ms = 100u64;
+        let jitter_ms = rand::thread_rng().gen_range(0..=stale_ms / 2);
+        instance.next_retry_at = Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
 
         // Self-vote as acceptor for Phase 1
         instance.highest_promised = Some(proposal_number.clone());
@@ -414,25 +450,60 @@ where
         }]
     }
 
-    /// Returns slots that have been nacked and whose backoff has elapsed.
-    /// Backoff: base_ms * 2^retry_count, capped at 5s.
+    /// Returns slots eligible for retry. Uses pre-computed `next_retry_at`
+    /// which includes jitter to break livelock between competing proposers.
     pub(crate) fn get_retryable_proposals(&self) -> Vec<u64> {
         let now = Instant::now();
         self.instances
             .iter()
             .filter(|(_, i)| {
-                i.nacked && !i.decided && i.is_proposer && {
-                    if let Some(nack_time) = i.last_nack_time {
-                        let base_ms = 100u64;
-                        let backoff_ms = base_ms.saturating_mul(1u64 << i.retry_count.min(6));
-                        let elapsed = now.duration_since(nack_time);
-                        elapsed.as_millis() >= backoff_ms as u128
+                if i.decided || !i.is_proposer {
+                    return false;
+                }
+                // Check if retry time has elapsed
+                let retry_at = match i.next_retry_at {
+                    Some(t) => t,
+                    None => return false,
+                };
+                if now < retry_at {
+                    return false;
+                }
+                if i.nacked {
+                    true
+                } else {
+                    // Not nacked — only retry if stuck (no quorum for current phase)
+                    let in_phase2 = !i.accepts_received.is_empty();
+                    let has_relevant_quorum = if in_phase2 {
+                        i.accepts_received.len() >= self.quorum_size
                     } else {
-                        false
-                    }
+                        i.promises_received.len() >= self.quorum_size
+                    };
+                    !has_relevant_quorum
                 }
             })
             .map(|(&slot, _)| slot)
+            .collect()
+    }
+
+    /// Returns Decide broadcasts for recent decisions that should be re-sent
+    /// to ensure peers that missed the original Decide can learn the outcome.
+    /// Expires entries older than 5 seconds.
+    pub(crate) fn get_decision_rebroadcasts(&mut self) -> Vec<Outgoing<V>> {
+        let now = Instant::now();
+        let max_age = std::time::Duration::from_secs(5);
+
+        // Remove expired entries
+        self.recent_decisions.retain(|(t, _, _)| now.duration_since(*t) < max_age);
+
+        self.recent_decisions
+            .iter()
+            .map(|(_, slot, value)| Outgoing {
+                target: SendTarget::Broadcast,
+                message: MessageVariant::Decide {
+                    slot: *slot,
+                    value: value.clone(),
+                },
+            })
             .collect()
     }
 
@@ -463,6 +534,11 @@ where
         instance.highest_seen_nack = None;
         instance.last_nack_time = None;
         instance.retry_count += 1;
+        instance.last_send_time = Some(Instant::now());
+        // Compute next stale retry time with jitter
+        let stale_ms = 100u64.saturating_mul(1u64 << instance.retry_count.min(3));
+        let jitter_ms = rand::thread_rng().gen_range(0..=stale_ms / 2);
+        instance.next_retry_at = Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
 
         // Self-vote for new round — safe because new_round > any prior promise
         instance.highest_promised = Some(proposal_number.clone());
@@ -825,17 +901,24 @@ mod tests {
     }
 
     #[test]
-    fn decided_slot_ignores_further_messages() {
+    fn decided_slot_replies_with_decide_to_late_prepare() {
         let mut proto = make_protocol("a", 3);
         proto.handle_message(node("b"), MessageVariant::Decide {
             slot: 0, value: "decided".to_string(),
         });
         proto.take_decisions();
 
+        // A late Prepare for a decided slot should reply with the Decide
+        // so the sender can learn the outcome (important for lossy networks).
         let responses = proto.handle_message(node("c"), MessageVariant::Prepare {
             slot: 0, proposal_number: (10, node("c")),
         });
-        assert!(responses.is_empty());
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(
+            &responses[0].message,
+            MessageVariant::Decide { slot: 0, value } if value == "decided"
+        ));
+        assert!(matches!(&responses[0].target, SendTarget::Peer(id) if id == &node("c")));
     }
 
     #[test]
@@ -847,14 +930,13 @@ mod tests {
         proto.take_decisions();
 
         assert!(!proto.instances.contains_key(&0));
-        assert!(proto.decided_slots.contains(&0));
+        assert!(proto.decided_slots.contains_key(&0));
     }
 
     #[test]
-    fn decide_from_external_always_queues_reproposal_if_proposer() {
-        // When we receive Decide from the network for a slot we proposed on,
-        // we always re-propose because we can't compare V generically.
-        // This is harmless — worst case, the same value gets decided twice in different slots.
+    fn decide_from_external_does_not_repropose_if_value_matches() {
+        // When the decided value matches our proposed value, we won this slot.
+        // No re-proposal needed.
         let mut proto = make_protocol("a", 3);
         let (_, _) = proto.propose("my-value".to_string());
 
@@ -863,7 +945,7 @@ mod tests {
         });
 
         let lost = proto.take_lost_proposals();
-        assert_eq!(lost.len(), 1); // Re-proposed even though value matches — harmless
+        assert!(lost.is_empty());
     }
 
     #[test]
