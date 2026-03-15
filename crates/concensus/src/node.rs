@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc;
 
@@ -287,6 +286,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::config::PeerInfo;
     use crate::error::TransportError;
     use crate::storage::MemoryStorage;

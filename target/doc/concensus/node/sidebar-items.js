@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["Decided","Node","NodeHandle"],"type":["DecisionReceiver"]};

@@ -51,19 +51,19 @@ impl MessageSender for TcpSender {
 
         // Write 4-byte BE length prefix
         let len = data.len() as u32;
-        if let Err(_) = writer.write_all(&len.to_be_bytes()).await {
+        if writer.write_all(&len.to_be_bytes()).await.is_err() {
             *guard = None;
             return Err(TransportError::Closed);
         }
 
         // Write payload
-        if let Err(_) = writer.write_all(&data).await {
+        if writer.write_all(&data).await.is_err() {
             *guard = None;
             return Err(TransportError::Closed);
         }
 
         // Flush
-        if let Err(_) = writer.flush().await {
+        if writer.flush().await.is_err() {
             *guard = None;
             return Err(TransportError::Closed);
         }
@@ -179,7 +179,7 @@ impl MessageReceiver for TcpReceiver {
 pub struct TcpTransport;
 
 impl TcpTransport {
-    pub async fn new(
+    pub async fn create(
         bind_addr: SocketAddr,
         peers: Vec<(NodeId, SocketAddr)>,
     ) -> Result<(Vec<PeerInfo<TcpSender>>, TcpReceiver), TransportError> {
@@ -304,7 +304,7 @@ mod tests {
         drop(listener); // Free the port for TcpTransport::new
 
         let id_peer = NodeId::new("peer", 1000);
-        let result = TcpTransport::new(
+        let result = TcpTransport::create(
             bound_addr,
             vec![(id_peer.clone(), "127.0.0.1:9999".parse().unwrap())],
         )
