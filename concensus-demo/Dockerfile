@@ -11,10 +11,15 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder - cache deps, then build
 FROM chef AS builder
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p concensus-demo
 COPY . .
-RUN cargo build --release -p concensus-demo
+RUN if [ -n "$FEATURES" ]; then \
+      cargo build --release -p concensus-demo --features "$FEATURES"; \
+    else \
+      cargo build --release -p concensus-demo; \
+    fi
 
 # Stage 4: Runtime
 FROM debian:bookworm-slim
