@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/concensus"]
+members = ["crates/concensus", "crates/concensus-tests", "crates/concensus-demo"]
 resolver = "2"

@@ -1,0 +1,33 @@
+syntax = "proto3";
+package consensus;
+
+service ConsensusService {
+  rpc Propose (ProposeRequest) returns (ProposeResponse);
+  rpc GetDecisions (GetDecisionsRequest) returns (GetDecisionsResponse);
+  rpc Health (HealthRequest) returns (HealthResponse);
+}
+
+message ProposeRequest {
+  string value = 1;
+}
+
+message ProposeResponse {
+  string status = 1;
+}
+
+message GetDecisionsRequest {}
+
+message GetDecisionsResponse {
+  repeated Decision decisions = 1;
+}
+
+message Decision {
+  uint64 slot = 1;
+  string value = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
