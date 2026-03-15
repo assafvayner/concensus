@@ -37,7 +37,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-concensus = { path = "crates/concensus", features = ["tcp-transport"] }
+concensus = { path = "concensus", features = ["tcp-transport"] }
 ```
 
 Basic 3-node cluster with TCP:
@@ -101,10 +101,9 @@ while let Some(decided) = decision_rx.recv().await {
 
 ```
 concensus/
-├── crates/
-│   ├── concensus/          # Core library
-│   ├── concensus-tests/    # Integration tests
-│   └── concensus-demo/     # Docker demo application
+├── concensus/          # Core library
+├── concensus-tests/    # Integration tests
+└── concensus-demo/     # Docker demo application
 ```
 
 ### concensus-tests
@@ -137,7 +136,7 @@ A Docker-based demo that runs a 3-node Paxos cluster with a gRPC API and CLI cli
 #### Quick Start
 
 ```bash
-cd crates/concensus-demo
+cd concensus-demo
 
 # Start a 3-node TCP cluster
 docker compose -f docker-compose.tcp.yml up --build -d
@@ -156,7 +155,7 @@ cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 decisi
 docker compose -f docker-compose.tcp.yml down
 ```
 
-See [`crates/concensus-demo/DEMO.md`](crates/concensus-demo/DEMO.md) for the full guide including prerequisites, environment variables, scaling, and cleanup.
+See [`concensus-demo/DEMO.md`](concensus-demo/DEMO.md) for the full guide including prerequisites, environment variables, scaling, and cleanup.
 
 ## Development
 

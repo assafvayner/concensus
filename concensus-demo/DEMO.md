@@ -31,7 +31,7 @@ Node 1 exposes its gRPC port (50051) to the host for CLI access.
 
 ## Running the Cluster
 
-All `docker compose` commands should be run from this directory (`crates/concensus-demo/`):
+All `docker compose` commands should be run from this directory (`concensus-demo/`):
 
 ### TCP transport
 

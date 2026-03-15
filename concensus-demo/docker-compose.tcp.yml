@@ -1,14 +1,13 @@
 x-node: &node-base
   build:
     context: ../..
-    dockerfile: crates/concensus-demo/Dockerfile
+    dockerfile: concensus-demo/Dockerfile
   environment: &node-env
-    TRANSPORT: uds
-    PEERS: "node-1=/sockets/node-1.sock,node-2=/sockets/node-2.sock,node-3=/sockets/node-3.sock"
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "node-1=node-1:9000,node-2=node-2:9000,node-3=node-3:9000"
     GRPC_PORT: "50051"
     RUST_LOG: info
-  volumes:
-    - sockets:/sockets
   healthcheck:
     test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
     interval: 5s
@@ -30,9 +29,6 @@ services:
   node-3:
     <<: *node-base
     hostname: node-3
-
-volumes:
-  sockets:
 
 networks:
   consensus-net:
