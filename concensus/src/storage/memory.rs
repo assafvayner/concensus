@@ -56,7 +56,14 @@ where
         highest_promised: Option<crate::message::ProposalNumber>,
         accepted: Option<(crate::message::ProposalNumber, V)>,
     ) -> Result<(), StorageError> {
-        self.acceptor_states.insert(slot, AcceptorState { slot, highest_promised, accepted });
+        self.acceptor_states.insert(
+            slot,
+            AcceptorState {
+                slot,
+                highest_promised,
+                accepted,
+            },
+        );
         Ok(())
     }
 
@@ -94,14 +101,8 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_decisions() {
         let mut storage = MemoryStorage::new();
-        storage
-            .save_decision(0, "hello".to_string())
-            .await
-            .unwrap();
-        storage
-            .save_decision(2, "world".to_string())
-            .await
-            .unwrap();
+        storage.save_decision(0, "hello".to_string()).await.unwrap();
+        storage.save_decision(2, "world".to_string()).await.unwrap();
         let decisions = storage.load_decisions().await.unwrap();
         assert_eq!(decisions.len(), 2);
         assert!(decisions.contains(&(0, "hello".to_string())));
@@ -111,10 +112,7 @@ mod tests {
     #[tokio::test]
     async fn save_overwrites_existing_slot() {
         let mut storage = MemoryStorage::new();
-        storage
-            .save_decision(0, "first".to_string())
-            .await
-            .unwrap();
+        storage.save_decision(0, "first".to_string()).await.unwrap();
         storage
             .save_decision(0, "second".to_string())
             .await
@@ -127,7 +125,10 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_acceptor_state() {
         let mut storage = MemoryStorage::<String>::new();
-        storage.save_acceptor_state(1, Some(make_pn(1)), None).await.unwrap();
+        storage
+            .save_acceptor_state(1, Some(make_pn(1)), None)
+            .await
+            .unwrap();
 
         let states = storage.load_acceptor_states().await.unwrap();
         assert_eq!(states.len(), 1);
@@ -139,7 +140,10 @@ mod tests {
     #[tokio::test]
     async fn save_decision_cleans_acceptor_state() {
         let mut storage = MemoryStorage::new();
-        storage.save_acceptor_state(1, Some(make_pn(1)), Some((make_pn(1), "hello".to_string()))).await.unwrap();
+        storage
+            .save_acceptor_state(1, Some(make_pn(1)), Some((make_pn(1), "hello".to_string())))
+            .await
+            .unwrap();
         assert_eq!(storage.load_acceptor_states().await.unwrap().len(), 1);
 
         storage.save_decision(1, "hello".to_string()).await.unwrap();
@@ -149,7 +153,10 @@ mod tests {
     #[tokio::test]
     async fn delete_acceptor_state() {
         let mut storage = MemoryStorage::<String>::new();
-        storage.save_acceptor_state(5, Some(make_pn(2)), None).await.unwrap();
+        storage
+            .save_acceptor_state(5, Some(make_pn(2)), None)
+            .await
+            .unwrap();
         assert_eq!(storage.load_acceptor_states().await.unwrap().len(), 1);
 
         storage.delete_acceptor_state(5).await.unwrap();

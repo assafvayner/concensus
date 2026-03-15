@@ -135,6 +135,7 @@ where
         std::mem::take(&mut self.lost_proposals)
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn take_dirty_acceptor_slots(
         &mut self,
     ) -> Vec<(u64, Option<ProposalNumber>, Option<(ProposalNumber, V)>)> {
@@ -1371,7 +1372,13 @@ mod tests {
         let mut proto = make_protocol("a", 3);
         let from = node("b");
         let pn = (1, from.clone());
-        proto.handle_message(from, MessageVariant::Prepare { slot: 0, proposal_number: pn });
+        proto.handle_message(
+            from,
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: pn,
+            },
+        );
         let dirty = proto.take_dirty_acceptor_slots();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].0, 0);

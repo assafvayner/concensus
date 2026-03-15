@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use duckdb::params;
 use serde::{de::DeserializeOwned, Serialize};
 
+use super::{AcceptorState, Storage};
 use crate::error::StorageError;
 use crate::message::ProposalNumber;
-use super::{AcceptorState, Storage};
 
 /// DuckDB-backed [`Storage`] implementation for crash recovery.
 ///
@@ -57,21 +57,18 @@ where
             .map_err(|e| StorageError::Persist(format!("failed to serialize value: {e}")))?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                StorageError::Persist(format!("failed to lock connection: {e}"))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::Persist(format!("failed to lock connection: {e}")))?;
             conn.execute(
                 "INSERT OR REPLACE INTO decisions (slot, value) VALUES (?, ?)",
                 params![slot, value_json],
             )
             .map_err(|e| StorageError::Persist(format!("failed to insert decision: {e}")))?;
-            conn.execute(
-                "DELETE FROM acceptor_state WHERE slot = ?",
-                params![slot],
-            )
-            .map_err(|e| {
-                StorageError::Delete(format!("failed to delete acceptor state: {e}"))
-            })?;
+            conn.execute("DELETE FROM acceptor_state WHERE slot = ?", params![slot])
+                .map_err(|e| {
+                    StorageError::Delete(format!("failed to delete acceptor state: {e}"))
+                })?;
             Ok(())
         })
         .await
@@ -81,9 +78,9 @@ where
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                StorageError::Load(format!("failed to lock connection: {e}"))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::Load(format!("failed to lock connection: {e}")))?;
             let mut stmt = conn
                 .prepare("SELECT slot, value FROM decisions")
                 .map_err(|e| StorageError::Load(format!("failed to prepare query: {e}")))?;
@@ -97,8 +94,8 @@ where
 
             let mut decisions = Vec::new();
             for row in rows {
-                let (slot, value_json) = row
-                    .map_err(|e| StorageError::Load(format!("failed to read row: {e}")))?;
+                let (slot, value_json) =
+                    row.map_err(|e| StorageError::Load(format!("failed to read row: {e}")))?;
                 match serde_json::from_str::<V>(&value_json) {
                     Ok(value) => decisions.push((slot, value)),
                     Err(e) => {
@@ -127,9 +124,7 @@ where
         let accepted_json = accepted
             .map(|a| serde_json::to_string(&a))
             .transpose()
-            .map_err(|e| {
-                StorageError::Persist(format!("failed to serialize accepted: {e}"))
-            })?;
+            .map_err(|e| StorageError::Persist(format!("failed to serialize accepted: {e}")))?;
 
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
@@ -152,9 +147,9 @@ where
     async fn load_acceptor_states(&self) -> Result<Vec<AcceptorState<V>>, StorageError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                StorageError::Load(format!("failed to lock connection: {e}"))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::Load(format!("failed to lock connection: {e}")))?;
             let mut stmt = conn
                 .prepare("SELECT slot, highest_promised, accepted FROM acceptor_state")
                 .map_err(|e| StorageError::Load(format!("failed to prepare query: {e}")))?;
@@ -165,20 +160,21 @@ where
                     let accepted_json: Option<String> = row.get(2)?;
                     Ok((slot, hp_json, accepted_json))
                 })
-                .map_err(|e| {
-                    StorageError::Load(format!("failed to query acceptor states: {e}"))
-                })?;
+                .map_err(|e| StorageError::Load(format!("failed to query acceptor states: {e}")))?;
 
             let mut states = Vec::new();
             for row in rows {
-                let (slot, hp_json, accepted_json) = row
-                    .map_err(|e| StorageError::Load(format!("failed to read row: {e}")))?;
+                let (slot, hp_json, accepted_json) =
+                    row.map_err(|e| StorageError::Load(format!("failed to read row: {e}")))?;
 
                 let highest_promised = match hp_json {
                     Some(json) => match serde_json::from_str::<ProposalNumber>(&json) {
                         Ok(hp) => Some(hp),
                         Err(e) => {
-                            tracing::warn!(slot, "skipping acceptor state with bad highest_promised JSON: {e}");
+                            tracing::warn!(
+                                slot,
+                                "skipping acceptor state with bad highest_promised JSON: {e}"
+                            );
                             continue;
                         }
                     },
@@ -189,7 +185,10 @@ where
                     Some(json) => match serde_json::from_str::<(ProposalNumber, V)>(&json) {
                         Ok(a) => Some(a),
                         Err(e) => {
-                            tracing::warn!(slot, "skipping acceptor state with bad accepted JSON: {e}");
+                            tracing::warn!(
+                                slot,
+                                "skipping acceptor state with bad accepted JSON: {e}"
+                            );
                             continue;
                         }
                     },
@@ -211,16 +210,13 @@ where
     async fn delete_acceptor_state(&mut self, slot: u64) -> Result<(), StorageError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                StorageError::Delete(format!("failed to lock connection: {e}"))
-            })?;
-            conn.execute(
-                "DELETE FROM acceptor_state WHERE slot = ?",
-                params![slot],
-            )
-            .map_err(|e| {
-                StorageError::Delete(format!("failed to delete acceptor state: {e}"))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::Delete(format!("failed to lock connection: {e}")))?;
+            conn.execute("DELETE FROM acceptor_state WHERE slot = ?", params![slot])
+                .map_err(|e| {
+                    StorageError::Delete(format!("failed to delete acceptor state: {e}"))
+                })?;
             Ok(())
         })
         .await
@@ -296,11 +292,7 @@ mod tests {
         let mut storage = DuckDbStorage::new(&path).unwrap();
 
         storage
-            .save_acceptor_state(
-                1,
-                Some(make_pn(2)),
-                Some((make_pn(1), "hello".to_string())),
-            )
+            .save_acceptor_state(1, Some(make_pn(2)), Some((make_pn(1), "hello".to_string())))
             .await
             .unwrap();
 
@@ -308,10 +300,7 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].slot, 1);
         assert_eq!(states[0].highest_promised, Some(make_pn(2)));
-        assert_eq!(
-            states[0].accepted,
-            Some((make_pn(1), "hello".to_string()))
-        );
+        assert_eq!(states[0].accepted, Some((make_pn(1), "hello".to_string())));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -322,19 +311,12 @@ mod tests {
         let mut storage = DuckDbStorage::new(&path).unwrap();
 
         storage
-            .save_acceptor_state(
-                1,
-                Some(make_pn(1)),
-                Some((make_pn(1), "hello".to_string())),
-            )
+            .save_acceptor_state(1, Some(make_pn(1)), Some((make_pn(1), "hello".to_string())))
             .await
             .unwrap();
         assert_eq!(storage.load_acceptor_states().await.unwrap().len(), 1);
 
-        storage
-            .save_decision(1, "hello".to_string())
-            .await
-            .unwrap();
+        storage.save_decision(1, "hello".to_string()).await.unwrap();
         assert!(storage.load_acceptor_states().await.unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
@@ -385,16 +367,9 @@ mod tests {
         // Write data and drop
         {
             let mut storage = DuckDbStorage::new(&path).unwrap();
+            storage.save_decision(0, "hello".to_string()).await.unwrap();
             storage
-                .save_decision(0, "hello".to_string())
-                .await
-                .unwrap();
-            storage
-                .save_acceptor_state(
-                    5,
-                    Some(make_pn(3)),
-                    Some((make_pn(2), "world".to_string())),
-                )
+                .save_acceptor_state(5, Some(make_pn(3)), Some((make_pn(2), "world".to_string())))
                 .await
                 .unwrap();
         }
@@ -410,10 +385,7 @@ mod tests {
             assert_eq!(states.len(), 1);
             assert_eq!(states[0].slot, 5);
             assert_eq!(states[0].highest_promised, Some(make_pn(3)));
-            assert_eq!(
-                states[0].accepted,
-                Some((make_pn(2), "world".to_string()))
-            );
+            assert_eq!(states[0].accepted, Some((make_pn(2), "world".to_string())));
         }
 
         let _ = std::fs::remove_file(&path);

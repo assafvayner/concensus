@@ -49,8 +49,8 @@ pub mod transport;
 
 pub use config::{NodeId, PeerInfo};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
-pub use node::{Decided, DecisionReceiver, Node, NodeHandle};
 pub use message::ProposalNumber;
+pub use node::{Decided, DecisionReceiver, Node, NodeHandle};
 pub use storage::{AcceptorState, MemoryStorage, Storage};
 pub use transport::{MessageReceiver, MessageSender};
 

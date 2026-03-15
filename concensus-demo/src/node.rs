@@ -95,8 +95,8 @@ fn parse_config() -> Config {
     {
         "memory" => StorageBackend::Memory,
         "duckdb" => {
-            let path = std::env::var("DUCKDB_PATH")
-                .expect("DUCKDB_PATH required when STORAGE=duckdb");
+            let path =
+                std::env::var("DUCKDB_PATH").expect("DUCKDB_PATH required when STORAGE=duckdb");
             StorageBackend::DuckDb {
                 path: PathBuf::from(path),
             }

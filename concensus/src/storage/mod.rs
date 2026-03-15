@@ -132,7 +132,9 @@ where
         highest_promised: Option<ProposalNumber>,
         accepted: Option<(ProposalNumber, V)>,
     ) -> Result<(), StorageError> {
-        (**self).save_acceptor_state(slot, highest_promised, accepted).await
+        (**self)
+            .save_acceptor_state(slot, highest_promised, accepted)
+            .await
     }
 
     async fn load_acceptor_states(&self) -> Result<Vec<AcceptorState<V>>, StorageError> {
