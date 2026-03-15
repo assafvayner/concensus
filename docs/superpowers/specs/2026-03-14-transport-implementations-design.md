@@ -32,7 +32,7 @@ pub(crate) enum MessageVariant<V> {
 }
 ```
 
-`to_bytes()` and `from_bytes()` operate on `Message<V>` (the wrapper struct). The node serializes `Message { sender: self.node_id, variant }` before calling `send()`.
+`to_bytes()` and `from_bytes()` operate on `Message<V>` (the wrapper struct). Both `Message<V>` and `MessageVariant<V>` are `pub(crate)` — not part of the public API. The node serializes `Message { sender: self.node_id, variant }` before calling `send()`.
 
 ### Node API Change
 
@@ -65,19 +65,25 @@ where
 
 ### Event Loop Change
 
-The event loop no longer spawns a task per peer receiver. Instead, it calls `receiver.recv()` directly in the `tokio::select!` loop. It deserializes `Message<V>` from the bytes, extracts `sender` and `variant`, and dispatches `variant` to the protocol state machine with the sender's `NodeId`.
+The event loop no longer spawns a task per peer receiver. Instead, it calls `receiver.recv()` directly in the `tokio::select!` loop.
+
+**Incoming path:** `receiver.recv()` returns `Bytes`. The node deserializes this into `Message<V>`, extracts `msg.sender` as the `from: NodeId`, and passes `msg.variant` to the protocol state machine. The previous `from` parameter (which came from per-peer receiver identity) is replaced entirely by `msg.sender`.
+
+**Outgoing path:** `ProtocolState` continues to produce `Outgoing<V>` where the message field is `MessageVariant<V>` (renamed from the old `Message<V>`). The `send_outgoing()` method in the node wraps each variant as `Message { sender: self.node_id.clone(), variant }`, serializes to bytes, and calls `sender.send(bytes)`.
 
 For the single-node (no peers) case, the receiver is never polled — the separate `select!` branch without incoming messages is retained.
 
 ### Protocol State Machine
 
-`ProtocolState::handle_message()` and related methods change to accept `MessageVariant<V>` instead of `Message<V>` (since the sender is extracted at the node level). The `from: NodeId` parameter is already passed separately.
+`ProtocolState::handle_message()` and related methods change to accept `MessageVariant<V>` instead of `Message<V>` (since the sender is extracted at the node level). The `from: NodeId` parameter is already passed separately. `Outgoing<V>.message` changes from `Message<V>` to `MessageVariant<V>` — the node layer wraps it with sender identity before serialization.
 
 ## Module Structure
 
+The existing `transport.rs` stays in place as the module root. Submodules are added in a `transport/` directory alongside it (Rust 2018+ path-based module system — `transport.rs` acts as the module root for `transport/` submodules). `transport.rs` gains `pub mod channel;` and `pub mod tcp;` declarations behind feature gates.
+
 ```
 crates/concensus/src/
-├── transport.rs           # MessageSender, MessageReceiver traits (module root)
+├── transport.rs           # MessageSender, MessageReceiver traits + submodule declarations
 ├── transport/
 │   ├── channel.rs         # #[cfg(feature = "channel-transport")]
 │   └── tcp.rs             # #[cfg(feature = "tcp-transport")]
@@ -126,7 +132,8 @@ pub fn channel(capacity: usize) -> (ChannelSender, ChannelReceiver);
 impl Clone for ChannelSender { ... }
 ```
 
-`ChannelSender` implements `MessageSender` by forwarding to `mpsc::Sender::send()`.
+`ChannelSender` implements `MessageSender` by forwarding to `mpsc::Sender::send().await` (async, waits for capacity). This provides backpressure — if the receiving node is slow, the sending node's event loop blocks on `send()` until there's capacity. This is intentional for testing: it makes the system deterministic and prevents unbounded buffering.
+
 `ChannelReceiver` implements `MessageReceiver` by forwarding to `mpsc::Receiver::recv()`.
 
 **Usage for a 3-node cluster:**
@@ -166,6 +173,8 @@ let (node_a, handle_a, rx_a) = Node::new(
 
 This is used for both sending and receiving. The transport layer handles framing; the caller sees complete `Bytes` messages.
 
+**Maximum message size:** 16 MiB (`16 * 1024 * 1024` bytes). If a length prefix exceeds this, the receiver drops the connection (the peer is considered buggy or malicious). The sender should never produce messages this large in normal operation — Paxos messages are small.
+
 ### TcpSender
 
 One per peer. Wraps a TCP connection to the peer's listen address.
@@ -183,7 +192,7 @@ impl TcpSender {
 
 **`send()` behavior:**
 1. Lock the mutex.
-2. If no connection, connect to `addr`, store the `OwnedWriteHalf`.
+2. If no connection, connect to `addr`. Split the `TcpStream` — store the `OwnedWriteHalf`, drop the `OwnedReadHalf` (the sender's connection is write-only; inbound data from peers arrives via the `TcpReceiver`'s listener, not via the sender's connection).
 3. Write 4-byte BE length prefix + payload.
 4. If write fails, drop the connection (set to `None`), return `TransportError::Closed`.
 5. Next `send()` call will reconnect lazily.
@@ -208,13 +217,17 @@ impl TcpReceiver {
 
 **Internal architecture:**
 
-`bind()` creates an `mpsc::channel` and spawns a background accept loop task:
+`bind()` creates an `mpsc::channel(1024)` (bounded, capacity 1024 — provides backpressure if the node falls behind processing messages) and spawns a background accept loop task:
 
-1. **Accept loop task:** Binds `TcpListener`, accepts connections in a loop. For each accepted connection, spawns a reader task. If the listener encounters an error, logs a warning and retries binding with backoff. Already-connected peers continue uninterrupted.
+1. **Accept loop task:** Binds `TcpListener`, accepts connections in a loop. For each accepted connection, spawns a reader task. If the listener encounters an error, logs a warning and retries binding with exponential backoff: initial delay 100ms, doubling each attempt, capped at 5 seconds, with random jitter (±25%). Already-connected peers continue uninterrupted.
 
-2. **Reader task (one per accepted connection):** Reads length-prefixed messages from the `OwnedReadHalf`. Forwards each complete message as `Bytes` into `incoming_rx`. If the read errors, the task ends — the peer will reconnect via its `TcpSender`, and the accept loop will spawn a new reader task.
+2. **Reader task (one per accepted connection):** Reads length-prefixed messages from the `OwnedReadHalf`. Validates length prefix against the 16 MiB maximum. Forwards each complete message as `Bytes` into `incoming_rx`. If the read errors or the length exceeds the maximum, the task ends — the peer will reconnect via its `TcpSender`, and the accept loop will spawn a new reader task.
+
+**Multiple connections from the same peer:** If a peer reconnects while a previous connection's reader task is still running, both reader tasks will feed into `incoming_rx`. This is safe — messages carry sender identity in the payload, and the stale connection will eventually error out and its reader task will end. No deduplication is needed.
 
 **`recv()` behavior:** Reads from `incoming_rx`. Returns `TransportError::Closed` only if the internal channel closes (all background tasks dead AND listener can't rebind).
+
+**Graceful shutdown:** When `TcpReceiver` is dropped, the `incoming_rx` receiver side closes. Background tasks detect this when their `incoming_tx.send()` calls return `Err` — they exit cleanly. The accept loop also needs to `select!` between `listener.accept()` and a check on the channel (e.g., try a zero-capacity send or use a `CancellationToken`). Alternatively, the accept loop can check `incoming_tx.is_closed()` between accepts.
 
 ### TcpTransport Factory
 
@@ -289,3 +302,11 @@ pub use transport::tcp::{self, TcpSender, TcpReceiver, TcpTransport};
 | Listener rebind with backoff | Recovers from transient OS errors without tight loops |
 | `tokio::sync::Mutex` for TcpSender connection | Held across `.await`; low contention (sequential sends from event loop) |
 | `ChannelSender` is `Clone` | One channel per node, senders cloned for each peer — natural mpsc pattern |
+| `ChannelSender::send()` uses async send (not try_send) | Provides backpressure for deterministic testing behavior |
+| 16 MiB max message size | Prevents OOM from malicious/buggy length prefixes; Paxos messages are small |
+| TcpSender drops OwnedReadHalf | Sender connection is write-only; inbound data arrives via TcpReceiver's listener |
+| Listener rebind: 100ms initial, doubling, 5s cap, ±25% jitter | Standard exponential backoff; prevents tight retry loops |
+| TcpReceiver internal channel capacity 1024 | Bounded for backpressure; large enough for burst traffic |
+| Multiple connections from same peer are allowed | Stale connections error out naturally; no deduplication needed |
+| Background tasks exit on TcpReceiver drop | Channel close propagates to tasks via send() failure |
+| `Outgoing<V>.message` is `MessageVariant<V>` | Node wraps with sender identity; protocol doesn't know about transport framing |
