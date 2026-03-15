@@ -176,6 +176,105 @@ src/storage/
 
 All new types re-exported from `lib.rs`.
 
+## Demo Integration
+
+### Config Changes
+
+The demo node (`crates/concensus-demo/src/node.rs`) gains a new environment variable:
+
+- `STORAGE` — `"memory"` (default) or `"duckdb"`
+- `DUCKDB_PATH` — file path for DuckDB database (required when `STORAGE=duckdb`, e.g. `/data/consensus.db`)
+
+The `Config` struct gains a `storage` field:
+
+```rust
+enum StorageBackend {
+    Memory,
+    DuckDb { path: PathBuf },
+}
+```
+
+`parse_config()` reads these env vars. The `start_node_tcp` and `start_node_uds` functions accept the storage backend config and construct either `MemoryStorage` or `DuckDbStorage` accordingly.
+
+### Demo Dependency Changes
+
+`crates/concensus-demo/Cargo.toml` adds the `duckdb-storage` feature:
+
+```toml
+concensus = { path = "../concensus", features = ["tcp-transport", "uds-transport", "test-support", "duckdb-storage"] }
+```
+
+### Docker Compose Changes
+
+New compose file `docker-compose.duckdb.yml` (TCP transport + DuckDB storage) with mounted volumes for each node's database:
+
+```yaml
+x-node: &node-base
+  build:
+    context: ../..
+    dockerfile: crates/concensus-demo/Dockerfile
+  environment: &node-env
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "node-1=node-1:9000,node-2=node-2:9000,node-3=node-3:9000"
+    GRPC_PORT: "50051"
+    STORAGE: duckdb
+    DUCKDB_PATH: "/data/consensus.db"
+    RUST_LOG: info
+  healthcheck:
+    test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - consensus-net
+
+services:
+  node-1:
+    <<: *node-base
+    hostname: node-1
+    ports:
+      - "50051:50051"
+    volumes:
+      - node1-data:/data
+  node-2:
+    <<: *node-base
+    hostname: node-2
+    volumes:
+      - node2-data:/data
+  node-3:
+    <<: *node-base
+    hostname: node-3
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  consensus-net:
+    driver: bridge
+```
+
+Each node gets its own named volume mounted at `/data`. The DuckDB file lives at `/data/consensus.db` inside each container. Named volumes survive `docker compose stop` and `docker compose restart`, enabling crash recovery testing.
+
+### Demo Testing
+
+Manual testing workflow using the Docker compose setup:
+
+1. Start cluster: `docker compose -f docker-compose.duckdb.yml up -d`
+2. Propose values: `concensus-cli --addr localhost:50051 propose "value1"` (repeat several times)
+3. Verify decisions: `concensus-cli --addr localhost:50051 decisions`
+4. Stop one node: `docker compose -f docker-compose.duckdb.yml stop node-2`
+5. Restart the stopped node: `docker compose -f docker-compose.duckdb.yml start node-2`
+6. Verify recovered node has all prior decisions: query decisions from node-2 via its gRPC port
+7. Propose new values and verify all nodes (including recovered node) participate in consensus
+
+This validates that the DuckDB file on the mounted volume survives a container restart and the node correctly recovers its state.
+
 ## Testing Strategy
 
 ### Unit Tests (`storage/duckdb.rs`)
