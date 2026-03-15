@@ -98,7 +98,9 @@ pub(crate) fn take_dirty_acceptor_slots(&mut self)
     -> Vec<(u64, Option<ProposalNumber>, Option<(ProposalNumber, V)>)>
 ```
 
-The `Node` event loop calls this after `handle_message`, persists each dirty slot via `save_acceptor_state`, then sends outgoing messages. When a slot is decided, the node calls `delete_acceptor_state` to clean up.
+The `Node` event loop calls this after `handle_message`, persists each dirty slot via `save_acceptor_state`, **then** sends outgoing messages. This is a reordering of the current code flow (which currently sends immediately after `handle_message`). The persist-before-send order is required for crash safety: if the node crashes after sending but before persisting, it would have made a promise it can't remember.
+
+When a slot is decided, `save_decision` handles cleanup of acceptor state internally (see DuckDB Implementation Details below).
 
 ## DuckDB Implementation
 
@@ -127,7 +129,7 @@ Values and protocol types are stored as JSON text via `serde_json`, consistent w
 
 ```rust
 pub struct DuckDbStorage<V> {
-    conn: duckdb::Connection,
+    conn: Arc<Mutex<duckdb::Connection>>,
     _phantom: PhantomData<V>,
 }
 
@@ -138,12 +140,14 @@ impl<V> DuckDbStorage<V> {
 }
 ```
 
+The `Connection` is wrapped in `Arc<Mutex<>>` (from `std::sync`) so that it can be cloned into `tokio::task::spawn_blocking` closures. The `Mutex` is held only for the duration of each blocking call.
+
 ### Implementation Details
 
-- DuckDB's Rust crate provides a synchronous API. Calls are wrapped in `tokio::task::spawn_blocking` to avoid blocking the event loop.
+- DuckDB's Rust crate provides a synchronous API. Each trait method clones the `Arc<Mutex<Connection>>`, then calls `tokio::task::spawn_blocking` with a closure that locks the mutex and executes the SQL.
 - `save_acceptor_state` uses `INSERT OR REPLACE` (upsert) semantics.
 - `delete_acceptor_state` uses `DELETE WHERE slot = ?`.
-- `save_decision` inserts the decision and also deletes the corresponding acceptor state (two idempotent statements — partial failure is safe).
+- `save_decision` inserts the decision and also deletes the corresponding acceptor state for that slot (two idempotent statements — partial failure is safe). This is the only place acceptor state cleanup happens; the `Node` does not call `delete_acceptor_state` separately on decision.
 
 ### Dependency
 
@@ -194,7 +198,7 @@ enum StorageBackend {
 }
 ```
 
-`parse_config()` reads these env vars. The `start_node_tcp` and `start_node_uds` functions accept the storage backend config and construct either `MemoryStorage` or `DuckDbStorage` accordingly.
+`parse_config()` reads these env vars. The storage is constructed in `main()` as a `Box<dyn Storage<String>>` based on the config, then passed to `start_node_tcp` or `start_node_uds`. These functions change their storage parameter from `MemoryStorage` to `Box<dyn Storage<String>>`.
 
 ### Demo Dependency Changes
 
