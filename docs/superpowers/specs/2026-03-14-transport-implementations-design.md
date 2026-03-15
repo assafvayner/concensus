@@ -118,33 +118,59 @@ tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 // transport/channel.rs
 
 pub struct ChannelSender {
-    tx: mpsc::Sender<Bytes>,
+    tx: SenderInner,  // enum wrapping bounded or unbounded sender
 }
 
 pub struct ChannelReceiver {
-    rx: mpsc::Receiver<Bytes>,
+    rx: ReceiverInner,  // enum wrapping bounded or unbounded receiver
 }
 
-/// Creates a (sender, receiver) pair. The sender is cloneable —
+/// Creates a bounded (sender, receiver) pair. The sender is cloneable —
 /// clone it once per peer that needs to send to this node.
+/// `send()` waits for capacity (backpressure).
 pub fn channel(capacity: usize) -> (ChannelSender, ChannelReceiver);
+
+/// Creates an unbounded (sender, receiver) pair. The sender is cloneable.
+/// `send()` never blocks — messages buffer without limit.
+pub fn unbounded_channel() -> (ChannelSender, ChannelReceiver);
 
 impl Clone for ChannelSender { ... }
 ```
 
-`ChannelSender` implements `MessageSender` by forwarding to `mpsc::Sender::send().await` (async, waits for capacity). This provides backpressure — if the receiving node is slow, the sending node's event loop blocks on `send()` until there's capacity. This is intentional for testing: it makes the system deterministic and prevents unbounded buffering.
+Internally, `ChannelSender` and `ChannelReceiver` use an enum to wrap either the bounded or unbounded variant:
 
-`ChannelReceiver` implements `MessageReceiver` by forwarding to `mpsc::Receiver::recv()`.
+```rust
+enum SenderInner {
+    Bounded(mpsc::Sender<Bytes>),
+    Unbounded(mpsc::UnboundedSender<Bytes>),
+}
+
+enum ReceiverInner {
+    Bounded(mpsc::Receiver<Bytes>),
+    Unbounded(mpsc::UnboundedReceiver<Bytes>),
+}
+```
+
+**Bounded channel:** `ChannelSender` implements `MessageSender` by forwarding to `mpsc::Sender::send().await` (async, waits for capacity). This provides backpressure — if the receiving node is slow, the sending node's event loop blocks on `send()` until there's capacity. Useful for deterministic testing.
+
+**Unbounded channel:** `ChannelSender` implements `MessageSender` by forwarding to `mpsc::UnboundedSender::send()` (infallible unless receiver dropped). Messages buffer without limit. Useful when backpressure is undesirable (e.g., high-throughput testing, or when the consumer is always fast enough).
+
+`ChannelReceiver` implements `MessageReceiver` by forwarding to the appropriate `recv()` — both bounded and unbounded receivers have the same `recv()` signature.
 
 **Usage for a 3-node cluster:**
 
 ```rust
-use concensus::transport::channel::channel;
+use concensus::transport::channel::{channel, unbounded_channel};
 
-// One channel per node
+// Bounded — with backpressure
 let (sender_to_a, receiver_a) = channel(64);
 let (sender_to_b, receiver_b) = channel(64);
 let (sender_to_c, receiver_c) = channel(64);
+
+// Or unbounded — no backpressure
+// let (sender_to_a, receiver_a) = unbounded_channel();
+// let (sender_to_b, receiver_b) = unbounded_channel();
+// let (sender_to_c, receiver_c) = unbounded_channel();
 
 // Node A: senders to B and C, its own receiver
 let (node_a, handle_a, rx_a) = Node::new(
@@ -281,7 +307,7 @@ pub use config::{NodeId, PeerInfo};
 // ... existing re-exports ...
 
 #[cfg(feature = "channel-transport")]
-pub use transport::channel::{self, ChannelSender, ChannelReceiver};
+pub use transport::channel::{self, channel, unbounded_channel, ChannelSender, ChannelReceiver};
 #[cfg(feature = "tcp-transport")]
 pub use transport::tcp::{self, TcpSender, TcpReceiver, TcpTransport};
 ```
@@ -302,7 +328,8 @@ pub use transport::tcp::{self, TcpSender, TcpReceiver, TcpTransport};
 | Listener rebind with backoff | Recovers from transient OS errors without tight loops |
 | `tokio::sync::Mutex` for TcpSender connection | Held across `.await`; low contention (sequential sends from event loop) |
 | `ChannelSender` is `Clone` | One channel per node, senders cloned for each peer — natural mpsc pattern |
-| `ChannelSender::send()` uses async send (not try_send) | Provides backpressure for deterministic testing behavior |
+| Bounded and unbounded channel variants | Bounded provides backpressure for deterministic testing; unbounded for high-throughput scenarios |
+| Single `ChannelSender`/`ChannelReceiver` type for both | Enum internally; same public type avoids generic parameter pollution in `Node` |
 | 16 MiB max message size | Prevents OOM from malicious/buggy length prefixes; Paxos messages are small |
 | TcpSender drops OwnedReadHalf | Sender connection is write-only; inbound data arrives via TcpReceiver's listener |
 | Listener rebind: 100ms initial, doubling, 5s cap, ±25% jitter | Standard exponential backoff; prevents tight retry loops |
