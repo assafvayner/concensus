@@ -53,12 +53,18 @@ mod tests {
     #[test]
     fn propose_error_display() {
         assert_eq!(ProposeError::NotRunning.to_string(), "node is not running");
-        assert_eq!(ProposeError::ChannelFull.to_string(), "proposal channel full");
+        assert_eq!(
+            ProposeError::ChannelFull.to_string(),
+            "proposal channel full"
+        );
     }
 
     #[test]
     fn node_error_display() {
-        assert_eq!(NodeError::NoQuorum.to_string(), "all peers disconnected, cannot form quorum");
+        assert_eq!(
+            NodeError::NoQuorum.to_string(),
+            "all peers disconnected, cannot form quorum"
+        );
     }
 
     #[test]
@@ -72,7 +78,10 @@ mod tests {
     #[test]
     fn transport_error_display() {
         assert_eq!(TransportError::Closed.to_string(), "connection closed");
-        let other = TransportError::Other(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "boom")));
+        let other = TransportError::Other(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "boom",
+        )));
         assert_eq!(other.to_string(), "transport error: boom");
     }
 

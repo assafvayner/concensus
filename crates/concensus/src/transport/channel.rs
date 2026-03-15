@@ -34,8 +34,12 @@ pub struct ChannelReceiver {
 pub fn channel(capacity: usize) -> (ChannelSender, ChannelReceiver) {
     let (tx, rx) = mpsc::channel(capacity);
     (
-        ChannelSender { inner: SenderInner::Bounded(tx) },
-        ChannelReceiver { inner: ReceiverInner::Bounded(rx) },
+        ChannelSender {
+            inner: SenderInner::Bounded(tx),
+        },
+        ChannelReceiver {
+            inner: ReceiverInner::Bounded(rx),
+        },
     )
 }
 
@@ -43,8 +47,12 @@ pub fn channel(capacity: usize) -> (ChannelSender, ChannelReceiver) {
 pub fn unbounded_channel() -> (ChannelSender, ChannelReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
     (
-        ChannelSender { inner: SenderInner::Unbounded(tx) },
-        ChannelReceiver { inner: ReceiverInner::Unbounded(rx) },
+        ChannelSender {
+            inner: SenderInner::Unbounded(tx),
+        },
+        ChannelReceiver {
+            inner: ReceiverInner::Unbounded(rx),
+        },
     )
 }
 
@@ -63,12 +71,8 @@ impl Clone for ChannelSender {
 impl MessageSender for ChannelSender {
     async fn send(&self, data: Bytes) -> Result<(), TransportError> {
         match &self.inner {
-            SenderInner::Bounded(tx) => {
-                tx.send(data).await.map_err(|_| TransportError::Closed)
-            }
-            SenderInner::Unbounded(tx) => {
-                tx.send(data).map_err(|_| TransportError::Closed)
-            }
+            SenderInner::Bounded(tx) => tx.send(data).await.map_err(|_| TransportError::Closed),
+            SenderInner::Unbounded(tx) => tx.send(data).map_err(|_| TransportError::Closed),
         }
     }
 }

@@ -1,3 +1,7 @@
 [workspace]
-members = ["crates/concensus", "crates/concensus-tests", "crates/concensus-demo"]
+members = [
+  "crates/concensus",
+  "crates/concensus-tests",
+  "crates/concensus-demo",
+]
 resolver = "2"

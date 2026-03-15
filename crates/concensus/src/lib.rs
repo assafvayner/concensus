@@ -55,7 +55,9 @@ pub use transport::{MessageReceiver, MessageSender};
 
 /// In-memory channel transport for testing. Requires the `channel-transport` feature.
 #[cfg(feature = "channel-transport")]
-pub use transport::channel::{self as channel, channel, unbounded_channel, ChannelReceiver, ChannelSender};
+pub use transport::channel::{
+    self as channel, channel, unbounded_channel, ChannelReceiver, ChannelSender,
+};
 
 /// TCP transport types. Requires the `tcp-transport` feature.
 #[cfg(feature = "tcp-transport")]

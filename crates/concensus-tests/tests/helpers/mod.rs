@@ -1,14 +1,24 @@
-pub mod lossy_transport;
+pub mod transport_filters;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use concensus::{
     channel, unbounded_channel, ChannelReceiver, ChannelSender, Decided, DecisionReceiver,
-    MemoryStorage, Node, NodeHandle, NodeId, PeerInfo,
+    MemoryStorage, Node, NodeHandle, NodeId, PeerInfo, Storage, StorageError,
 };
-use lossy_transport::{LossyReceiver, LossySender};
+use serde::{de::DeserializeOwned, Serialize};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
+use transport_filters::{
+    DelayedSender, LossyReceiver, LossySender, ReorderingReceiver, ReorderingSender,
+};
+
+// ---------------------------------------------------------------------------
+// Cluster node types
+// ---------------------------------------------------------------------------
 
 pub struct ClusterNode {
     pub handle: NodeHandle<String>,
@@ -17,11 +27,182 @@ pub struct ClusterNode {
     pub id: NodeId,
 }
 
-/// Creates a cluster where senders drop messages at the given rate.
-///
-/// Only senders are lossy (not receivers), because wrapping the receiver
-/// would block the node's `tokio::select!` retry arm — the LossyReceiver's
-/// internal loop would prevent retry timers from firing.
+pub struct ClusterNodeTyped<V> {
+    pub handle: NodeHandle<V>,
+    pub decisions: DecisionReceiver<V>,
+    pub run_handle: JoinHandle<Result<(), concensus::NodeError>>,
+    pub id: NodeId,
+}
+
+// ---------------------------------------------------------------------------
+// Shared storage for recovery tests
+// ---------------------------------------------------------------------------
+
+pub struct SharedMemoryStorage<V> {
+    inner: Arc<Mutex<MemoryStorage<V>>>,
+}
+
+impl<V> SharedMemoryStorage<V> {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MemoryStorage::new())),
+        }
+    }
+}
+
+impl<V> Clone for SharedMemoryStorage<V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[async_trait]
+impl<V> Storage<V> for SharedMemoryStorage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError> {
+        self.inner.lock().await.save_decision(slot, value).await
+    }
+
+    async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
+        self.inner.lock().await.load_decisions().await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Basic cluster creation
+// ---------------------------------------------------------------------------
+
+pub fn create_cluster(n: usize) -> Vec<ClusterNode> {
+    create_cluster_inner(n, false, 0)
+}
+
+pub fn create_unbounded_cluster(n: usize) -> Vec<ClusterNode> {
+    create_cluster_inner(n, true, 0)
+}
+
+pub fn create_cluster_with_dead_node(n: usize) -> Vec<ClusterNode> {
+    create_cluster_inner(n, false, 1)
+}
+
+pub fn create_cluster_with_dead_nodes(n: usize, dead_count: usize) -> Vec<ClusterNode> {
+    assert!(dead_count < n, "dead_count must be less than n");
+    create_cluster_inner(n, false, dead_count)
+}
+
+fn create_cluster_inner(n: usize, unbounded: bool, dead_count: usize) -> Vec<ClusterNode> {
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    let mut senders: Vec<ChannelSender> = Vec::new();
+    let mut receivers: Vec<ChannelReceiver> = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = if unbounded {
+            unbounded_channel()
+        } else {
+            channel(64)
+        };
+        senders.push(tx);
+        receivers.push(rx);
+    }
+
+    let mut cluster_nodes = Vec::new();
+    for i in 0..n {
+        let is_dead = i >= n - dead_count;
+
+        let peers: Vec<PeerInfo<ChannelSender>> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| PeerInfo {
+                id: ids[j].clone(),
+                sender: senders[j].clone(),
+            })
+            .collect();
+
+        let receiver = receivers.remove(0);
+        let storage = MemoryStorage::<String>::new();
+
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+
+        let run_handle = if is_dead {
+            tokio::spawn(async move {
+                drop(node);
+                futures_never().await
+            })
+        } else {
+            tokio::spawn(node.run())
+        };
+
+        cluster_nodes.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: ids[i].clone(),
+        });
+    }
+
+    cluster_nodes
+}
+
+// ---------------------------------------------------------------------------
+// Generic cluster creation (for non-String value types)
+// ---------------------------------------------------------------------------
+
+pub fn create_cluster_typed<V>(n: usize) -> Vec<ClusterNodeTyped<V>>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + PartialEq + 'static,
+{
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    let mut senders: Vec<ChannelSender> = Vec::new();
+    let mut receivers: Vec<ChannelReceiver> = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = channel(64);
+        senders.push(tx);
+        receivers.push(rx);
+    }
+
+    let mut cluster_nodes = Vec::new();
+    for i in 0..n {
+        let peers: Vec<PeerInfo<ChannelSender>> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| PeerInfo {
+                id: ids[j].clone(),
+                sender: senders[j].clone(),
+            })
+            .collect();
+
+        let receiver = receivers.remove(0);
+        let storage = MemoryStorage::<V>::new();
+
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+
+        let run_handle = tokio::spawn(node.run());
+
+        cluster_nodes.push(ClusterNodeTyped {
+            handle,
+            decisions,
+            run_handle,
+            id: ids[i].clone(),
+        });
+    }
+
+    cluster_nodes
+}
+
+// ---------------------------------------------------------------------------
+// Lossy cluster creation
+// ---------------------------------------------------------------------------
+
 pub fn create_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
     assert!(n > 0);
 
@@ -50,8 +231,7 @@ pub fn create_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
         let receiver = receivers.remove(0);
         let storage = MemoryStorage::<String>::new();
 
-        let (node, handle, decisions) =
-            Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
         let run_handle = tokio::spawn(node.run());
 
@@ -66,46 +246,28 @@ pub fn create_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
     cluster_nodes
 }
 
-pub fn create_cluster(n: usize) -> Vec<ClusterNode> {
-    create_cluster_inner(n, false, false)
-}
+// ---------------------------------------------------------------------------
+// Lossy cluster with unbounded channels (avoids backpressure deadlocks)
+// ---------------------------------------------------------------------------
 
-pub fn create_unbounded_cluster(n: usize) -> Vec<ClusterNode> {
-    create_cluster_inner(n, true, false)
-}
-
-pub fn create_cluster_with_dead_node(n: usize) -> Vec<ClusterNode> {
-    create_cluster_inner(n, false, true)
-}
-
-fn create_cluster_inner(n: usize, unbounded: bool, last_dead: bool) -> Vec<ClusterNode> {
+pub fn create_lossy_unbounded_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
     assert!(n > 0);
 
-    // Create node IDs
     let ids: Vec<NodeId> = (0..n)
         .map(|i| NodeId::new(format!("node-{}", i), 1000))
         .collect();
 
-    // Create channels: one (sender, receiver) per node
-    let mut senders: Vec<ChannelSender> = Vec::new();
+    let mut senders: Vec<LossySender<ChannelSender>> = Vec::new();
     let mut receivers: Vec<ChannelReceiver> = Vec::new();
     for _ in 0..n {
-        let (tx, rx) = if unbounded {
-            unbounded_channel()
-        } else {
-            channel(64)
-        };
-        senders.push(tx);
+        let (tx, rx) = unbounded_channel();
+        senders.push(LossySender::with_drop_rate(tx, drop_rate));
         receivers.push(rx);
     }
 
-    // Build nodes
     let mut cluster_nodes = Vec::new();
     for i in 0..n {
-        let is_dead = last_dead && i == n - 1;
-
-        // Build peer list: all nodes except self
-        let peers: Vec<PeerInfo<ChannelSender>> = (0..n)
+        let peers: Vec<PeerInfo<LossySender<ChannelSender>>> = (0..n)
             .filter(|&j| j != i)
             .map(|j| PeerInfo {
                 id: ids[j].clone(),
@@ -116,19 +278,9 @@ fn create_cluster_inner(n: usize, unbounded: bool, last_dead: bool) -> Vec<Clust
         let receiver = receivers.remove(0);
         let storage = MemoryStorage::<String>::new();
 
-        let (node, handle, decisions) =
-            Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
-        let run_handle = if is_dead {
-            // Spawn a task that just drops the node immediately (simulates unreachable peer)
-            tokio::spawn(async move {
-                drop(node);
-                // Keep future alive so JoinHandle doesn't complete immediately
-                futures_never().await
-            })
-        } else {
-            tokio::spawn(node.run())
-        };
+        let run_handle = tokio::spawn(node.run());
 
         cluster_nodes.push(ClusterNode {
             handle,
@@ -140,6 +292,175 @@ fn create_cluster_inner(n: usize, unbounded: bool, last_dead: bool) -> Vec<Clust
 
     cluster_nodes
 }
+
+// ---------------------------------------------------------------------------
+// Delayed cluster creation
+// ---------------------------------------------------------------------------
+
+pub fn create_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<ClusterNode> {
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    // Use unbounded channels to avoid backpressure deadlocks: the DelayedSender
+    // blocks the node event loop during the sleep, and a bounded channel can
+    // cause the sender to also block waiting for capacity, creating a deadlock.
+    let mut senders: Vec<DelayedSender<ChannelSender>> = Vec::new();
+    let mut receivers: Vec<ChannelReceiver> = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = unbounded_channel();
+        senders.push(DelayedSender::with_range(
+            tx,
+            Duration::from_millis(min_ms),
+            Duration::from_millis(max_ms),
+        ));
+        receivers.push(rx);
+    }
+
+    let mut cluster_nodes = Vec::new();
+    for i in 0..n {
+        let peers: Vec<PeerInfo<DelayedSender<ChannelSender>>> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| PeerInfo {
+                id: ids[j].clone(),
+                sender: senders[j].clone(),
+            })
+            .collect();
+
+        let receiver = receivers.remove(0);
+        let storage = MemoryStorage::<String>::new();
+
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+
+        let run_handle = tokio::spawn(node.run());
+
+        cluster_nodes.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: ids[i].clone(),
+        });
+    }
+
+    cluster_nodes
+}
+
+// ---------------------------------------------------------------------------
+// Reordering cluster creation
+// ---------------------------------------------------------------------------
+
+pub fn create_reordering_cluster(n: usize, window_ms: u64, batch_size: usize) -> Vec<ClusterNode> {
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    let mut senders: Vec<ReorderingSender<ChannelSender>> = Vec::new();
+    let mut receivers: Vec<ReorderingReceiver<ChannelReceiver>> = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = channel(64);
+        senders.push(ReorderingSender::new(tx));
+        receivers.push(ReorderingReceiver::with_params(
+            rx,
+            Duration::from_millis(window_ms),
+            batch_size,
+        ));
+    }
+
+    let mut cluster_nodes = Vec::new();
+    for i in 0..n {
+        let peers: Vec<PeerInfo<ReorderingSender<ChannelSender>>> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| PeerInfo {
+                id: ids[j].clone(),
+                sender: senders[j].clone(),
+            })
+            .collect();
+
+        let receiver = receivers.remove(0);
+        let storage = MemoryStorage::<String>::new();
+
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+
+        let run_handle = tokio::spawn(node.run());
+
+        cluster_nodes.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: ids[i].clone(),
+        });
+    }
+
+    cluster_nodes
+}
+
+// ---------------------------------------------------------------------------
+// Combined lossy + delayed cluster creation
+// ---------------------------------------------------------------------------
+
+pub fn create_lossy_delayed_cluster(
+    n: usize,
+    drop_rate: f64,
+    min_delay_ms: u64,
+    max_delay_ms: u64,
+) -> Vec<ClusterNode> {
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    // Wrap: DelayedSender<LossySender<ChannelSender>>
+    // Loss check happens first (inner), then delay (outer).
+    // Use unbounded channels to avoid backpressure deadlocks with delayed sends.
+    let mut senders: Vec<DelayedSender<LossySender<ChannelSender>>> = Vec::new();
+    let mut receivers: Vec<ChannelReceiver> = Vec::new();
+    for _ in 0..n {
+        let (tx, rx) = unbounded_channel();
+        let lossy = LossySender::with_drop_rate(tx, drop_rate);
+        senders.push(DelayedSender::with_range(
+            lossy,
+            Duration::from_millis(min_delay_ms),
+            Duration::from_millis(max_delay_ms),
+        ));
+        receivers.push(rx);
+    }
+
+    let mut cluster_nodes = Vec::new();
+    for i in 0..n {
+        let peers: Vec<PeerInfo<DelayedSender<LossySender<ChannelSender>>>> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| PeerInfo {
+                id: ids[j].clone(),
+                sender: senders[j].clone(),
+            })
+            .collect();
+
+        let receiver = receivers.remove(0);
+        let storage = MemoryStorage::<String>::new();
+
+        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+
+        let run_handle = tokio::spawn(node.run());
+
+        cluster_nodes.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: ids[i].clone(),
+        });
+    }
+
+    cluster_nodes
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 async fn futures_never() -> Result<(), concensus::NodeError> {
     loop {
@@ -170,26 +491,27 @@ pub async fn collect_decisions_with_timeout(
     results
 }
 
+// ---------------------------------------------------------------------------
+// Assertions
+// ---------------------------------------------------------------------------
+
 /// Assert all nodes agree on the same slot-to-value mapping.
 pub fn assert_consistent_decisions(all_decisions: &[Vec<Decided<String>>]) {
     if all_decisions.is_empty() {
         return;
     }
 
-    // Build slot->value map from first node
     let reference: HashMap<u64, String> = all_decisions[0]
         .iter()
         .map(|d| (d.slot, d.value.clone()))
         .collect();
 
-    // Check each node agrees
     for (i, decisions) in all_decisions.iter().enumerate() {
         let node_map: HashMap<u64, String> = decisions
             .iter()
             .map(|d| (d.slot, d.value.clone()))
             .collect();
 
-        // Slots must be unique per node
         assert_eq!(
             decisions.len(),
             node_map.len(),
@@ -197,7 +519,6 @@ pub fn assert_consistent_decisions(all_decisions: &[Vec<Decided<String>>]) {
             i
         );
 
-        // Every decision must match reference
         for (slot, value) in &node_map {
             if let Some(ref_value) = reference.get(slot) {
                 assert_eq!(
@@ -205,6 +526,28 @@ pub fn assert_consistent_decisions(all_decisions: &[Vec<Decided<String>>]) {
                     "node {} disagrees on slot {}: got {}, expected {}",
                     i, slot, value, ref_value
                 );
+            }
+        }
+    }
+}
+
+/// The core Paxos safety invariant: for any slot, all nodes that decided
+/// that slot must have decided the SAME value. Unlike assert_consistent_decisions
+/// which requires all nodes to have the same number of decisions, this check
+/// tolerates partial sets — it only checks slots that multiple nodes decided.
+pub fn assert_safety_invariant(all_decisions: &[Vec<Decided<String>>]) {
+    let mut slot_values: HashMap<u64, String> = HashMap::new();
+    for (node_idx, decisions) in all_decisions.iter().enumerate() {
+        for d in decisions {
+            if let Some(existing) = slot_values.get(&d.slot) {
+                assert_eq!(
+                    &d.value, existing,
+                    "SAFETY VIOLATION: node {} decided slot {} = {:?}, \
+                     but another node decided slot {} = {:?}",
+                    node_idx, d.slot, d.value, d.slot, existing
+                );
+            } else {
+                slot_values.insert(d.slot, d.value.clone());
             }
         }
     }

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use crate::error::StorageError;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
-use crate::error::StorageError;
+use std::collections::HashMap;
 
 /// Durable storage for consensus decisions.
 ///
@@ -39,11 +39,17 @@ pub struct MemoryStorage<V> {
 
 impl<V> MemoryStorage<V> {
     /// Creates an empty `MemoryStorage`.
-    pub fn new() -> Self { Self { decisions: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            decisions: HashMap::new(),
+        }
+    }
 }
 
 impl<V> Default for MemoryStorage<V> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait]
@@ -57,7 +63,11 @@ where
     }
 
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
-        Ok(self.decisions.iter().map(|(&slot, value)| (slot, value.clone())).collect())
+        Ok(self
+            .decisions
+            .iter()
+            .map(|(&slot, value)| (slot, value.clone()))
+            .collect())
     }
 }
 
@@ -87,7 +97,10 @@ mod tests {
     async fn save_overwrites_existing_slot() {
         let mut storage = MemoryStorage::new();
         storage.save_decision(0, "first".to_string()).await.unwrap();
-        storage.save_decision(0, "second".to_string()).await.unwrap();
+        storage
+            .save_decision(0, "second".to_string())
+            .await
+            .unwrap();
         let decisions = storage.load_decisions().await.unwrap();
         assert_eq!(decisions.len(), 1);
         assert!(decisions.contains(&(0, "second".to_string())));

@@ -3,8 +3,8 @@ mod helpers;
 use std::collections::HashSet;
 
 use helpers::{
-    assert_consistent_decisions, collect_decisions, create_cluster,
-    create_cluster_with_dead_node, create_unbounded_cluster,
+    assert_consistent_decisions, collect_decisions, create_cluster, create_cluster_with_dead_node,
+    create_unbounded_cluster,
 };
 
 #[tokio::test]
@@ -40,11 +40,7 @@ async fn multiple_sequential_proposals() {
 
     let values = vec!["alpha", "beta", "gamma"];
     for v in &values {
-        cluster[0]
-            .handle
-            .propose(v.to_string())
-            .await
-            .unwrap();
+        cluster[0].handle.propose(v.to_string()).await.unwrap();
         // Small delay to ensure sequential processing
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -54,8 +50,7 @@ async fn multiple_sequential_proposals() {
     let mut all_decisions = Vec::new();
     for node in &mut cluster {
         let decisions = collect_decisions(&mut node.decisions, 3).await;
-        let decided_values: HashSet<String> =
-            decisions.iter().map(|d| d.value.clone()).collect();
+        let decided_values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(decided_values, expected);
         all_decisions.push(decisions);
     }
@@ -95,8 +90,7 @@ async fn proposals_from_different_nodes() {
     let mut all_decisions = Vec::new();
     for node in &mut cluster {
         let decisions = collect_decisions(&mut node.decisions, 3).await;
-        let decided_values: HashSet<String> =
-            decisions.iter().map(|d| d.value.clone()).collect();
+        let decided_values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(decided_values, expected);
         all_decisions.push(decisions);
     }
@@ -112,11 +106,7 @@ async fn proposals_from_different_nodes() {
 async fn single_node_cluster() {
     let mut cluster = create_cluster(1);
 
-    cluster[0]
-        .handle
-        .propose("solo".to_string())
-        .await
-        .unwrap();
+    cluster[0].handle.propose("solo".to_string()).await.unwrap();
 
     let decisions = collect_decisions(&mut cluster[0].decisions, 1).await;
     assert_eq!(decisions.len(), 1);
@@ -158,9 +148,7 @@ async fn rapid_concurrent_proposals() {
     let mut cluster = create_unbounded_cluster(3);
 
     let num_proposals = 50;
-    let expected: HashSet<String> = (0..num_proposals)
-        .map(|i| format!("value-{}", i))
-        .collect();
+    let expected: HashSet<String> = (0..num_proposals).map(|i| format!("value-{}", i)).collect();
 
     for i in 0..num_proposals {
         cluster[0]
@@ -173,8 +161,7 @@ async fn rapid_concurrent_proposals() {
     let mut all_decisions = Vec::new();
     for node in &mut cluster {
         let decisions = collect_decisions(&mut node.decisions, num_proposals).await;
-        let decided_values: HashSet<String> =
-            decisions.iter().map(|d| d.value.clone()).collect();
+        let decided_values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(decided_values, expected);
         all_decisions.push(decisions);
     }

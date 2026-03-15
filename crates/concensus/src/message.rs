@@ -94,7 +94,10 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, MessageVariant::Prepare { slot: 0, .. }));
+        assert!(matches!(
+            deserialized,
+            MessageVariant::Prepare { slot: 0, .. }
+        ));
     }
 
     #[test]
@@ -107,14 +110,20 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: MessageVariant<String> = serde_json::from_str(&json).unwrap();
         match deserialized {
-            MessageVariant::Promise { accepted: Some((_, val)), .. } => assert_eq!(val, "hello"),
+            MessageVariant::Promise {
+                accepted: Some((_, val)),
+                ..
+            } => assert_eq!(val, "hello"),
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
     fn decide_message_serde_roundtrip() {
-        let msg = MessageVariant::Decide { slot: 5, value: 42u64 };
+        let msg = MessageVariant::Decide {
+            slot: 5,
+            value: 42u64,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: MessageVariant<u64> = serde_json::from_str(&json).unwrap();
         match deserialized {
@@ -157,7 +166,10 @@ mod tests {
             proposal_number: (1, test_node_id()),
             value: "test".to_string(),
         };
-        let msg = Message { sender: test_node_id(), variant };
+        let msg = Message {
+            sender: test_node_id(),
+            variant,
+        };
         let bytes = msg.to_bytes().unwrap();
         let decoded: Message<String> = Message::from_bytes(&bytes).unwrap();
         match decoded.variant {
@@ -176,10 +188,16 @@ mod tests {
             slot: 7,
             proposal_number: (2, test_node_id()),
         };
-        let msg: Message<String> = Message { sender: sender.clone(), variant };
+        let msg: Message<String> = Message {
+            sender: sender.clone(),
+            variant,
+        };
         let bytes = msg.to_bytes().unwrap();
         let decoded: Message<String> = Message::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.sender, sender);
-        assert!(matches!(decoded.variant, MessageVariant::Prepare { slot: 7, .. }));
+        assert!(matches!(
+            decoded.variant,
+            MessageVariant::Prepare { slot: 7, .. }
+        ));
     }
 }

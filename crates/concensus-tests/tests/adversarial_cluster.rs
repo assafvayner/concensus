@@ -2,9 +2,7 @@ mod helpers;
 
 use std::collections::HashSet;
 
-use helpers::{
-    assert_consistent_decisions, collect_decisions_with_timeout, create_lossy_cluster,
-};
+use helpers::{assert_consistent_decisions, collect_decisions_with_timeout, create_lossy_cluster};
 use tokio::time::Duration;
 
 /// With message loss, Paxos retries take longer. Use generous timeouts.
@@ -20,17 +18,24 @@ const TIMEOUT_PER_DECISION: Duration = Duration::from_secs(30);
 async fn lossy_1pct_single_value() {
     let mut cluster = create_lossy_cluster(3, 0.01);
 
-    cluster[0].handle.propose("hello".to_string()).await.unwrap();
+    cluster[0]
+        .handle
+        .propose("hello".to_string())
+        .await
+        .unwrap();
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
         assert_eq!(decisions[0].value, "hello");
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -44,14 +49,17 @@ async fn lossy_1pct_multiple_proposals() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,17 +70,24 @@ async fn lossy_1pct_multiple_proposals() {
 async fn lossy_10pct_single_value() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
-    cluster[0].handle.propose("hello".to_string()).await.unwrap();
+    cluster[0]
+        .handle
+        .propose("hello".to_string())
+        .await
+        .unwrap();
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
         assert_eq!(decisions[0].value, "hello");
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -86,14 +101,17 @@ async fn lossy_10pct_multiple_proposals() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -110,14 +128,17 @@ async fn lossy_10pct_proposals_from_different_nodes() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,17 +149,24 @@ async fn lossy_10pct_proposals_from_different_nodes() {
 async fn lossy_20pct_single_value() {
     let mut cluster = create_lossy_cluster(3, 0.20);
 
-    cluster[0].handle.propose("hello".to_string()).await.unwrap();
+    cluster[0]
+        .handle
+        .propose("hello".to_string())
+        .await
+        .unwrap();
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
         assert_eq!(decisions[0].value, "hello");
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -152,14 +180,17 @@ async fn lossy_20pct_multiple_proposals() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -176,14 +207,17 @@ async fn lossy_20pct_proposals_from_different_nodes() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,17 +228,24 @@ async fn lossy_20pct_proposals_from_different_nodes() {
 async fn lossy_30pct_single_value() {
     let mut cluster = create_lossy_cluster(3, 0.30);
 
-    cluster[0].handle.propose("hello".to_string()).await.unwrap();
+    cluster[0]
+        .handle
+        .propose("hello".to_string())
+        .await
+        .unwrap();
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 1, TIMEOUT_PER_DECISION).await;
         assert_eq!(decisions[0].value, "hello");
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,14 +259,17 @@ async fn lossy_30pct_multiple_proposals() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 10, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,12 +286,15 @@ async fn lossy_30pct_proposals_from_different_nodes() {
 
     let mut all = Vec::new();
     for node in &mut cluster {
-        let decisions = collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 3, TIMEOUT_PER_DECISION).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
         assert_eq!(values, expected);
         all.push(decisions);
     }
     assert_consistent_decisions(&all);
 
-    for node in cluster { drop(node.handle); }
+    for node in cluster {
+        drop(node.handle);
+    }
 }

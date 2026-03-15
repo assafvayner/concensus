@@ -1,7 +1,7 @@
+use crate::transport::MessageSender;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::sync::Arc;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::transport::MessageSender;
 
 /// A remote peer's identity paired with a sender for delivering messages to it.
 ///
@@ -36,14 +36,21 @@ pub struct NodeId {
 impl NodeId {
     /// Creates a new `NodeId` with the given name and incarnation number.
     pub fn new(name: impl Into<Arc<str>>, incarnation: u64) -> Self {
-        Self { name: name.into(), incarnation }
+        Self {
+            name: name.into(),
+            incarnation,
+        }
     }
 
     /// Returns the human-readable name portion of this node identity.
-    pub fn name(&self) -> &str { &self.name }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
     /// Returns the incarnation number, typically a UNIX timestamp set at node startup.
-    pub fn incarnation(&self) -> u64 { self.incarnation }
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
 }
 
 impl fmt::Display for NodeId {
@@ -129,14 +136,16 @@ mod tests {
 
     #[test]
     fn peer_info_holds_sender() {
-        use crate::transport::MessageSender;
         use crate::error::TransportError;
+        use crate::transport::MessageSender;
         use bytes::Bytes;
 
         struct DummySender;
         #[async_trait::async_trait]
         impl MessageSender for DummySender {
-            async fn send(&self, _data: Bytes) -> Result<(), TransportError> { Ok(()) }
+            async fn send(&self, _data: Bytes) -> Result<(), TransportError> {
+                Ok(())
+            }
         }
 
         let _info = PeerInfo {

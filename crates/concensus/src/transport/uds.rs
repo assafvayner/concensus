@@ -106,8 +106,7 @@ impl UdsReceiver {
         // Remove stale socket file if it exists
         let _ = std::fs::remove_file(&path);
 
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| TransportError::Other(Box::new(e)))?;
+        let listener = UnixListener::bind(&path).map_err(|e| TransportError::Other(Box::new(e)))?;
 
         let (incoming_tx, incoming_rx) = mpsc::channel(LISTENER_CHANNEL_CAPACITY);
 
@@ -138,10 +137,8 @@ impl UdsReceiver {
                         }
 
                         // Add jitter: ±25%
-                        let jitter = (delay_ms as f64
-                            * 0.25
-                            * (2.0 * rand::random::<f64>() - 1.0))
-                            as i64;
+                        let jitter =
+                            (delay_ms as f64 * 0.25 * (2.0 * rand::random::<f64>() - 1.0)) as i64;
                         let actual_delay = (delay_ms as i64 + jitter).max(10) as u64;
                         tokio::time::sleep(std::time::Duration::from_millis(actual_delay)).await;
 
@@ -255,13 +252,10 @@ mod tests {
         let payload = Bytes::from("hello-uds");
         sender.send(payload.clone()).await.unwrap();
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            receiver.recv(),
-        )
-        .await
-        .expect("timed out")
-        .expect("recv failed");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("timed out")
+            .expect("recv failed");
 
         assert_eq!(received, payload);
 
@@ -283,13 +277,10 @@ mod tests {
 
         // First send — establishes connection
         sender.send(Bytes::from("msg-1")).await.unwrap();
-        let r1 = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            receiver.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r1, Bytes::from("msg-1"));
 
         // Force-close the connection by clearing it
@@ -300,13 +291,10 @@ mod tests {
 
         // Second send — should reconnect
         sender.send(Bytes::from("msg-2")).await.unwrap();
-        let r2 = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            receiver.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r2, Bytes::from("msg-2"));
 
         let _ = std::fs::remove_file(&sock_path);
@@ -335,13 +323,10 @@ mod tests {
         let sender = UdsSender::new(&sock_path);
         sender.send(Bytes::from("valid")).await.unwrap();
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            receiver.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received, Bytes::from("valid"));
 
         let _ = std::fs::remove_file(&sock_path);
@@ -355,11 +340,7 @@ mod tests {
         let peer_path = temp_socket_path("factory-peer");
         let id_peer = NodeId::new("peer", 1000);
 
-        let result = UdsTransport::create(
-            &sock_path,
-            vec![(id_peer.clone(), peer_path)],
-        )
-        .await;
+        let result = UdsTransport::create(&sock_path, vec![(id_peer.clone(), peer_path)]).await;
 
         assert!(result.is_ok());
         let (peers, _receiver) = result.unwrap();

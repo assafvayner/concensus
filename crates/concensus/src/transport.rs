@@ -8,9 +8,9 @@
 //! - [`tcp`] — TCP with length-prefixed framing (feature: `tcp-transport`)
 //! - [`uds`] — Unix domain sockets (feature: `uds-transport`)
 
+use crate::error::TransportError;
 use async_trait::async_trait;
 use bytes::Bytes;
-use crate::error::TransportError;
 
 #[cfg(feature = "channel-transport")]
 pub mod channel;
@@ -53,7 +53,9 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    struct MockSender { tx: mpsc::Sender<Bytes> }
+    struct MockSender {
+        tx: mpsc::Sender<Bytes>,
+    }
 
     #[async_trait]
     impl MessageSender for MockSender {
@@ -62,7 +64,9 @@ mod tests {
         }
     }
 
-    struct MockReceiver { rx: mpsc::Receiver<Bytes> }
+    struct MockReceiver {
+        rx: mpsc::Receiver<Bytes>,
+    }
 
     #[async_trait]
     impl MessageReceiver for MockReceiver {

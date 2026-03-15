@@ -210,7 +210,11 @@ where
         tracing::info!(node_id = %self.node_id, "node starting");
 
         // Load existing decisions
-        let decisions = self.storage.load_decisions().await.map_err(NodeError::Storage)?;
+        let decisions = self
+            .storage
+            .load_decisions()
+            .await
+            .map_err(NodeError::Storage)?;
         self.protocol.initialize_from_decisions(decisions);
 
         // Build senders list
@@ -278,7 +282,11 @@ where
         }
     }
 
-    async fn handle_proposal(&mut self, value: V, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
+    async fn handle_proposal(
+        &mut self,
+        value: V,
+        senders: &[(NodeId, S)],
+    ) -> Result<(), NodeError> {
         let (slot, outgoing) = self.protocol.propose(value);
         tracing::debug!(slot, "new proposal");
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
@@ -403,22 +411,20 @@ where
     ///   1024) is full. Back off and retry.
     /// - [`ProposeError::NotRunning`] — the node's event loop has stopped.
     pub async fn propose(&self, value: V) -> Result<(), ProposeError> {
-        self.proposal_tx
-            .try_send(value)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => ProposeError::ChannelFull,
-                mpsc::error::TrySendError::Closed(_) => ProposeError::NotRunning,
-            })
+        self.proposal_tx.try_send(value).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => ProposeError::ChannelFull,
+            mpsc::error::TrySendError::Closed(_) => ProposeError::NotRunning,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::config::PeerInfo;
     use crate::error::TransportError;
     use crate::storage::MemoryStorage;
+    use bytes::Bytes;
 
     struct DummySender;
     #[async_trait::async_trait]
@@ -487,23 +493,16 @@ mod tests {
 
         handle.propose("hello".to_string()).await.unwrap();
 
-        let decided = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            decision_rx.recv(),
-        )
-        .await
-        .expect("timed out")
-        .expect("channel closed");
+        let decided = tokio::time::timeout(std::time::Duration::from_secs(1), decision_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
 
         assert_eq!(decided.slot, 0);
         assert_eq!(decided.value, "hello");
 
         drop(handle);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            run_handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
     }
 
     #[tokio::test]
@@ -538,8 +537,14 @@ mod tests {
         let (node_a, handle_a, mut rx_a) = Node::with_id(
             id_a.clone(),
             vec![
-                PeerInfo { id: id_b.clone(), sender: ChannelSender(b_tx.clone()) },
-                PeerInfo { id: id_c.clone(), sender: ChannelSender(c_tx.clone()) },
+                PeerInfo {
+                    id: id_b.clone(),
+                    sender: ChannelSender(b_tx.clone()),
+                },
+                PeerInfo {
+                    id: id_c.clone(),
+                    sender: ChannelSender(c_tx.clone()),
+                },
             ],
             ChannelReceiver(a_rx),
             MemoryStorage::<String>::new(),
@@ -547,8 +552,14 @@ mod tests {
         let (node_b, _handle_b, mut rx_b) = Node::with_id(
             id_b.clone(),
             vec![
-                PeerInfo { id: id_a.clone(), sender: ChannelSender(a_tx.clone()) },
-                PeerInfo { id: id_c.clone(), sender: ChannelSender(c_tx.clone()) },
+                PeerInfo {
+                    id: id_a.clone(),
+                    sender: ChannelSender(a_tx.clone()),
+                },
+                PeerInfo {
+                    id: id_c.clone(),
+                    sender: ChannelSender(c_tx.clone()),
+                },
             ],
             ChannelReceiver(b_rx),
             MemoryStorage::<String>::new(),
@@ -556,8 +567,14 @@ mod tests {
         let (node_c, _handle_c, mut rx_c) = Node::with_id(
             id_c.clone(),
             vec![
-                PeerInfo { id: id_a.clone(), sender: ChannelSender(a_tx.clone()) },
-                PeerInfo { id: id_b.clone(), sender: ChannelSender(b_tx.clone()) },
+                PeerInfo {
+                    id: id_a.clone(),
+                    sender: ChannelSender(a_tx.clone()),
+                },
+                PeerInfo {
+                    id: id_b.clone(),
+                    sender: ChannelSender(b_tx.clone()),
+                },
             ],
             ChannelReceiver(c_rx),
             MemoryStorage::<String>::new(),
@@ -571,9 +588,18 @@ mod tests {
         handle_a.propose("hello".to_string()).await.unwrap();
 
         let timeout = std::time::Duration::from_secs(5);
-        let da = tokio::time::timeout(timeout, rx_a.recv()).await.unwrap().unwrap();
-        let db = tokio::time::timeout(timeout, rx_b.recv()).await.unwrap().unwrap();
-        let dc = tokio::time::timeout(timeout, rx_c.recv()).await.unwrap().unwrap();
+        let da = tokio::time::timeout(timeout, rx_a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let db = tokio::time::timeout(timeout, rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let dc = tokio::time::timeout(timeout, rx_c.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(da.value, "hello");
         assert_eq!(db.value, "hello");
