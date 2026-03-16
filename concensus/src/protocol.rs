@@ -53,7 +53,7 @@ pub(crate) struct ProtocolState<V> {
     #[cfg(feature = "multi-paxos")]
     highest_seen_round: u64,
     #[cfg(feature = "multi-paxos")]
-    last_decide_time: Option<Instant>,
+    last_heartbeat_time: Option<Instant>,
 }
 
 /// Per-slot Paxos instance
@@ -130,7 +130,7 @@ where
             #[cfg(feature = "multi-paxos")]
             highest_seen_round: 0,
             #[cfg(feature = "multi-paxos")]
-            last_decide_time: None,
+            last_heartbeat_time: None,
         }
     }
 
@@ -473,10 +473,6 @@ where
             self.next_slot = slot + 1;
         }
         self.pending_decisions.push(Decision { slot, value });
-        #[cfg(feature = "multi-paxos")]
-        {
-            self.last_decide_time = Some(Instant::now());
-        }
     }
 
     // -- Propose: entry point --
@@ -756,7 +752,7 @@ where
         tracing::info!(term, node = %self.node_id, "became leader");
         self.leader_state = LeaderState::Leader { term };
         self.highest_seen_round = self.highest_seen_round.max(term);
-        self.last_decide_time = None;
+        self.last_heartbeat_time = None;
     }
 
     #[cfg(feature = "multi-paxos")]
@@ -812,8 +808,13 @@ where
     #[cfg(feature = "multi-paxos")]
     pub(crate) fn should_send_heartbeat(&self) -> bool {
         if let LeaderState::Leader { .. } = &self.leader_state {
+            // Always send heartbeats on a fixed interval, even if Decides were
+            // sent recently. Heartbeats carry the leader's identity and term,
+            // which is the only way followers learn who the leader is. Without
+            // periodic heartbeats, a busy leader that continuously sends Decides
+            // would never announce itself to new followers.
             let heartbeat_interval = std::time::Duration::from_millis(100);
-            match self.last_decide_time {
+            match self.last_heartbeat_time {
                 Some(t) => Instant::now().duration_since(t) >= heartbeat_interval,
                 None => true,
             }
@@ -823,8 +824,9 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    pub(crate) fn make_heartbeat(&self) -> Vec<Outgoing<V>> {
+    pub(crate) fn make_heartbeat(&mut self) -> Vec<Outgoing<V>> {
         if let LeaderState::Leader { term } = &self.leader_state {
+            self.last_heartbeat_time = Some(Instant::now());
             vec![Outgoing {
                 target: SendTarget::Broadcast,
                 message: MessageVariant::Heartbeat { term: *term },

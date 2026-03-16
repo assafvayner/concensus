@@ -323,3 +323,99 @@ async fn lossy_network_with_leader() {
         drop(node.handle);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 9. Duplicate forwarded values are each independently tracked
+// ---------------------------------------------------------------------------
+
+/// Verifies that forwarding the same value twice doesn't cause one of them
+/// to be silently lost. Each forward should be tracked independently so that
+/// if the first one is decided, the second still gets its own slot (or times
+/// out and is re-proposed directly).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_forwarded_values_both_decide() {
+    let mut cluster = create_cluster(3);
+
+    // Establish node-0 as leader
+    cluster[0]
+        .handle
+        .propose("establish".to_string())
+        .await
+        .unwrap();
+    for node in &mut cluster {
+        collect_decisions(&mut node.decisions, 1).await;
+    }
+
+    // Propose the same value twice from a follower
+    cluster[1]
+        .handle
+        .propose("duplicate".to_string())
+        .await
+        .unwrap();
+    cluster[1]
+        .handle
+        .propose("duplicate".to_string())
+        .await
+        .unwrap();
+
+    // Both should be decided (in separate slots)
+    let mut all = Vec::new();
+    for node in &mut cluster {
+        let decisions =
+            collect_decisions_with_timeout(&mut node.decisions, 2, Duration::from_secs(10)).await;
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].value, "duplicate");
+        assert_eq!(decisions[1].value, "duplicate");
+        assert_ne!(decisions[0].slot, decisions[1].slot);
+        all.push(decisions);
+    }
+    assert_consistent_decisions(&all);
+
+    for node in cluster {
+        drop(node.handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Late-joining follower discovers leader via heartbeat
+// ---------------------------------------------------------------------------
+
+/// After a leader is established, a follower should learn its identity via
+/// heartbeat messages and then forward subsequent proposals instead of
+/// running full Paxos.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_discovers_leader_via_heartbeat() {
+    let mut cluster = create_cluster(3);
+
+    // Establish node-0 as leader
+    cluster[0]
+        .handle
+        .propose("establish".to_string())
+        .await
+        .unwrap();
+    for node in &mut cluster {
+        collect_decisions(&mut node.decisions, 1).await;
+    }
+
+    // Wait for at least one heartbeat (>100ms interval)
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Propose from node-2 — should have learned leader via heartbeat
+    cluster[2]
+        .handle
+        .propose("from-follower-2".to_string())
+        .await
+        .unwrap();
+
+    let mut all = Vec::new();
+    for node in &mut cluster {
+        let decisions = collect_decisions(&mut node.decisions, 1).await;
+        assert_eq!(decisions[0].value, "from-follower-2");
+        all.push(decisions);
+    }
+    assert_consistent_decisions(&all);
+
+    for node in cluster {
+        drop(node.handle);
+    }
+}

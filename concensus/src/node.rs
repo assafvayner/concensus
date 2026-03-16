@@ -97,7 +97,9 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
     #[cfg(feature = "multi-paxos")]
-    forwarded_proposals: Vec<(std::time::Instant, V)>,
+    forwarded_proposals: Vec<(u64, std::time::Instant, V)>,
+    #[cfg(feature = "multi-paxos")]
+    next_forward_id: u64,
 }
 
 /// A cloneable handle for submitting proposals to a running [`Node`].
@@ -186,6 +188,8 @@ where
             decision_tx,
             #[cfg(feature = "multi-paxos")]
             forwarded_proposals: Vec::new(),
+            #[cfg(feature = "multi-paxos")]
+            next_forward_id: 0,
         };
 
         (node, NodeHandle { proposal_tx }, decision_rx)
@@ -303,8 +307,10 @@ where
                         },
                     }];
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
+                    let fwd_id = self.next_forward_id;
+                    self.next_forward_id += 1;
                     self.forwarded_proposals
-                        .push((std::time::Instant::now(), value));
+                        .push((fwd_id, std::time::Instant::now(), value));
                     return Ok(());
                 }
             }
@@ -380,11 +386,11 @@ where
             let timed_out: Vec<V> = self
                 .forwarded_proposals
                 .iter()
-                .filter(|(t, _)| now.duration_since(*t) >= forward_timeout)
-                .map(|(_, v)| v.clone())
+                .filter(|(_, t, _)| now.duration_since(*t) >= forward_timeout)
+                .map(|(_, _, v)| v.clone())
                 .collect();
             self.forwarded_proposals
-                .retain(|(t, _)| now.duration_since(*t) < forward_timeout);
+                .retain(|(_, t, _)| now.duration_since(*t) < forward_timeout);
 
             for value in timed_out {
                 tracing::debug!("forwarded proposal timed out, proposing directly");
@@ -448,11 +454,21 @@ where
             }
         }
 
-        // Remove forwarded proposals that have been decided
+        // Remove at most one forwarded proposal per decided value. Using per-request
+        // IDs ensures that if the same value is forwarded twice, only one entry is
+        // cleared per decision — the other stays and will either get its own decision
+        // or time out and fall back to direct proposal.
         #[cfg(feature = "multi-paxos")]
         {
-            self.forwarded_proposals
-                .retain(|(_, v)| !decisions.iter().any(|d| d.value == *v));
+            for decision in &decisions {
+                if let Some(pos) = self
+                    .forwarded_proposals
+                    .iter()
+                    .position(|(_, _, v)| *v == decision.value)
+                {
+                    self.forwarded_proposals.remove(pos);
+                }
+            }
         }
 
         Ok(())
