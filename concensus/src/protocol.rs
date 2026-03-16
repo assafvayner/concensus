@@ -161,6 +161,11 @@ where
             if self.decided_slots.contains_key(&state.slot) {
                 continue;
             }
+            // Advance next_slot past any restored undecided slot so that
+            // propose() never reuses a slot with restored acceptor state.
+            if state.slot >= self.next_slot {
+                self.next_slot = state.slot + 1;
+            }
             let instance = self.get_or_create_instance(state.slot);
             instance.highest_promised = state.highest_promised;
             instance.accepted = state.accepted;
@@ -1548,6 +1553,44 @@ mod tests {
         }];
         proto.initialize_from_acceptor_states(states);
         assert!(!proto.instances.contains_key(&0));
+    }
+
+    #[test]
+    fn initialize_from_acceptor_states_advances_next_slot() {
+        use crate::storage::AcceptorState;
+        let mut proto = make_protocol("a", 3);
+        // Decide slots 0 and 1 so next_slot = 2
+        proto.handle_message(
+            node("b"),
+            MessageVariant::Decide {
+                slot: 0,
+                value: "a".to_string(),
+            },
+        );
+        proto.handle_message(
+            node("b"),
+            MessageVariant::Decide {
+                slot: 1,
+                value: "b".to_string(),
+            },
+        );
+        proto.take_decisions();
+        assert_eq!(proto.next_slot, 2);
+
+        // Restore acceptor state for slot 5 (undecided)
+        let states = vec![AcceptorState {
+            slot: 5,
+            highest_promised: Some((3, node("c"))),
+            accepted: None,
+        }];
+        proto.initialize_from_acceptor_states(states);
+
+        // next_slot must advance past the restored slot
+        assert_eq!(proto.next_slot, 6);
+
+        // propose() should not reuse slot 5
+        let (slot, _) = proto.propose("new".to_string());
+        assert_eq!(slot, 6);
     }
 
     #[test]

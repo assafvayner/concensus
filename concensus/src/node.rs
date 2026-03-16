@@ -274,7 +274,7 @@ where
                         }
                     }
                     _ = retry_interval.tick() => {
-                        self.handle_retries(&senders).await;
+                        self.handle_retries(&senders).await?;
                     }
                 }
             } else {
@@ -347,11 +347,12 @@ where
         Ok(())
     }
 
-    async fn handle_retries(&mut self, senders: &[(NodeId, S)]) {
+    async fn handle_retries(&mut self, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
         let slots = self.protocol.get_retryable_proposals();
         for slot in slots {
             tracing::debug!(slot, "retrying proposal");
             let outgoing = self.protocol.retry_proposal(slot);
+            self.persist_dirty_acceptor_slots().await?;
             Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         }
 
@@ -361,6 +362,7 @@ where
         if !rebroadcasts.is_empty() {
             Self::send_outgoing(&self.node_id, &rebroadcasts, senders).await;
         }
+        Ok(())
     }
 
     async fn send_outgoing(node_id: &NodeId, outgoing: &[Outgoing<V>], senders: &[(NodeId, S)]) {
