@@ -401,7 +401,18 @@ where
     fn handle_decide(&mut self, from: NodeId, slot: u64, value: V) {
         #[cfg(feature = "multi-paxos")]
         {
-            self.update_leader_contact(&from, self.highest_seen_round);
+            // Only reset the leader timeout if the Decide came from the node we
+            // already believe is the leader. We do NOT learn a new leader identity
+            // from Decide messages because followers re-broadcast Decides via
+            // get_decision_rebroadcasts(), and a follower's re-broadcast should not
+            // cause other nodes to treat it as the leader. Leader identity is only
+            // established via Heartbeat messages (which carry an explicit term and
+            // are only sent by the actual leader).
+            if let LeaderState::Follower { leader: Some(ref leader_id), ref mut last_contact } = self.leader_state {
+                if *leader_id == from {
+                    *last_contact = Instant::now();
+                }
+            }
         }
         #[cfg(not(feature = "multi-paxos"))]
         let _ = &from;
