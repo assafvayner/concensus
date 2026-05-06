@@ -1,4 +1,6 @@
+use crate::config::NodeId;
 use crate::error::StorageError;
+use crate::message::LogEntry;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
@@ -29,12 +31,51 @@ where
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError>;
 }
 
+/// Durable storage for Raft-specific state.
+///
+/// Extends [`Storage`] with the persistent Raft state from the paper:
+/// `currentTerm`, `votedFor`, and the replicated log. The [`Node`](crate::Node)
+/// constructed via `Node::with_raft_config` requires this trait; it is invoked
+/// to flush term, vote, and log entries to durable storage before sending the
+/// corresponding RPC.
+#[async_trait]
+pub trait RaftStorage<V>: Storage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send,
+{
+    /// Persist the current Raft term.
+    async fn save_term(&mut self, term: u64) -> Result<(), StorageError>;
+
+    /// Load the persisted Raft term, or 0 if no term was ever saved.
+    async fn load_term(&self) -> Result<u64, StorageError>;
+
+    /// Persist the candidate this node voted for in the current term, or `None`
+    /// to clear the vote (e.g., on term advance).
+    async fn save_voted_for(&mut self, voted_for: Option<NodeId>) -> Result<(), StorageError>;
+
+    /// Load the persisted vote, if any.
+    async fn load_voted_for(&self) -> Result<Option<NodeId>, StorageError>;
+
+    /// Append entries to the end of the log, in order.
+    async fn append_log(&mut self, entries: &[LogEntry<V>]) -> Result<(), StorageError>;
+
+    /// Drop log entries from `index` (inclusive) onward. A no-op if `index` is
+    /// past the end of the log.
+    async fn truncate_log_from(&mut self, index: u64) -> Result<(), StorageError>;
+
+    /// Load the entire log.
+    async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError>;
+}
+
 /// In-memory [`Storage`] implementation backed by a `HashMap`.
 ///
 /// Decisions are lost when the process exits. Suitable for tests and
 /// ephemeral deployments where durability is not required.
 pub struct MemoryStorage<V> {
     decisions: HashMap<u64, V>,
+    term: u64,
+    voted_for: Option<NodeId>,
+    log: Vec<LogEntry<V>>,
 }
 
 impl<V> MemoryStorage<V> {
@@ -42,6 +83,9 @@ impl<V> MemoryStorage<V> {
     pub fn new() -> Self {
         Self {
             decisions: HashMap::new(),
+            term: 0,
+            voted_for: None,
+            log: Vec::new(),
         }
     }
 }
@@ -68,6 +112,47 @@ where
             .iter()
             .map(|(&slot, value)| (slot, value.clone()))
             .collect())
+    }
+}
+
+#[async_trait]
+impl<V> RaftStorage<V> for MemoryStorage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    async fn save_term(&mut self, term: u64) -> Result<(), StorageError> {
+        self.term = term;
+        Ok(())
+    }
+
+    async fn load_term(&self) -> Result<u64, StorageError> {
+        Ok(self.term)
+    }
+
+    async fn save_voted_for(&mut self, voted_for: Option<NodeId>) -> Result<(), StorageError> {
+        self.voted_for = voted_for;
+        Ok(())
+    }
+
+    async fn load_voted_for(&self) -> Result<Option<NodeId>, StorageError> {
+        Ok(self.voted_for.clone())
+    }
+
+    async fn append_log(&mut self, entries: &[LogEntry<V>]) -> Result<(), StorageError> {
+        self.log.extend_from_slice(entries);
+        Ok(())
+    }
+
+    async fn truncate_log_from(&mut self, index: u64) -> Result<(), StorageError> {
+        let idx = index as usize;
+        if idx < self.log.len() {
+            self.log.truncate(idx);
+        }
+        Ok(())
+    }
+
+    async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
+        Ok(self.log.clone())
     }
 }
 
@@ -104,5 +189,72 @@ mod tests {
         let decisions = storage.load_decisions().await.unwrap();
         assert_eq!(decisions.len(), 1);
         assert!(decisions.contains(&(0, "second".to_string())));
+    }
+
+    #[tokio::test]
+    async fn raft_storage_term_roundtrip() {
+        let mut s = MemoryStorage::<String>::new();
+        assert_eq!(s.load_term().await.unwrap(), 0);
+        s.save_term(7).await.unwrap();
+        assert_eq!(s.load_term().await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn raft_storage_voted_for_roundtrip() {
+        use crate::config::NodeId;
+        let mut s = MemoryStorage::<String>::new();
+        assert!(s.load_voted_for().await.unwrap().is_none());
+        let nid = NodeId::new("a", 1);
+        s.save_voted_for(Some(nid.clone())).await.unwrap();
+        assert_eq!(s.load_voted_for().await.unwrap(), Some(nid));
+        s.save_voted_for(None).await.unwrap();
+        assert!(s.load_voted_for().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn raft_storage_log_append_load_truncate() {
+        use crate::message::LogEntry;
+        let mut s = MemoryStorage::<String>::new();
+        assert!(s.load_log().await.unwrap().is_empty());
+        s.append_log(&[
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+        ])
+        .await
+        .unwrap();
+        s.append_log(&[LogEntry {
+            term: 2,
+            value: "c".into(),
+        }])
+        .await
+        .unwrap();
+        let log = s.load_log().await.unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[2].term, 2);
+        s.truncate_log_from(1).await.unwrap();
+        let log = s.load_log().await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].value, "a");
+    }
+
+    #[tokio::test]
+    async fn raft_storage_truncate_past_end_is_noop() {
+        use crate::message::LogEntry;
+        let mut s = MemoryStorage::<String>::new();
+        s.append_log(&[LogEntry {
+            term: 1,
+            value: "a".into(),
+        }])
+        .await
+        .unwrap();
+        // Truncate from index well past the end - should be no-op, not panic or error
+        s.truncate_log_from(100).await.unwrap();
+        assert_eq!(s.load_log().await.unwrap().len(), 1);
     }
 }

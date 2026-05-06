@@ -50,7 +50,7 @@ pub mod transport;
 pub use config::{ConsensusAlgorithm, NodeConfig, NodeId, PaxosConfig, PeerInfo, RaftConfig};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use node::{Decided, DecisionReceiver, Node, NodeHandle};
-pub use storage::{MemoryStorage, Storage};
+pub use storage::{MemoryStorage, RaftStorage, Storage};
 pub use transport::{MessageReceiver, MessageSender};
 
 /// In-memory channel transport for testing. Requires the `channel-transport` feature.

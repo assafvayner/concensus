@@ -4,7 +4,7 @@ use crate::config::NodeId;
 
 /// A single replicated log entry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub(crate) struct LogEntry<V> {
+pub struct LogEntry<V> {
     pub term: u64,
     pub value: V,
 }
