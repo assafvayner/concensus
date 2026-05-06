@@ -531,12 +531,9 @@ pub fn create_raft_lossy_delayed_cluster(
     out
 }
 
-pub fn create_raft_cluster_with_edge_filters(
-    n: usize,
-) -> (
-    Vec<ClusterNode>,
-    HashMap<(NodeId, NodeId), std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) {
+pub type EdgeFlags = HashMap<(NodeId, NodeId), std::sync::Arc<std::sync::atomic::AtomicBool>>;
+
+pub fn create_raft_cluster_with_edge_filters(n: usize) -> (Vec<ClusterNode>, EdgeFlags) {
     assert!(n > 0);
     let cfg = test_raft_config();
     let ids: Vec<NodeId> = (0..n)
@@ -551,8 +548,7 @@ pub fn create_raft_cluster_with_edge_filters(
         base_tx.insert(id.clone(), tx);
         rx_for.insert(id.clone(), rx);
     }
-    let mut edges: HashMap<(NodeId, NodeId), std::sync::Arc<std::sync::atomic::AtomicBool>> =
-        HashMap::new();
+    let mut edges: EdgeFlags = HashMap::new();
     let mut edge_senders: HashMap<(NodeId, NodeId), ToggleDropSender<ChannelSender>> =
         HashMap::new();
     for from in &ids {

@@ -108,10 +108,9 @@ async fn network_partition_majority_progresses() {
         .await
         .unwrap();
     let mut majority_decisions = Vec::new();
-    for i in 0..3 {
+    for node in cluster.iter_mut().take(3) {
         let d =
-            collect_decisions_with_timeout(&mut cluster[i].decisions, 2, Duration::from_secs(8))
-                .await;
+            collect_decisions_with_timeout(&mut node.decisions, 2, Duration::from_secs(8)).await;
         majority_decisions.push(d);
     }
 
@@ -131,10 +130,9 @@ async fn network_partition_majority_progresses() {
         }
     }
     let mut minority_decisions = Vec::new();
-    for i in 3..5 {
+    for node in cluster.iter_mut().skip(3).take(2) {
         let d =
-            collect_decisions_with_timeout(&mut cluster[i].decisions, 2, Duration::from_secs(15))
-                .await;
+            collect_decisions_with_timeout(&mut node.decisions, 2, Duration::from_secs(15)).await;
         minority_decisions.push(d);
     }
     let mut all = majority_decisions;
@@ -323,7 +321,10 @@ async fn leader_completeness_under_churn() {
         all.push(d);
     }
     assert_safety_invariant(&all);
-    assert!(!all.is_empty(), "expected surviving nodes to have decisions");
+    assert!(
+        !all.is_empty(),
+        "expected surviving nodes to have decisions"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
