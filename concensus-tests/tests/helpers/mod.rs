@@ -590,6 +590,19 @@ pub fn assert_consistent_decisions(all_decisions: &[Vec<Decided<String>>]) {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum Algorithm {
+    Paxos,
+    Raft,
+}
+
+pub fn create_cluster_with_algorithm(n: usize, alg: Algorithm) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_cluster(n),
+        Algorithm::Raft => create_raft_cluster(n),
+    }
+}
+
 /// The core Paxos safety invariant: for any slot, all nodes that decided
 /// that slot must have decided the SAME value. Unlike assert_consistent_decisions
 /// which requires all nodes to have the same number of decisions, this check
