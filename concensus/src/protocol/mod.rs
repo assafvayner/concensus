@@ -145,15 +145,4 @@ where
             ProtocolImpl::Raft(r) => r.peek_state(),
         }
     }
-
-    /// Initialize from previously persisted decisions. Protocol-specific.
-    pub(crate) fn initialize_from_decisions(&mut self, decisions: Vec<(u64, V)>) {
-        match self {
-            Self::Paxos(p) => p.initialize_from_decisions(decisions),
-            Self::Raft(_) => {
-                // TODO(Task 16): Restart recovery via RaftProtocol::recover.
-                let _ = decisions;
-            }
-        }
-    }
 }
