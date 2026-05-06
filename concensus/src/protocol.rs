@@ -28,6 +28,12 @@ pub(crate) struct Decision<V> {
     pub value: V,
 }
 
+pub(crate) struct DirtyAcceptorState<V> {
+    pub slot: u64,
+    pub highest_promised: Option<ProposalNumber>,
+    pub accepted: Option<(ProposalNumber, V)>,
+}
+
 #[cfg(feature = "multi-paxos")]
 #[derive(Debug)]
 pub(crate) enum LeaderState {
@@ -163,19 +169,16 @@ where
         std::mem::take(&mut self.lost_proposals)
     }
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn take_dirty_acceptor_slots(
-        &mut self,
-    ) -> Vec<(u64, Option<ProposalNumber>, Option<(ProposalNumber, V)>)> {
+    pub(crate) fn take_dirty_acceptor_slots(&mut self) -> Vec<DirtyAcceptorState<V>> {
         let slots = std::mem::take(&mut self.dirty_acceptor_slots);
         let mut result = Vec::new();
         for slot in slots {
             if let Some(instance) = self.instances.get(&slot) {
-                result.push((
+                result.push(DirtyAcceptorState {
                     slot,
-                    instance.highest_promised.clone(),
-                    instance.accepted.clone(),
-                ));
+                    highest_promised: instance.highest_promised.clone(),
+                    accepted: instance.accepted.clone(),
+                });
             }
         }
         result
@@ -1698,8 +1701,8 @@ mod tests {
         );
         let dirty = proto.take_dirty_acceptor_slots();
         assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty[0].0, 0);
-        assert!(dirty[0].1.is_some());
+        assert_eq!(dirty[0].slot, 0);
+        assert!(dirty[0].highest_promised.is_some());
     }
 
     #[test]
@@ -1717,9 +1720,9 @@ mod tests {
         );
         let dirty = proto.take_dirty_acceptor_slots();
         assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty[0].0, 0);
-        assert!(dirty[0].1.is_some());
-        assert!(dirty[0].2.is_some());
+        assert_eq!(dirty[0].slot, 0);
+        assert!(dirty[0].highest_promised.is_some());
+        assert!(dirty[0].accepted.is_some());
     }
 
     #[test]
@@ -1745,8 +1748,8 @@ mod tests {
         proto.propose("hello".to_string());
         let dirty = proto.take_dirty_acceptor_slots();
         assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty[0].0, 0);
-        assert!(dirty[0].1.is_some());
+        assert_eq!(dirty[0].slot, 0);
+        assert!(dirty[0].highest_promised.is_some());
     }
 
     #[test]
@@ -1767,7 +1770,7 @@ mod tests {
         proto.retry_proposal(0);
         let dirty = proto.take_dirty_acceptor_slots();
         assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty[0].0, 0);
+        assert_eq!(dirty[0].slot, 0);
     }
 
     #[test]

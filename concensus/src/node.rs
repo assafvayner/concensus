@@ -306,9 +306,9 @@ where
 
     async fn persist_dirty_acceptor_slots(&mut self) -> Result<(), NodeError> {
         let dirty = self.protocol.take_dirty_acceptor_slots();
-        for (slot, highest_promised, accepted) in dirty {
+        for state in dirty {
             self.storage
-                .save_acceptor_state(slot, highest_promised, accepted)
+                .save_acceptor_state(state.slot, state.highest_promised, state.accepted)
                 .await
                 .map_err(NodeError::Storage)?;
         }
