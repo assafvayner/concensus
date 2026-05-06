@@ -13,8 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use concensus::{
     channel, unbounded_channel, ChannelReceiver, ChannelSender, Decided, DecisionReceiver,
-    LogEntry, MemoryStorage, Node, NodeHandle, NodeId, PeerInfo, RaftStorage, Storage,
-    StorageError,
+    LogEntry, Node, NodeHandle, NodeId, PaxosMemoryStorage, PaxosStorage, PeerInfo,
+    RaftMemoryStorage, RaftStorage, StorageError,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
@@ -47,15 +47,26 @@ pub struct ClusterNodeTyped<V> {
 // Shared storage for recovery tests
 // ---------------------------------------------------------------------------
 
+/// Shared `PaxosStorage` for restart-recovery tests.
+///
+/// Wraps a `PaxosMemoryStorage` in `Arc<Mutex<...>>` so a node can be dropped
+/// and a new one constructed against the same underlying state, modeling
+/// process restart with persistent disk.
 pub struct SharedMemoryStorage<V> {
-    inner: Arc<Mutex<MemoryStorage<V>>>,
+    inner: Arc<Mutex<PaxosMemoryStorage<V>>>,
 }
 
 impl<V> SharedMemoryStorage<V> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MemoryStorage::new())),
+            inner: Arc::new(Mutex::new(PaxosMemoryStorage::new())),
         }
+    }
+}
+
+impl<V> Default for SharedMemoryStorage<V> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -68,7 +79,7 @@ impl<V> Clone for SharedMemoryStorage<V> {
 }
 
 #[async_trait]
-impl<V> Storage<V> for SharedMemoryStorage<V>
+impl<V> PaxosStorage<V> for SharedMemoryStorage<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
@@ -81,19 +92,16 @@ where
     }
 }
 
-/// Shared `RaftStorage` for restart-recovery tests.
-///
-/// Wraps a single `MemoryStorage` in `Arc<Mutex<...>>` so a node can be
-/// dropped and a new one constructed against the same underlying state,
-/// modeling process restart with persistent disk.
+/// Shared `RaftStorage` for restart-recovery tests. Mirrors
+/// `SharedMemoryStorage` for the Raft side.
 pub struct SharedRaftStorage<V> {
-    inner: Arc<Mutex<MemoryStorage<V>>>,
+    inner: Arc<Mutex<RaftMemoryStorage<V>>>,
 }
 
 impl<V> SharedRaftStorage<V> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MemoryStorage::new())),
+            inner: Arc::new(Mutex::new(RaftMemoryStorage::new())),
         }
     }
 }
@@ -113,7 +121,7 @@ impl<V> Clone for SharedRaftStorage<V> {
 }
 
 #[async_trait]
-impl<V> Storage<V> for SharedRaftStorage<V>
+impl<V> RaftStorage<V> for SharedRaftStorage<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
@@ -124,13 +132,7 @@ where
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
         self.inner.lock().await.load_decisions().await
     }
-}
 
-#[async_trait]
-impl<V> RaftStorage<V> for SharedRaftStorage<V>
-where
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
     async fn save_term(&mut self, term: u64) -> Result<(), StorageError> {
         self.inner.lock().await.save_term(term).await
     }
@@ -213,7 +215,7 @@ fn create_cluster_inner(n: usize, unbounded: bool, dead_count: usize) -> Vec<Clu
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -270,7 +272,7 @@ where
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<V>::new();
+        let storage = PaxosMemoryStorage::<V>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -366,7 +368,7 @@ fn create_raft_lossy_cluster_inner(
             config.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -415,7 +417,7 @@ pub fn create_raft_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<Cl
             cfg.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -464,7 +466,7 @@ pub fn create_raft_reordering_cluster(
             cfg.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -519,7 +521,7 @@ pub fn create_raft_lossy_delayed_cluster(
             cfg.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -578,7 +580,7 @@ pub fn create_raft_cluster_with_edge_filters(n: usize) -> (Vec<ClusterNode>, Edg
             cfg.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -622,7 +624,7 @@ fn create_raft_cluster_inner(n: usize, config: concensus::RaftConfig) -> Vec<Clu
             config.clone(),
             peers,
             recv,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         );
         let run_handle = tokio::spawn(node.run());
         out.push(ClusterNode {
@@ -665,7 +667,7 @@ pub fn create_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -712,7 +714,7 @@ pub fn create_lossy_unbounded_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNo
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -766,7 +768,7 @@ pub fn create_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<Cluster
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -817,7 +819,7 @@ pub fn create_reordering_cluster(n: usize, window_ms: u64, batch_size: usize) ->
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 
@@ -877,7 +879,7 @@ pub fn create_lossy_delayed_cluster(
             .collect();
 
         let receiver = receivers.remove(0);
-        let storage = MemoryStorage::<String>::new();
+        let storage = PaxosMemoryStorage::<String>::new();
 
         let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
 

@@ -12,13 +12,15 @@
 //! - [`Node`] — the consensus participant that runs the Paxos event loop
 //! - [`NodeHandle`] — a cloneable handle for submitting proposals to a running node
 //! - [`DecisionReceiver`] — a channel receiver for consuming decided values
-//! - [`Storage`] — a trait for persisting decisions (with [`MemoryStorage`] provided)
+//! - [`PaxosStorage`] / [`RaftStorage`] — algorithm-specific persistence traits,
+//!   each with an in-memory implementation ([`PaxosMemoryStorage`],
+//!   [`RaftMemoryStorage`])
 //! - [`MessageSender`] / [`MessageReceiver`] — traits for inter-node communication
 //!
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use concensus::{Node, NodeId, MemoryStorage, PeerInfo};
+//! use concensus::{Node, NodeId, PaxosMemoryStorage, PeerInfo};
 //! # // This example requires a transport, shown conceptually
 //! # fn main() {}
 //! ```
@@ -51,7 +53,7 @@ pub use config::{NodeId, PaxosConfig, PeerInfo, RaftConfig};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use message::raft::LogEntry;
 pub use node::{Decided, DecisionReceiver, Node, NodeHandle, NodeRole, NodeState};
-pub use storage::{MemoryStorage, RaftStorage, Storage};
+pub use storage::{PaxosMemoryStorage, PaxosStorage, RaftMemoryStorage, RaftStorage};
 pub use transport::{MessageReceiver, MessageSender};
 
 /// In-memory channel transport for testing. Requires the `channel-transport` feature.

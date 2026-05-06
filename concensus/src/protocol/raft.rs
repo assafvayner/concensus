@@ -140,8 +140,8 @@ where
     }
 
     /// Restore persistent state at startup. Called by the Node before entering
-    /// the event loop with `term`, `voted_for`, and `log` from `RaftStorage`
-    /// and `decisions` from `Storage::load_decisions`. The committed prefix of
+    /// the event loop with `term`, `voted_for`, `log`, and decisions all loaded
+    /// through `RaftStorage`. The committed prefix of
     /// the log is exactly the set of decided slots, so `commit_index` and
     /// `last_applied` are set to the highest decided slot (or `None` if there
     /// are no decisions).

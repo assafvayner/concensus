@@ -1,11 +1,11 @@
 mod helpers;
 
-use concensus::{channel, ChannelSender, Decided, MemoryStorage, Node, NodeId, PeerInfo};
+use concensus::{channel, ChannelSender, Decided, Node, NodeId, PaxosMemoryStorage, PeerInfo};
 use helpers::SharedMemoryStorage;
 use tokio::time::{timeout, Duration};
 
 /// Helper: build a 3-node cluster where node-0 uses the given `SharedMemoryStorage`
-/// and the other two use fresh `MemoryStorage`.
+/// and the other two use fresh `PaxosMemoryStorage`.
 #[allow(clippy::type_complexity)]
 fn build_cluster(
     ids: &[NodeId; 3],
@@ -55,13 +55,13 @@ fn build_cluster(
         ids[1].clone(),
         peers_for_1,
         rx1,
-        MemoryStorage::<String>::new(),
+        PaxosMemoryStorage::<String>::new(),
     );
     let (node2, handle2, dec2) = Node::with_id(
         ids[2].clone(),
         peers_for_2,
         rx2,
-        MemoryStorage::<String>::new(),
+        PaxosMemoryStorage::<String>::new(),
     );
 
     let rh0 = tokio::spawn(node0.run());

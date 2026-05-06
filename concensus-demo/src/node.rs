@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use concensus::{
-    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, ProposeError, RaftConfig,
-    TcpTransport, UdsTransport,
+    DecisionReceiver, Node, NodeHandle, NodeId, PaxosMemoryStorage, ProposeError, RaftConfig,
+    RaftMemoryStorage, TcpTransport, UdsTransport,
 };
 
 pub mod consensus_proto {
@@ -268,14 +268,14 @@ async fn start_node_tcp(
             node_id,
             peer_infos,
             receiver,
-            MemoryStorage::<String>::new(),
+            PaxosMemoryStorage::<String>::new(),
         ),
         Algorithm::Raft => Node::with_raft_config_and_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
             receiver,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         ),
     };
 
@@ -306,14 +306,14 @@ async fn start_node_uds(
             node_id,
             peer_infos,
             receiver,
-            MemoryStorage::<String>::new(),
+            PaxosMemoryStorage::<String>::new(),
         ),
         Algorithm::Raft => Node::with_raft_config_and_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
             receiver,
-            MemoryStorage::<String>::new(),
+            RaftMemoryStorage::<String>::new(),
         ),
     };
 

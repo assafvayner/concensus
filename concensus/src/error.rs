@@ -23,7 +23,8 @@ pub enum NodeError {
     Storage(#[from] StorageError),
 }
 
-/// Errors from the [`Storage`](crate::Storage) trait.
+/// Errors from the [`PaxosStorage`](crate::PaxosStorage) and
+/// [`RaftStorage`](crate::RaftStorage) traits.
 #[derive(Error, Debug)]
 pub enum StorageError {
     /// Failed to persist a decided value.
