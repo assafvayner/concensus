@@ -1923,6 +1923,33 @@ mod tests {
     }
 
     #[test]
+    fn is_idle_false_when_leader() {
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.leader = Some(me);
+        assert!(!p.is_idle(), "leader is never idle");
+    }
+
+    #[test]
+    fn is_idle_false_when_pending_proposals() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.pending_proposals.push("x".into());
+        assert!(!p.is_idle());
+    }
+
+    #[test]
+    fn is_idle_false_when_log_nonempty() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.log.push(LogEntry {
+            term: 1,
+            value: "x".into(),
+        });
+        assert!(!p.is_idle());
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
