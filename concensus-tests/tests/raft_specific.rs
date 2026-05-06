@@ -224,3 +224,57 @@ async fn partition_minority_leader_steps_down() {
     }
     assert_safety_invariant(&all);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn election_livelock_resolves() {
+    use concensus::RaftConfig;
+    // Tight election window with randomization range still wide enough to
+    // break ties — the property under test is that the randomization _does_
+    // break ties, not that any specific timing converges instantly.
+    let cfg = RaftConfig {
+        election_timeout_min: Duration::from_millis(80),
+        election_timeout_max: Duration::from_millis(200),
+        heartbeat_interval: Duration::from_millis(20),
+    };
+    let mut cluster = helpers::create_raft_lossy_cluster_with_config(3, 0.30, cfg);
+    // Allow time for the cluster to thrash through livelock attempts and
+    // eventually settle on a leader despite tight timeouts and 30% loss.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    // Continuously propose at every node — eventually one will be elected
+    // leader long enough to commit. We retry until the global deadline.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut got_decision = false;
+    while tokio::time::Instant::now() < deadline {
+        for node in &cluster {
+            let _ = node.handle.propose("after-livelock".into()).await;
+        }
+        // Race a short timeout across all nodes.
+        let mut futs: Vec<_> = cluster
+            .iter_mut()
+            .map(|n| {
+                Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(2), n.decisions.recv())
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+            })
+            .collect();
+        while !futs.is_empty() {
+            let (ok, _, remaining) = futures::future::select_all(futs).await;
+            if ok {
+                got_decision = true;
+                break;
+            }
+            futs = remaining;
+        }
+        if got_decision {
+            break;
+        }
+    }
+    assert!(
+        got_decision,
+        "cluster must settle on a leader and decide within 30s"
+    );
+}
