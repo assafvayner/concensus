@@ -13,6 +13,33 @@ use crate::protocol::{Outgoing, PaxosProtocol, ProtocolImpl, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
 
+/// Public mirror of the internal Raft role. Used by the test-support
+/// observability hook [`Node::peek_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeRole {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+/// Snapshot of a node's protocol state, for tests and observability.
+///
+/// Returned by [`Node::peek_state`] (test-support feature only). Fields that
+/// don't apply to the active algorithm carry sentinel values: a Paxos node
+/// always reports `role = None`, `term = 0`, `voted_for = None`.
+#[derive(Clone, Debug)]
+pub struct NodeState {
+    pub node_id: NodeId,
+    pub algorithm: crate::config::ConsensusAlgorithm,
+    pub role: Option<NodeRole>,
+    pub term: u64,
+    pub leader: Option<NodeId>,
+    pub voted_for: Option<NodeId>,
+    pub log_len: u64,
+    pub commit_index: Option<u64>,
+    pub last_applied: Option<u64>,
+}
+
 /// Channel receiver for consensus decisions.
 ///
 /// Yields [`Decided`] values in the order they are finalized by the Paxos protocol.
@@ -852,5 +879,22 @@ mod tests {
         // Cluster shutdown
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
+    }
+
+    #[test]
+    fn node_state_is_constructible() {
+        let s = NodeState {
+            node_id: NodeId::new("a", 1),
+            algorithm: crate::config::ConsensusAlgorithm::Raft,
+            role: Some(NodeRole::Follower),
+            term: 3,
+            leader: None,
+            voted_for: None,
+            log_len: 0,
+            commit_index: None,
+            last_applied: None,
+        };
+        assert_eq!(s.term, 3);
+        assert!(matches!(s.role, Some(NodeRole::Follower)));
     }
 }

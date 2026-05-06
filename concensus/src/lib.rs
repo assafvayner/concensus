@@ -49,7 +49,7 @@ pub mod transport;
 
 pub use config::{ConsensusAlgorithm, NodeConfig, NodeId, PaxosConfig, PeerInfo, RaftConfig};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
-pub use node::{Decided, DecisionReceiver, Node, NodeHandle};
+pub use node::{Decided, DecisionReceiver, Node, NodeHandle, NodeRole, NodeState};
 pub use storage::{MemoryStorage, RaftStorage, Storage};
 pub use transport::{MessageReceiver, MessageSender};
 
