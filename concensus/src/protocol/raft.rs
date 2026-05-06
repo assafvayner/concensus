@@ -2029,6 +2029,14 @@ mod tests {
     }
 
     #[test]
+    fn single_node_raft_drains_initial_persist_intent() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.term, Some(1));
+        assert!(intent.voted_for.is_some());
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
