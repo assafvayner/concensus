@@ -2067,6 +2067,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_leader_steps_down_on_higher_term_heartbeat() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let mut old = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        old.role = Role::Leader;
+        old.current_term = 3;
+        old.voted_for = Some(me.clone());
+        old.leader = Some(me.clone());
+        let new_leader = NodeId::new("b", 1);
+        let _ = old.handle_message(
+            new_leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: new_leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert!(matches!(old.role, Role::Follower));
+        assert_eq!(old.current_term, 5);
+        assert_eq!(old.leader, Some(new_leader));
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
