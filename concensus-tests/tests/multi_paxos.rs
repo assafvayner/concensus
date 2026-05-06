@@ -158,10 +158,9 @@ async fn leader_crash_and_failover() {
         .unwrap();
 
     // Collect from surviving nodes (1 and 2) with extended timeout.
-    for i in 1..3 {
+    for node in cluster.iter_mut().take(3).skip(1) {
         let decisions =
-            collect_decisions_with_timeout(&mut cluster[i].decisions, 1, Duration::from_secs(10))
-                .await;
+            collect_decisions_with_timeout(&mut node.decisions, 1, Duration::from_secs(10)).await;
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].value, "after-crash");
     }
@@ -257,13 +256,9 @@ async fn safety_under_leader_transition() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
     // Each of 3 nodes proposes 5 values.
-    for i in 0..3 {
+    for (i, node) in cluster.iter().enumerate().take(3) {
         for j in 0..5 {
-            cluster[i]
-                .handle
-                .propose(format!("n{}-v{}", i, j))
-                .await
-                .unwrap();
+            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
         }
     }
 

@@ -1,3 +1,9 @@
+// Test helpers are shared across many integration-test binaries. Each binary
+// pulls in this module independently and only uses the subset it needs, which
+// means cargo emits dead_code/unused_imports warnings for the rest. Allow them
+// at the module level so the workspace stays clippy-clean.
+#![allow(dead_code, unused_imports)]
+
 pub mod transport_filters;
 
 use std::collections::HashMap;

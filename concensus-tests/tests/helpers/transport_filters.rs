@@ -1,3 +1,7 @@
+// Filters are reused across many test binaries; not every binary uses every
+// constructor or sender/receiver pair, so suppress dead_code warnings here.
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use rand::seq::SliceRandom;

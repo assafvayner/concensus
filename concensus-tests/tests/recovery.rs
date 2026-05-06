@@ -6,6 +6,7 @@ use tokio::time::{timeout, Duration};
 
 /// Helper: build a 3-node cluster where node-0 uses the given `SharedMemoryStorage`
 /// and the other two use fresh `MemoryStorage`.
+#[allow(clippy::type_complexity)]
 fn build_cluster(
     ids: &[NodeId; 3],
     storage0: SharedMemoryStorage<String>,
@@ -223,9 +224,8 @@ async fn recovered_node_skips_decided_slots() {
 
     // Verify nodes 1 and 2 also decided "value-b" (they may decide "value-a" first
     // since they have fresh storage and re-learn slot 0).
-    for i in 1..3 {
-        let collected =
-            collect_until_value(&mut decisions2[i], "value-b", Duration::from_secs(5)).await;
+    for decisions in decisions2.iter_mut().take(3).skip(1) {
+        let collected = collect_until_value(decisions, "value-b", Duration::from_secs(5)).await;
         assert_eq!(collected.last().unwrap().value, "value-b");
     }
 

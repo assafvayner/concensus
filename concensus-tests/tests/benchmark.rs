@@ -36,11 +36,7 @@ async fn measure_sequential_latencies(
 
     for i in 0..count {
         let start = Instant::now();
-        cluster[0]
-            .handle
-            .propose(format!("v-{}", i))
-            .await
-            .unwrap();
+        cluster[0].handle.propose(format!("v-{}", i)).await.unwrap();
         // Wait for proposer node to decide
         let _decided = tokio::time::timeout(DECISION_TIMEOUT, cluster[0].decisions.recv())
             .await
@@ -63,19 +59,12 @@ async fn measure_sequential_latencies(
 
 /// Measures throughput: fire all proposals, then collect all decisions.
 /// Returns total elapsed time.
-async fn measure_throughput(
-    cluster: &mut [helpers::ClusterNode],
-    count: usize,
-) -> Duration {
+async fn measure_throughput(cluster: &mut [helpers::ClusterNode], count: usize) -> Duration {
     let start = Instant::now();
 
     // Fire all proposals as fast as possible
     for i in 0..count {
-        cluster[0]
-            .handle
-            .propose(format!("v-{}", i))
-            .await
-            .unwrap();
+        cluster[0].handle.propose(format!("v-{}", i)).await.unwrap();
     }
 
     // Collect all decisions from all nodes
@@ -84,10 +73,7 @@ async fn measure_throughput(
         let decisions =
             collect_decisions_with_timeout(&mut node.decisions, count, DECISION_TIMEOUT).await;
         let values: HashSet<String> = decisions.iter().map(|d| d.value.clone()).collect();
-        assert_eq!(
-            values, expected,
-            "not all proposals decided on node"
-        );
+        assert_eq!(values, expected, "not all proposals decided on node");
     }
 
     start.elapsed()
