@@ -107,6 +107,42 @@ where
         (self.total_nodes / 2) + 1
     }
 
+    /// Restore persistent state at startup. Called by the Node before entering
+    /// the event loop with `term`, `voted_for`, and `log` from `RaftStorage`
+    /// and `decisions` from `Storage::load_decisions`. The committed prefix of
+    /// the log is exactly the set of decided slots, so `commit_index` and
+    /// `last_applied` are set to the highest decided slot (or `None` if there
+    /// are no decisions). Role resets to Follower regardless of pre-restart
+    /// role: a freshly-started node cannot assume it is still leader; the
+    /// election timeout will trigger a fresh election if needed.
+    pub(crate) fn recover(
+        &mut self,
+        term: u64,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry<V>>,
+        decisions: Vec<(u64, V)>,
+    ) {
+        self.current_term = term;
+        self.voted_for = voted_for;
+        self.log = log;
+        let max_decided = decisions.iter().map(|(s, _)| *s).max();
+        self.commit_index = max_decided;
+        self.last_applied = max_decided;
+        // Stay as Follower; let timeouts trigger a fresh election if needed.
+        self.role = Role::Follower;
+        self.leader = None;
+        self.election_deadline = Instant::now() + sample_election_timeout(&self.config);
+        self.pending_persist_term = false;
+        self.pending_persist_voted_for = false;
+        self.pending_persist_log_from = None;
+        self.pending_truncate_from = None;
+        self.pending_decisions.clear();
+        self.pending_proposals.clear();
+        self.votes_received.clear();
+        self.next_index.clear();
+        self.match_index.clear();
+    }
+
     /// Drain the pending persistence intent — the Node will write it through
     /// `RaftStorage` before sending any outgoing wire message. Clears the
     /// underlying flags so subsequent calls return empty intents until new
@@ -1431,6 +1467,59 @@ mod tests {
         assert!(intent.truncate_from.is_none());
         assert!(intent.append_from.is_none());
         assert!(intent.log_snapshot.is_empty());
+    }
+
+    #[test]
+    fn recover_loads_state_correctly() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.recover(
+            7,
+            Some(NodeId::new("b", 1)),
+            vec![
+                LogEntry {
+                    term: 5,
+                    value: "x".into(),
+                },
+                LogEntry {
+                    term: 7,
+                    value: "y".into(),
+                },
+            ],
+            vec![(0, "x".into())],
+        );
+        assert_eq!(p.current_term, 7);
+        assert_eq!(p.voted_for, Some(NodeId::new("b", 1)));
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[0].term, 5);
+        assert_eq!(p.log[1].term, 7);
+        assert_eq!(p.commit_index, Some(0));
+        assert_eq!(p.last_applied, Some(0));
+        assert!(matches!(p.role, Role::Follower));
+        assert!(!p.pending_persist_term);
+        assert!(!p.pending_persist_voted_for);
+        assert!(p.pending_persist_log_from.is_none());
+        assert!(p.pending_truncate_from.is_none());
+    }
+
+    #[test]
+    fn recover_with_no_decisions_leaves_commit_index_none() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.recover(
+            2,
+            None,
+            vec![LogEntry {
+                term: 2,
+                value: "x".into(),
+            }],
+            vec![],
+        );
+        assert_eq!(p.current_term, 2);
+        assert!(p.voted_for.is_none());
+        assert_eq!(p.log.len(), 1);
+        assert_eq!(p.commit_index, None);
+        assert_eq!(p.last_applied, None);
     }
 
     #[test]

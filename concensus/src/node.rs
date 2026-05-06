@@ -307,7 +307,22 @@ where
             .load_decisions()
             .await
             .map_err(NodeError::Storage)?;
-        self.protocol.initialize_from_decisions(decisions);
+        let recovered_raft_state = if let Some(rs) = self.raft_storage.as_mut() {
+            let term = rs.load_term().await.map_err(NodeError::Storage)?;
+            let voted_for = rs.load_voted_for().await.map_err(NodeError::Storage)?;
+            let log = rs.load_log().await.map_err(NodeError::Storage)?;
+            Some((term, voted_for, log))
+        } else {
+            None
+        };
+        match (&mut self.protocol, recovered_raft_state) {
+            (crate::protocol::ProtocolImpl::Raft(raft), Some((term, voted_for, log))) => {
+                raft.recover(term, voted_for, log, decisions);
+            }
+            (proto, _) => {
+                proto.initialize_from_decisions(decisions);
+            }
+        }
 
         // Build senders list
         let mut senders: Vec<(NodeId, S)> = Vec::new();
