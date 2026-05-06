@@ -325,3 +325,66 @@ async fn leader_completeness_under_churn() {
     assert_safety_invariant(&all);
     assert!(!all.is_empty(), "expected surviving nodes to have decisions");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflict_index_helps_recovery_after_long_isolation() {
+    use std::sync::atomic::Ordering;
+    let (mut cluster, edges) = helpers::create_raft_cluster_with_edge_filters(3);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let leader_idx = detect_active_leader_index(&mut cluster)
+        .await
+        .expect("leader required");
+    let lagging_idx = (leader_idx + 1) % 3;
+    let lagging_id = cluster[lagging_idx].id.clone();
+
+    // Isolate the lagging follower.
+    let all_ids: Vec<_> = cluster.iter().map(|n| n.id.clone()).collect();
+    for other in &all_ids {
+        if other == &lagging_id {
+            continue;
+        }
+        edges[&(lagging_id.clone(), other.clone())].store(true, Ordering::Relaxed);
+        edges[&(other.clone(), lagging_id.clone())].store(true, Ordering::Relaxed);
+    }
+
+    // Generate ~30 decisions on the surviving 2/3 quorum.
+    for i in 0..30 {
+        let _ = cluster[leader_idx].handle.propose(format!("v-{i}")).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Heal. Lagging follower should catch up.
+    for other in &all_ids {
+        if other == &lagging_id {
+            continue;
+        }
+        edges[&(lagging_id.clone(), other.clone())].store(false, Ordering::Relaxed);
+        edges[&(other.clone(), lagging_id.clone())].store(false, Ordering::Relaxed);
+    }
+
+    // Wait for catch-up. The conflict-index optimization should converge fast.
+    let mut decisions_on_lagger = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            cluster[lagging_idx].decisions.recv(),
+        )
+        .await
+        {
+            Ok(Some(d)) => {
+                decisions_on_lagger.push(d);
+                if decisions_on_lagger.len() >= 25 {
+                    break;
+                }
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        decisions_on_lagger.len() >= 20,
+        "lagging follower must catch up with the cluster (got {} decisions)",
+        decisions_on_lagger.len()
+    );
+}
