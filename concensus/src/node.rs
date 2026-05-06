@@ -8,10 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{NodeId, PeerInfo};
 use crate::error::{NodeError, ProposeError};
-#[cfg(feature = "multi-paxos")]
-use crate::message::PaxosMessage;
-use crate::message::{Message, WireVariant};
-use crate::protocol::{Outgoing, ProtocolState, SendTarget};
+use crate::message::{Message, PaxosMessage, WireVariant};
+use crate::protocol::{Outgoing, PaxosProtocol, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
 
@@ -95,7 +93,7 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
     storage: Box<dyn Storage<V> + Send>,
-    protocol: ProtocolState<V>,
+    protocol: PaxosProtocol<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
     #[cfg(feature = "multi-paxos")]
@@ -176,7 +174,7 @@ where
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
-        let protocol = ProtocolState::new(node_id.clone(), total_nodes);
+        let protocol = PaxosProtocol::new(node_id.clone(), total_nodes);
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
 
@@ -406,7 +404,11 @@ where
         Ok(())
     }
 
-    async fn send_outgoing(node_id: &NodeId, outgoing: &[Outgoing<V>], senders: &[(NodeId, S)]) {
+    async fn send_outgoing(
+        node_id: &NodeId,
+        outgoing: &[Outgoing<PaxosMessage<V>>],
+        senders: &[(NodeId, S)],
+    ) {
         for out in outgoing {
             let msg = Message {
                 sender: node_id.clone(),

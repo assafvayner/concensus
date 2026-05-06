@@ -7,26 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
 use crate::message::{PaxosMessage, ProposalNumber};
-
-/// Where to send an outgoing message
-pub(crate) enum SendTarget {
-    /// Send to a specific peer
-    Peer(NodeId),
-    /// Broadcast to all peers
-    Broadcast,
-}
-
-/// An outgoing message produced by the protocol state machine
-pub(crate) struct Outgoing<V> {
-    pub target: SendTarget,
-    pub message: PaxosMessage<V>,
-}
-
-/// A decided value ready to be delivered
-pub(crate) struct Decision<V> {
-    pub slot: u64,
-    pub value: V,
-}
+use crate::protocol::{Decision, Outgoing, SendTarget};
 
 #[cfg(feature = "multi-paxos")]
 #[derive(Debug)]
@@ -42,7 +23,7 @@ pub(crate) enum LeaderState {
 }
 
 /// Manages all active Paxos instances
-pub(crate) struct ProtocolState<V> {
+pub(crate) struct PaxosProtocol<V> {
     pub(crate) node_id: NodeId,
     pub(crate) instances: HashMap<u64, PaxosInstance<V>>,
     next_slot: u64,
@@ -113,7 +94,7 @@ impl<V> PaxosInstance<V> {
     }
 }
 
-impl<V> ProtocolState<V>
+impl<V> PaxosProtocol<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + PartialEq,
 {
@@ -165,7 +146,7 @@ where
         &mut self,
         from: NodeId,
         msg: PaxosMessage<V>,
-    ) -> Vec<Outgoing<V>> {
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
         match msg {
             PaxosMessage::Prepare {
                 slot,
@@ -227,7 +208,7 @@ where
         from: NodeId,
         slot: u64,
         proposal_number: ProposalNumber,
-    ) -> Vec<Outgoing<V>> {
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
         if let Some(value) = self.decided_slots.get(&slot).cloned() {
             // Inform the sender about the decision they missed
             return vec![Outgoing {
@@ -273,7 +254,7 @@ where
         slot: u64,
         proposal_number: ProposalNumber,
         value: V,
-    ) -> Vec<Outgoing<V>> {
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
         if let Some(decided_value) = self.decided_slots.get(&slot).cloned() {
             // Inform the sender about the decision they missed
             return vec![Outgoing {
@@ -321,7 +302,7 @@ where
         slot: u64,
         proposal_number: ProposalNumber,
         accepted: Option<(ProposalNumber, V)>,
-    ) -> Vec<Outgoing<V>> {
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
         if self.decided_slots.contains_key(&slot) {
             return vec![];
         }
@@ -373,7 +354,7 @@ where
         slot: u64,
         proposal_number: ProposalNumber,
         _value: V,
-    ) -> Vec<Outgoing<V>> {
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
         if self.decided_slots.contains_key(&slot) {
             return vec![];
         }
@@ -486,7 +467,7 @@ where
 
     // -- Propose: entry point --
     #[cfg(feature = "multi-paxos")]
-    pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
+    pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<PaxosMessage<V>>>) {
         if let LeaderState::Leader { term } = self.leader_state {
             self.propose_fast_path(value, term)
         } else {
@@ -495,12 +476,12 @@ where
     }
 
     #[cfg(not(feature = "multi-paxos"))]
-    pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
+    pub(crate) fn propose(&mut self, value: V) -> (u64, Vec<Outgoing<PaxosMessage<V>>>) {
         self.propose_full_paxos(value)
     }
 
     // -- Full Paxos propose: Phase 1 + self-vote --
-    fn propose_full_paxos(&mut self, value: V) -> (u64, Vec<Outgoing<V>>) {
+    fn propose_full_paxos(&mut self, value: V) -> (u64, Vec<Outgoing<PaxosMessage<V>>>) {
         let slot = self.next_slot;
         self.next_slot += 1;
 
@@ -541,7 +522,7 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    fn propose_fast_path(&mut self, value: V, term: u64) -> (u64, Vec<Outgoing<V>>) {
+    fn propose_fast_path(&mut self, value: V, term: u64) -> (u64, Vec<Outgoing<PaxosMessage<V>>>) {
         let slot = self.next_slot;
         self.next_slot += 1;
 
@@ -594,7 +575,7 @@ where
         )
     }
 
-    fn start_phase2(&mut self, slot: u64) -> Vec<Outgoing<V>> {
+    fn start_phase2(&mut self, slot: u64) -> Vec<Outgoing<PaxosMessage<V>>> {
         let instance = self.instances.get_mut(&slot).unwrap();
 
         // Phase 2 value selection: use highest accepted value from promises, or own value.
@@ -681,7 +662,7 @@ where
     /// Returns Decide broadcasts for recent decisions that should be re-sent
     /// to ensure peers that missed the original Decide can learn the outcome.
     /// Expires entries older than 5 seconds.
-    pub(crate) fn get_decision_rebroadcasts(&mut self) -> Vec<Outgoing<V>> {
+    pub(crate) fn get_decision_rebroadcasts(&mut self) -> Vec<Outgoing<PaxosMessage<V>>> {
         let now = Instant::now();
         let max_age = std::time::Duration::from_secs(5);
 
@@ -701,7 +682,7 @@ where
             .collect()
     }
 
-    pub(crate) fn retry_proposal(&mut self, slot: u64) -> Vec<Outgoing<V>> {
+    pub(crate) fn retry_proposal(&mut self, slot: u64) -> Vec<Outgoing<PaxosMessage<V>>> {
         let instance = match self.instances.get_mut(&slot) {
             Some(i) if !i.decided && i.is_proposer => i,
             _ => return vec![],
@@ -833,7 +814,7 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    pub(crate) fn make_heartbeat(&mut self) -> Vec<Outgoing<V>> {
+    pub(crate) fn make_heartbeat(&mut self) -> Vec<Outgoing<PaxosMessage<V>>> {
         if let LeaderState::Leader { term } = &self.leader_state {
             self.last_heartbeat_time = Some(Instant::now());
             vec![Outgoing {
@@ -860,7 +841,7 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    pub(crate) fn start_election(&mut self) -> Vec<Outgoing<V>> {
+    pub(crate) fn start_election(&mut self) -> Vec<Outgoing<PaxosMessage<V>>> {
         tracing::info!(node = %self.node_id, "starting leader election");
         self.leader_state = LeaderState::Candidate;
 
@@ -900,7 +881,7 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    fn handle_heartbeat(&mut self, from: NodeId, term: u64) -> Vec<Outgoing<V>> {
+    fn handle_heartbeat(&mut self, from: NodeId, term: u64) -> Vec<Outgoing<PaxosMessage<V>>> {
         if term >= self.highest_seen_round {
             self.update_leader_contact(&from, term);
         }
@@ -908,7 +889,7 @@ where
     }
 
     #[cfg(feature = "multi-paxos")]
-    fn handle_forward(&mut self, _from: NodeId, value: V) -> Vec<Outgoing<V>> {
+    fn handle_forward(&mut self, _from: NodeId, value: V) -> Vec<Outgoing<PaxosMessage<V>>> {
         if let LeaderState::Leader { .. } = &self.leader_state {
             tracing::debug!(node = %self.node_id, "received forwarded proposal");
             let (_, outgoing) = self.propose(value);
@@ -929,8 +910,8 @@ mod tests {
         NodeId::new(name, 1000)
     }
 
-    fn make_protocol(name: &str, total_nodes: usize) -> ProtocolState<String> {
-        ProtocolState::new(node(name), total_nodes)
+    fn make_protocol(name: &str, total_nodes: usize) -> PaxosProtocol<String> {
+        PaxosProtocol::new(node(name), total_nodes)
     }
 
     // -- Acceptor tests (Phase 1) --
