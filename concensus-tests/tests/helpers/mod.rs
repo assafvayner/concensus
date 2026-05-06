@@ -919,6 +919,61 @@ pub fn create_cluster_with_algorithm(n: usize, alg: Algorithm) -> Vec<ClusterNod
     }
 }
 
+pub fn create_lossy_with_algorithm(n: usize, drop_rate: f64, alg: Algorithm) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_lossy_cluster(n, drop_rate),
+        Algorithm::Raft => create_raft_lossy_cluster(n, drop_rate),
+    }
+}
+
+pub fn create_lossy_unbounded_with_algorithm(
+    n: usize,
+    drop_rate: f64,
+    alg: Algorithm,
+) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_lossy_unbounded_cluster(n, drop_rate),
+        Algorithm::Raft => create_raft_lossy_unbounded_cluster(n, drop_rate),
+    }
+}
+
+pub fn create_delayed_with_algorithm(
+    n: usize,
+    min_ms: u64,
+    max_ms: u64,
+    alg: Algorithm,
+) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_delayed_cluster(n, min_ms, max_ms),
+        Algorithm::Raft => create_raft_delayed_cluster(n, min_ms, max_ms),
+    }
+}
+
+pub fn create_reordering_with_algorithm(
+    n: usize,
+    window_ms: u64,
+    batch_size: usize,
+    alg: Algorithm,
+) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_reordering_cluster(n, window_ms, batch_size),
+        Algorithm::Raft => create_raft_reordering_cluster(n, window_ms, batch_size),
+    }
+}
+
+pub fn create_lossy_delayed_with_algorithm(
+    n: usize,
+    drop_rate: f64,
+    min_ms: u64,
+    max_ms: u64,
+    alg: Algorithm,
+) -> Vec<ClusterNode> {
+    match alg {
+        Algorithm::Paxos => create_lossy_delayed_cluster(n, drop_rate, min_ms, max_ms),
+        Algorithm::Raft => create_raft_lossy_delayed_cluster(n, drop_rate, min_ms, max_ms),
+    }
+}
+
 /// The core Paxos safety invariant: for any slot, all nodes that decided
 /// that slot must have decided the SAME value. Unlike assert_consistent_decisions
 /// which requires all nodes to have the same number of decisions, this check
