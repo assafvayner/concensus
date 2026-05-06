@@ -1842,6 +1842,28 @@ mod tests {
     }
 
     #[test]
+    fn granting_vote_resets_election_deadline() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let earlier = Instant::now() - Duration::from_secs(1);
+        p.election_deadline = earlier;
+        let candidate = NodeId::new("b", 1);
+        let _ = p.handle_message(
+            candidate.clone(),
+            RaftMessage::RequestVote {
+                term: 5,
+                candidate,
+                last_log_index: None,
+                last_log_term: 0,
+            },
+        );
+        assert!(
+            p.election_deadline > earlier,
+            "deadline should be reset after granting vote"
+        );
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
