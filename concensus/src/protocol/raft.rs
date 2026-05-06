@@ -338,6 +338,100 @@ where
         }]
     }
 
+    fn broadcast_with_entries(
+        &mut self,
+        entries: Vec<LogEntry<V>>,
+    ) -> Vec<Outgoing<RaftMessage<V>>> {
+        self.last_heartbeat_sent = Some(Instant::now());
+        let prev_log_index = if self.log.len() > entries.len() {
+            Some((self.log.len() - entries.len()) as u64 - 1)
+        } else {
+            None
+        };
+        let prev_log_term = match prev_log_index {
+            Some(i) => self.log[i as usize].term,
+            None => 0,
+        };
+        vec![Outgoing {
+            target: SendTarget::Broadcast,
+            message: RaftMessage::AppendEntries {
+                term: self.current_term,
+                leader: self.node_id.clone(),
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.commit_index,
+            },
+        }]
+    }
+
+    fn handle_append_entries_response(
+        &mut self,
+        from: NodeId,
+        term: u64,
+        success: bool,
+        match_index: Option<u64>,
+        conflict_term: Option<u64>,
+        conflict_index: Option<u64>,
+    ) -> Vec<Outgoing<RaftMessage<V>>> {
+        let _ = conflict_term;
+        let _ = conflict_index;
+        if !matches!(self.role, Role::Leader) || term != self.current_term {
+            return Vec::new();
+        }
+        if success {
+            if let Some(mi) = match_index {
+                self.match_index.insert(from.clone(), Some(mi));
+                self.next_index.insert(from, mi + 1);
+                self.try_advance_commit();
+            }
+            Vec::new()
+        } else {
+            let entry = self
+                .next_index
+                .entry(from.clone())
+                .or_insert(self.log.len() as u64);
+            if *entry > 0 {
+                *entry -= 1;
+            }
+            let next = *self.next_index.get(&from).unwrap();
+            let prev = if next == 0 { None } else { Some(next - 1) };
+            let prev_term = match prev {
+                Some(i) => self.log[i as usize].term,
+                None => 0,
+            };
+            let entries: Vec<LogEntry<V>> = self.log[next as usize..].to_vec();
+            vec![Outgoing {
+                target: SendTarget::Peer(from),
+                message: RaftMessage::AppendEntries {
+                    term: self.current_term,
+                    leader: self.node_id.clone(),
+                    prev_log_index: prev,
+                    prev_log_term: prev_term,
+                    entries,
+                    leader_commit: self.commit_index,
+                },
+            }]
+        }
+    }
+
+    fn try_advance_commit(&mut self) {
+        let mut indexes: Vec<Option<u64>> = self.match_index.values().copied().collect();
+        indexes.sort_by(|a, b| b.cmp(a));
+        let q = self.quorum();
+        if indexes.len() < q {
+            return;
+        }
+        let candidate = indexes[q - 1];
+        if let Some(c) = candidate {
+            let entry_term = self.log[c as usize].term;
+            if entry_term == self.current_term && self.commit_index.is_none_or(|cur| c > cur) {
+                self.commit_index = Some(c);
+                self.apply_committed_entries();
+            }
+        }
+    }
+
     fn apply_committed_entries(&mut self) {
         let target = match self.commit_index {
             Some(c) => c,
@@ -376,9 +470,22 @@ where
     type Message = RaftMessage<V>;
 
     fn propose(&mut self, value: V) -> Vec<Outgoing<Self::Message>> {
-        // Filled in by later tasks. For now, buffer.
-        self.pending_proposals.push(value);
-        Vec::new()
+        if !matches!(self.role, Role::Leader) {
+            // Forwarding lands in Task 17. For now, buffer.
+            self.pending_proposals.push(value);
+            return Vec::new();
+        }
+        let entry = LogEntry {
+            term: self.current_term,
+            value,
+        };
+        let idx = self.log.len() as u64;
+        self.log.push(entry.clone());
+        if self.pending_persist_log_from.is_none() {
+            self.pending_persist_log_from = Some(idx);
+        }
+        self.match_index.insert(self.node_id.clone(), Some(idx));
+        self.broadcast_with_entries(vec![entry])
     }
 
     fn handle_message(&mut self, from: NodeId, msg: Self::Message) -> Vec<Outgoing<Self::Message>> {
@@ -421,8 +528,21 @@ where
                 entries,
                 leader_commit,
             ),
-            RaftMessage::AppendEntriesResponse { .. } => Vec::new(), // Task 13
-            RaftMessage::Forward { .. } => Vec::new(),               // Task 17
+            RaftMessage::AppendEntriesResponse {
+                term,
+                success,
+                match_index,
+                conflict_term,
+                conflict_index,
+            } => self.handle_append_entries_response(
+                from,
+                term,
+                success,
+                match_index,
+                conflict_term,
+                conflict_index,
+            ),
+            RaftMessage::Forward { .. } => Vec::new(), // Task 17
         }
     }
 
@@ -944,6 +1064,136 @@ mod tests {
         assert_eq!(decisions[0].value, "x");
         assert_eq!(decisions[1].slot, 1);
         assert_eq!(decisions[1].value, "y");
+    }
+
+    #[test]
+    fn leader_propose_appends_to_log_and_emits_append_entries() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        let out =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        assert_eq!(p.log.len(), 1);
+        assert_eq!(p.log[0].value, "hello");
+        assert_eq!(p.log[0].term, 1);
+        assert_eq!(p.match_index.get(&me), Some(&Some(0)));
+        assert!(out.iter().any(|o| matches!(&o.message,
+            RaftMessage::AppendEntries { entries, .. } if entries.len() == 1 && entries[0].value == "hello"
+        )));
+    }
+
+    #[test]
+    fn leader_advances_commit_on_majority_match() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        p.log.push(LogEntry {
+            term: 1,
+            value: "x".into(),
+        });
+        p.match_index.insert(me.clone(), Some(0));
+        let _ = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: Some(0),
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert_eq!(p.commit_index, Some(0));
+        let decisions = p.take_decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].slot, 0);
+        assert_eq!(decisions[0].value, "x");
+    }
+
+    #[test]
+    fn leader_does_not_commit_entry_from_prior_term() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        p.log.push(LogEntry {
+            term: 3,
+            value: "old".into(),
+        });
+        p.match_index.insert(me.clone(), Some(0));
+        let _ = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 5,
+                success: true,
+                match_index: Some(0),
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert_eq!(p.commit_index, None);
+    }
+
+    #[test]
+    fn leader_response_for_old_term_ignored() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        let _ = p.handle_message(
+            b,
+            RaftMessage::AppendEntriesResponse {
+                term: 3,
+                success: true,
+                match_index: Some(0),
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert!(p.match_index.is_empty());
+        assert_eq!(p.commit_index, None);
+    }
+
+    #[test]
+    fn leader_rewinds_next_index_on_rejection() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        p.log = (0..5)
+            .map(|i| LogEntry {
+                term: 1,
+                value: format!("v{}", i),
+            })
+            .collect();
+        p.next_index.insert(b.clone(), 5);
+        let out = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 1,
+                success: false,
+                match_index: None,
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert_eq!(p.next_index.get(&b), Some(&4));
+        assert!(matches!(&out[0].message, RaftMessage::AppendEntries { .. }));
     }
 
     #[test]
