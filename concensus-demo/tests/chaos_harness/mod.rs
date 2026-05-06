@@ -25,7 +25,11 @@ impl DockerCluster {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()
             .expect("docker compose up failed");
-        assert!(status.success(), "docker compose up exit={:?}", status.code());
+        assert!(
+            status.success(),
+            "docker compose up exit={:?}",
+            status.code()
+        );
         Self {
             nodes: vec![
                 NodeAddr {
