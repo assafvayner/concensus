@@ -162,9 +162,13 @@ where
     /// and `decisions` from `Storage::load_decisions`. The committed prefix of
     /// the log is exactly the set of decided slots, so `commit_index` and
     /// `last_applied` are set to the highest decided slot (or `None` if there
-    /// are no decisions). Role resets to Follower regardless of pre-restart
-    /// role: a freshly-started node cannot assume it is still leader; the
-    /// election timeout will trigger a fresh election if needed.
+    /// are no decisions).
+    ///
+    /// Role normally resets to Follower: a freshly-started node cannot assume
+    /// it is still leader, and the election timeout will trigger a fresh
+    /// election if needed. Single-node clusters are the exception — there are
+    /// no peers to elect us, so we mirror the constructor's bootstrap and
+    /// resume directly as Leader at term ≥ 1 with a vote for self.
     pub(crate) fn recover(
         &mut self,
         term: u64,
@@ -178,9 +182,6 @@ where
         let max_decided = decisions.iter().map(|(s, _)| *s).max();
         self.commit_index = max_decided;
         self.last_applied = max_decided;
-        // Stay as Follower; let timeouts trigger a fresh election if needed.
-        self.role = Role::Follower;
-        self.leader = None;
         self.election_deadline = Instant::now() + sample_election_timeout(&self.config);
         self.pending_persist_term = false;
         self.pending_persist_voted_for = false;
@@ -191,6 +192,22 @@ where
         self.votes_received.clear();
         self.next_index.clear();
         self.match_index.clear();
+
+        if self.total_nodes == 1 {
+            if self.current_term == 0 {
+                self.current_term = 1;
+                self.pending_persist_term = true;
+            }
+            if self.voted_for.as_ref() != Some(&self.node_id) {
+                self.voted_for = Some(self.node_id.clone());
+                self.pending_persist_voted_for = true;
+            }
+            self.role = Role::Leader;
+            self.leader = Some(self.node_id.clone());
+        } else {
+            self.role = Role::Follower;
+            self.leader = None;
+        }
     }
 
     /// Drain the pending persistence intent — the Node will write it through
@@ -2109,5 +2126,50 @@ mod tests {
         assert_eq!(snap.commit_index, Some(0));
         assert_eq!(snap.last_applied, Some(0));
         assert!(matches!(snap.role, Some(crate::node::NodeRole::Follower)));
+    }
+
+    #[test]
+    fn single_node_recover_from_empty_state_resumes_as_leader() {
+        let me = NodeId::new("solo", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
+        p.recover(0, None, Vec::new(), Vec::new());
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
+        assert_eq!(p.voted_for, Some(me.clone()));
+        assert_eq!(p.leader, Some(me));
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.term, Some(1));
+        assert!(intent.voted_for.is_some());
+    }
+
+    #[test]
+    fn single_node_recover_preserves_persisted_term_and_log() {
+        use crate::message::LogEntry;
+        let me = NodeId::new("solo", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
+        let log = vec![LogEntry {
+            term: 1,
+            value: "x".into(),
+        }];
+        p.recover(1, Some(me.clone()), log, vec![(0, "x".into())]);
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
+        assert_eq!(p.commit_index, Some(0));
+        assert_eq!(p.last_applied, Some(0));
+        let intent = p.drain_persist_intent();
+        assert!(intent.term.is_none());
+        assert!(intent.voted_for.is_none());
+    }
+
+    #[test]
+    fn multi_node_recover_resets_to_follower() {
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.leader = Some(me.clone());
+        p.recover(5, Some(me.clone()), Vec::new(), Vec::new());
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.leader, None);
+        assert_eq!(p.current_term, 5);
     }
 }

@@ -407,20 +407,11 @@ async fn invariant_checker_observes_decisions() {
 
 /// Single-node Raft end-to-end through the Node abstraction.
 ///
-/// `RaftProtocol::new(_, 1, _)` bootstraps the sole node as Leader at term 1,
-/// but `Node::run` calls `recover()` on startup which currently resets the
-/// role to Follower regardless of `total_nodes`. With no peers the run loop
-/// also has no `on_tick` branch, so the node never triggers an election and
-/// proposals stall in the pending buffer.
-///
-/// This is an integration-layer gap (the protocol layer is covered by
-/// `single_node_raft_starts_as_leader` and `single_node_raft_commits_immediately_on_propose`
-/// in `concensus/src/protocol/raft.rs`). Marked `#[ignore]` until the Node
-/// preserves the bootstrap leader state when there are no peers.
+/// `RaftProtocol::new(_, 1, _)` bootstraps the sole node as Leader at term 1.
+/// `recover()` mirrors that bootstrap when `total_nodes == 1`, so the node
+/// resumes as Leader after `Node::run`'s recovery step and the no-peer event
+/// loop can drive proposals to commit immediately (single-node quorum is 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Node::run resets bootstrap-leader to Follower; single-node Raft via the Node \
-            abstraction is an open implementation gap (protocol layer is covered by \
-            unit tests in concensus/src/protocol/raft.rs)"]
 async fn single_node_raft_end_to_end() {
     let mut cluster = create_raft_cluster(1);
     cluster[0].handle.propose("solo".into()).await.unwrap();
