@@ -1827,6 +1827,21 @@ mod tests {
     }
 
     #[test]
+    fn leader_does_not_heartbeat_within_interval() {
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        p.last_heartbeat_sent = Some(Instant::now());
+        let out = p.on_tick(Instant::now());
+        assert!(
+            out.is_empty(),
+            "leader should suppress heartbeat within interval"
+        );
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
