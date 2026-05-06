@@ -147,6 +147,19 @@ where
         self.instances.is_empty()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn peek_state(&self) -> crate::protocol::raft::ProtocolSnapshot {
+        crate::protocol::raft::ProtocolSnapshot {
+            role: None,
+            term: 0,
+            leader: None,
+            voted_for: None,
+            log_len: 0,
+            commit_index: None,
+            last_applied: None,
+        }
+    }
+
     pub(crate) fn take_decisions(&mut self) -> Vec<Decision<V>> {
         std::mem::take(&mut self.pending_decisions)
     }

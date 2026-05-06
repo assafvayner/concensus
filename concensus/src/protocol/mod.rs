@@ -138,6 +138,14 @@ where
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn peek_state(&self) -> crate::protocol::raft::ProtocolSnapshot {
+        match self {
+            ProtocolImpl::Paxos(p) => p.peek_state(),
+            ProtocolImpl::Raft(r) => r.peek_state(),
+        }
+    }
+
     /// Initialize from previously persisted decisions. Protocol-specific.
     pub(crate) fn initialize_from_decisions(&mut self, decisions: Vec<(u64, V)>) {
         match self {

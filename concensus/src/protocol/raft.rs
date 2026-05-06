@@ -72,6 +72,19 @@ pub(crate) struct RaftProtocol<V> {
     pub(crate) pending_proposals: Vec<V>,
 }
 
+/// Inner snapshot used by `ConsensusProtocol::peek_state`. Mirrors `NodeState`
+/// minus `node_id` and `algorithm`, which the wrapper fills in.
+#[allow(dead_code)]
+pub(crate) struct ProtocolSnapshot {
+    pub role: Option<crate::node::NodeRole>,
+    pub term: u64,
+    pub leader: Option<NodeId>,
+    pub voted_for: Option<NodeId>,
+    pub log_len: u64,
+    pub commit_index: Option<u64>,
+    pub last_applied: Option<u64>,
+}
+
 impl<V> RaftProtocol<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
@@ -124,6 +137,24 @@ where
 
     pub(crate) fn quorum(&self) -> usize {
         (self.total_nodes / 2) + 1
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn peek_state(&self) -> ProtocolSnapshot {
+        let role = Some(match self.role {
+            Role::Follower => crate::node::NodeRole::Follower,
+            Role::Candidate => crate::node::NodeRole::Candidate,
+            Role::Leader => crate::node::NodeRole::Leader,
+        });
+        ProtocolSnapshot {
+            role,
+            term: self.current_term,
+            leader: self.leader.clone(),
+            voted_for: self.voted_for.clone(),
+            log_len: self.log.len() as u64,
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
+        }
     }
 
     /// Restore persistent state at startup. Called by the Node before entering
@@ -1791,5 +1822,24 @@ mod tests {
             },
         );
         assert_eq!(p.next_index.get(&b), Some(&4));
+    }
+
+    #[test]
+    fn peek_state_reports_raft_state() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 4;
+        p.log.push(LogEntry {
+            term: 4,
+            value: "x".into(),
+        });
+        p.commit_index = Some(0);
+        p.last_applied = Some(0);
+        let snap = p.peek_state();
+        assert_eq!(snap.term, 4);
+        assert_eq!(snap.log_len, 1);
+        assert_eq!(snap.commit_index, Some(0));
+        assert_eq!(snap.last_applied, Some(0));
+        assert!(matches!(snap.role, Some(crate::node::NodeRole::Follower)));
     }
 }
