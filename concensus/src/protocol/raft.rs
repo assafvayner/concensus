@@ -1950,6 +1950,58 @@ mod tests {
     }
 
     #[test]
+    fn conflict_hint_uses_first_index_of_term() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "c".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "d".into(),
+            },
+            LogEntry {
+                term: 3,
+                value: "e".into(),
+            },
+        ];
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(4),
+                prev_log_term: 99,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: false,
+                conflict_term: Some(3),
+                conflict_index: Some(4),
+                ..
+            } => {}
+            other => panic!(
+                "expected conflict_term=Some(3), conflict_index=Some(4); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
