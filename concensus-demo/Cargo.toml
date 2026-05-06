@@ -3,6 +3,10 @@ name = "concensus-demo"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "concensus_demo"
+path = "src/lib.rs"
+
 [[bin]]
 name = "concensus-node"
 path = "src/node.rs"
