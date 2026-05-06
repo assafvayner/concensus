@@ -1900,6 +1900,29 @@ mod tests {
     }
 
     #[test]
+    fn recover_with_partial_decisions_sets_commit_index_correctly() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let log = (0..5)
+            .map(|i| LogEntry {
+                term: 1,
+                value: format!("v{i}"),
+            })
+            .collect();
+        p.recover(
+            1,
+            None,
+            log,
+            vec![(0, "v0".into()), (1, "v1".into()), (2, "v2".into())],
+        );
+        assert_eq!(p.commit_index, Some(2));
+        assert_eq!(p.last_applied, Some(2));
+        assert!(p.take_decisions().is_empty());
+        let _ = p.on_tick(Instant::now());
+        assert!(p.take_decisions().is_empty());
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
