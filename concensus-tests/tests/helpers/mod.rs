@@ -289,6 +289,17 @@ where
 // Raft cluster creation
 // ---------------------------------------------------------------------------
 
+/// Default `RaftConfig` for tests. Wider timeouts than production (150-300ms
+/// election window, 50ms heartbeat) to absorb scheduler jitter without
+/// destabilizing convergence.
+fn test_raft_config() -> concensus::RaftConfig {
+    concensus::RaftConfig {
+        election_timeout_min: std::time::Duration::from_millis(150),
+        election_timeout_max: std::time::Duration::from_millis(300),
+        heartbeat_interval: std::time::Duration::from_millis(50),
+    }
+}
+
 pub fn create_raft_cluster(n: usize) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, concensus::RaftConfig::default())
 }
@@ -298,6 +309,225 @@ pub fn create_raft_cluster_with_config(
     config: concensus::RaftConfig,
 ) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, config)
+}
+
+pub fn create_raft_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
+    create_raft_lossy_cluster_inner(n, drop_rate, false, test_raft_config())
+}
+
+pub fn create_raft_lossy_unbounded_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
+    create_raft_lossy_cluster_inner(n, drop_rate, true, test_raft_config())
+}
+
+pub fn create_raft_lossy_cluster_with_config(
+    n: usize,
+    drop_rate: f64,
+    config: concensus::RaftConfig,
+) -> Vec<ClusterNode> {
+    create_raft_lossy_cluster_inner(n, drop_rate, false, config)
+}
+
+fn create_raft_lossy_cluster_inner(
+    n: usize,
+    drop_rate: f64,
+    unbounded: bool,
+    config: concensus::RaftConfig,
+) -> Vec<ClusterNode> {
+    assert!(n > 0);
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{i}"), 1000))
+        .collect();
+    let mut tx_for: HashMap<NodeId, LossySender<ChannelSender>> = HashMap::new();
+    let mut rx_for: HashMap<NodeId, ChannelReceiver> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = if unbounded {
+            unbounded_channel()
+        } else {
+            channel(64)
+        };
+        tx_for.insert(id.clone(), LossySender::with_drop_rate(tx, drop_rate));
+        rx_for.insert(id.clone(), rx);
+    }
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<LossySender<ChannelSender>>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: tx_for[other].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            config.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    out
+}
+
+pub fn create_raft_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<ClusterNode> {
+    assert!(n > 0);
+    let cfg = test_raft_config();
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{i}"), 1000))
+        .collect();
+    let mut tx_for: HashMap<NodeId, DelayedSender<ChannelSender>> = HashMap::new();
+    let mut rx_for: HashMap<NodeId, ChannelReceiver> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = unbounded_channel();
+        tx_for.insert(
+            id.clone(),
+            DelayedSender::with_range(
+                tx,
+                Duration::from_millis(min_ms),
+                Duration::from_millis(max_ms),
+            ),
+        );
+        rx_for.insert(id.clone(), rx);
+    }
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<DelayedSender<ChannelSender>>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: tx_for[other].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            cfg.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    out
+}
+
+pub fn create_raft_reordering_cluster(
+    n: usize,
+    window_ms: u64,
+    batch_size: usize,
+) -> Vec<ClusterNode> {
+    assert!(n > 0);
+    let cfg = test_raft_config();
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{i}"), 1000))
+        .collect();
+    let mut tx_for: HashMap<NodeId, ReorderingSender<ChannelSender>> = HashMap::new();
+    let mut rx_for: HashMap<NodeId, ReorderingReceiver<ChannelReceiver>> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = channel(64);
+        tx_for.insert(id.clone(), ReorderingSender::new(tx));
+        rx_for.insert(
+            id.clone(),
+            ReorderingReceiver::with_params(rx, Duration::from_millis(window_ms), batch_size),
+        );
+    }
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<ReorderingSender<ChannelSender>>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: tx_for[other].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            cfg.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    out
+}
+
+pub fn create_raft_lossy_delayed_cluster(
+    n: usize,
+    drop_rate: f64,
+    min_delay_ms: u64,
+    max_delay_ms: u64,
+) -> Vec<ClusterNode> {
+    assert!(n > 0);
+    let cfg = test_raft_config();
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{i}"), 1000))
+        .collect();
+    let mut tx_for: HashMap<NodeId, DelayedSender<LossySender<ChannelSender>>> = HashMap::new();
+    let mut rx_for: HashMap<NodeId, ChannelReceiver> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = unbounded_channel();
+        let lossy = LossySender::with_drop_rate(tx, drop_rate);
+        tx_for.insert(
+            id.clone(),
+            DelayedSender::with_range(
+                lossy,
+                Duration::from_millis(min_delay_ms),
+                Duration::from_millis(max_delay_ms),
+            ),
+        );
+        rx_for.insert(id.clone(), rx);
+    }
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<DelayedSender<LossySender<ChannelSender>>>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: tx_for[other].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            cfg.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    out
 }
 
 fn create_raft_cluster_inner(n: usize, config: concensus::RaftConfig) -> Vec<ClusterNode> {

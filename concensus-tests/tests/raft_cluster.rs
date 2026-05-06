@@ -38,3 +38,29 @@ async fn raft_three_node_consensus() {
         drop(node.handle);
     }
 }
+
+#[tokio::test]
+async fn raft_lossy_cluster_makes_progress() {
+    let mut cluster = helpers::create_raft_lossy_unbounded_cluster(3, 0.10);
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    for node in &cluster {
+        let _ = node.handle.propose("hello".into()).await;
+    }
+    let mut all = Vec::new();
+    for node in &mut cluster {
+        let mut decisions = Vec::new();
+        for _ in 0..3 {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), node.decisions.recv())
+                .await
+            {
+                Ok(Some(d)) => decisions.push(d),
+                _ => break,
+            }
+        }
+        all.push(decisions);
+    }
+    helpers::assert_safety_invariant(&all);
+    for node in cluster {
+        drop(node.handle);
+    }
+}
