@@ -267,7 +267,32 @@ where
         self.leader = Some(self.node_id.clone());
         self.next_index.clear();
         self.match_index.clear();
-        self.broadcast_heartbeat()
+
+        // Drain any proposals buffered while we had no leader; treat each as a fresh
+        // proposal now that we are the leader.
+        let buffered: Vec<V> = std::mem::take(&mut self.pending_proposals);
+        if buffered.is_empty() {
+            return self.broadcast_heartbeat();
+        }
+        let mut new_entries: Vec<LogEntry<V>> = Vec::with_capacity(buffered.len());
+        let start_idx = self.log.len() as u64;
+        for value in buffered {
+            let entry = LogEntry {
+                term: self.current_term,
+                value,
+            };
+            self.log.push(entry.clone());
+            new_entries.push(entry);
+        }
+        if self.pending_persist_log_from.is_none() {
+            self.pending_persist_log_from = Some(start_idx);
+        }
+        let last_idx = self.log.len() as u64 - 1;
+        self.match_index
+            .insert(self.node_id.clone(), Some(last_idx));
+        // Single-node clusters can commit immediately.
+        self.try_advance_commit();
+        self.broadcast_with_entries(new_entries)
     }
 
     fn broadcast_heartbeat(&mut self) -> Vec<Outgoing<RaftMessage<V>>> {
@@ -1698,6 +1723,45 @@ mod tests {
         // Quorum (2 of 3) not yet reached; only self matches.
         assert_eq!(p.commit_index, None);
         assert!(p.take_decisions().is_empty());
+    }
+
+    #[test]
+    fn buffered_proposals_drain_when_self_becomes_leader() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        // Buffer two proposals while no leader is known.
+        let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "x".into());
+        let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "y".into());
+        assert_eq!(p.pending_proposals.len(), 2);
+        // Trigger an election.
+        p.election_deadline = Instant::now() - Duration::from_millis(1);
+        let _ = p.on_tick(Instant::now());
+        assert!(matches!(p.role, Role::Candidate));
+        // Receive a yes vote from one peer (with self = quorum on 3-node).
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert!(matches!(p.role, Role::Leader));
+        // Buffered proposals should have been drained into the log.
+        assert!(p.pending_proposals.is_empty());
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[0].value, "x");
+        assert_eq!(p.log[1].value, "y");
+        // The outgoing message should be an AppendEntries carrying the two new entries.
+        assert_eq!(out.len(), 1);
+        match &out[0].message {
+            RaftMessage::AppendEntries { entries, .. } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].value, "x");
+                assert_eq!(entries[1].value, "y");
+            }
+            _ => panic!("expected AppendEntries with buffered entries"),
+        }
     }
 
     #[test]
