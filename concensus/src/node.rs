@@ -331,6 +331,34 @@ where
         (node, NodeHandle { proposal_tx }, decision_rx)
     }
 
+    /// Test-only snapshot of the node's current protocol state.
+    ///
+    /// Useful for integration tests that need to observe per-node state
+    /// (current term, role, log length, commit index) without coupling to
+    /// internal types. Returns sentinel values for fields that don't apply
+    /// to the active algorithm (Paxos always reports `role = None`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn peek_state(&self) -> NodeState {
+        let snap = self.protocol.peek_state();
+        let algorithm = match &self.protocol {
+            crate::protocol::ProtocolImpl::Paxos(_) => {
+                crate::config::ConsensusAlgorithm::MultiPaxos
+            }
+            crate::protocol::ProtocolImpl::Raft(_) => crate::config::ConsensusAlgorithm::Raft,
+        };
+        NodeState {
+            node_id: self.node_id.clone(),
+            algorithm,
+            role: snap.role,
+            term: snap.term,
+            leader: snap.leader,
+            voted_for: snap.voted_for,
+            log_len: snap.log_len,
+            commit_index: snap.commit_index,
+            last_applied: snap.last_applied,
+        }
+    }
+
     /// Runs the Paxos event loop until shutdown or fatal error.
     ///
     /// This method consumes the `Node` and drives the consensus protocol:
@@ -925,5 +953,25 @@ mod tests {
         };
         assert_eq!(s.term, 3);
         assert!(matches!(s.role, Some(NodeRole::Follower)));
+    }
+
+    #[tokio::test]
+    async fn node_peek_state_returns_snapshot() {
+        use crate::config::RaftConfig;
+        let id = NodeId::new("solo", 1);
+        let (node, _handle, _rx) =
+            Node::<String, DummySender, DummyReceiver>::with_raft_config_and_id(
+                id.clone(),
+                RaftConfig::default(),
+                vec![],
+                DummyReceiver,
+                MemoryStorage::new(),
+            );
+        let s = node.peek_state();
+        assert_eq!(s.node_id, id);
+        assert_eq!(s.algorithm, crate::config::ConsensusAlgorithm::Raft);
+        // Single-node Raft starts as Leader at term 1 (per RaftProtocol::new logic).
+        assert_eq!(s.term, 1);
+        assert!(matches!(s.role, Some(NodeRole::Leader)));
     }
 }

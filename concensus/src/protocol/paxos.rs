@@ -161,7 +161,7 @@ where
         self.instances.is_empty()
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn peek_state(&self) -> crate::protocol::raft::ProtocolSnapshot {
         crate::protocol::raft::ProtocolSnapshot {
             role: None,
