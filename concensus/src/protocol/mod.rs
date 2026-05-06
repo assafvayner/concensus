@@ -41,6 +41,7 @@ pub(crate) trait ConsensusProtocol<V> {
     fn is_idle(&self) -> bool;
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ProtocolImpl<V> {
     Paxos(PaxosProtocol<V>),
     #[allow(dead_code)]
