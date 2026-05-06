@@ -231,6 +231,131 @@ where
         }
         Vec::new()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_append_entries(
+        &mut self,
+        _from: NodeId,
+        term: u64,
+        leader: NodeId,
+        prev_log_index: Option<u64>,
+        prev_log_term: u64,
+        entries: Vec<LogEntry<V>>,
+        leader_commit: Option<u64>,
+    ) -> Vec<Outgoing<RaftMessage<V>>> {
+        // Reject if leader's term is stale.
+        if term < self.current_term {
+            return vec![Outgoing {
+                target: SendTarget::Peer(leader),
+                message: RaftMessage::AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: None,
+                    conflict_term: None,
+                    conflict_index: None,
+                },
+            }];
+        }
+        // Recognize the leader for the current term and reset election timer.
+        self.role = Role::Follower;
+        self.leader = Some(leader.clone());
+        self.election_deadline = Instant::now() + sample_election_timeout(&self.config);
+        // Note: term-bump already happened in handle_message via become_follower
+        // when term > current_term.
+
+        // Log consistency check: our log must contain prev_log_index with prev_log_term.
+        let prev_ok = match prev_log_index {
+            None => true,
+            Some(idx) => {
+                let i = idx as usize;
+                i < self.log.len() && self.log[i].term == prev_log_term
+            }
+        };
+        if !prev_ok {
+            return vec![Outgoing {
+                target: SendTarget::Peer(leader),
+                message: RaftMessage::AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: None,
+                    conflict_term: None, // Task 14 fills these in
+                    conflict_index: None,
+                },
+            }];
+        }
+
+        // Append entries, truncating any conflict at insertion points.
+        let start = match prev_log_index {
+            Some(i) => (i + 1) as usize,
+            None => 0,
+        };
+        for (insert_at, entry) in (start..).zip(entries) {
+            if insert_at < self.log.len() {
+                if self.log[insert_at].term != entry.term {
+                    self.log.truncate(insert_at);
+                    self.pending_truncate_from = Some(insert_at as u64);
+                    self.log.push(entry);
+                    if self.pending_persist_log_from.is_none()
+                        || self.pending_persist_log_from.unwrap() > insert_at as u64
+                    {
+                        self.pending_persist_log_from = Some(insert_at as u64);
+                    }
+                }
+                // else: entry already matches; idempotent no-op.
+            } else {
+                let from_idx = self.log.len() as u64;
+                self.log.push(entry);
+                if self.pending_persist_log_from.is_none() {
+                    self.pending_persist_log_from = Some(from_idx);
+                }
+            }
+        }
+
+        // Update commit_index from leader_commit, capped at our last index.
+        if let Some(lc) = leader_commit {
+            let last_idx = self.log.len().saturating_sub(1) as u64;
+            let new_ci = lc.min(last_idx);
+            if !self.log.is_empty() && self.commit_index.is_none_or(|c| new_ci > c) {
+                self.commit_index = Some(new_ci);
+                self.apply_committed_entries();
+            }
+        }
+
+        let match_idx = if self.log.is_empty() {
+            None
+        } else {
+            Some(self.log.len() as u64 - 1)
+        };
+        vec![Outgoing {
+            target: SendTarget::Peer(leader),
+            message: RaftMessage::AppendEntriesResponse {
+                term: self.current_term,
+                success: true,
+                match_index: match_idx,
+                conflict_term: None,
+                conflict_index: None,
+            },
+        }]
+    }
+
+    fn apply_committed_entries(&mut self) {
+        let target = match self.commit_index {
+            Some(c) => c,
+            None => return,
+        };
+        let start = match self.last_applied {
+            Some(a) => a + 1,
+            None => 0,
+        };
+        for idx in start..=target {
+            let entry = &self.log[idx as usize];
+            self.pending_decisions.push(Decision {
+                slot: idx,
+                value: entry.value.clone(),
+            });
+        }
+        self.last_applied = Some(target);
+    }
 }
 
 pub(crate) fn sample_election_timeout(cfg: &RaftConfig) -> Duration {
@@ -280,9 +405,24 @@ where
             RaftMessage::RequestVoteResponse { term, vote_granted } => {
                 self.handle_request_vote_response(from, term, vote_granted)
             }
-            RaftMessage::AppendEntries { .. } => Vec::new(), // Task 12
+            RaftMessage::AppendEntries {
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => self.handle_append_entries(
+                from,
+                term,
+                leader,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            ),
             RaftMessage::AppendEntriesResponse { .. } => Vec::new(), // Task 13
-            RaftMessage::Forward { .. } => Vec::new(),       // Task 17
+            RaftMessage::Forward { .. } => Vec::new(),               // Task 17
         }
     }
 
@@ -549,5 +689,282 @@ mod tests {
         );
         assert!(out.is_empty());
         assert!(matches!(p.role, Role::Candidate)); // unchanged
+    }
+
+    #[test]
+    fn append_entries_resets_election_timer_and_accepts_leader() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("b", 1);
+        // Force a known-stale deadline so the reset is observable regardless of
+        // how the next randomized sample lands.
+        let earlier_deadline = Instant::now() - Duration::from_secs(1);
+        p.election_deadline = earlier_deadline;
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.current_term, 1);
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.leader, Some(leader.clone()));
+        assert!(p.election_deadline > earlier_deadline);
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: true,
+                term: 1,
+                ..
+            } => {}
+            other => panic!("expected success AER, got {:?}", other),
+        }
+        match &out[0].target {
+            SendTarget::Peer(t) => assert_eq!(t, &leader),
+            _ => panic!("expected Peer target"),
+        }
+    }
+
+    #[test]
+    fn append_entries_rejects_lower_term() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 3,
+                leader: NodeId::new("b", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: false,
+                term: 5,
+                ..
+            } => {}
+            _ => panic!("expected rejection with our term"),
+        }
+    }
+
+    #[test]
+    fn append_entries_rejects_log_gap() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(2), // claims our log has 3+ entries; we have 0
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "x".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse { success: false, .. } => {}
+            _ => panic!(),
+        }
+        assert!(p.log.is_empty());
+    }
+
+    #[test]
+    fn append_entries_rejects_term_mismatch_at_prev() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.log.push(LogEntry {
+            term: 1,
+            value: "old".into(),
+        });
+        p.current_term = 1;
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(0),
+                prev_log_term: 5, // mismatch — our log[0].term is 1
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse { success: false, .. } => {}
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn append_entries_appends_when_prev_matches() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "x".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.log.len(), 1);
+        assert_eq!(p.log[0].value, "x");
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(0),
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "y".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[1].value, "y");
+    }
+
+    #[test]
+    fn append_entries_truncates_conflicting_suffix() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 2;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "stale".into(),
+            },
+        ];
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 2,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(0),
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 2,
+                    value: "fresh".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[0].value, "a");
+        assert_eq!(p.log[1].value, "fresh");
+        assert_eq!(p.log[1].term, 2);
+    }
+
+    #[test]
+    fn append_entries_idempotent_for_already_present_entries() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 1;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+        ];
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(0),
+                prev_log_term: 1,
+                // Re-sends entry at index 1 — already matches our log.
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "b".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.log.len(), 2);
+        assert_eq!(p.log[1].value, "b");
+    }
+
+    #[test]
+    fn leader_commit_advances_commit_index_and_yields_decisions() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        value: "x".into(),
+                    },
+                    LogEntry {
+                        term: 1,
+                        value: "y".into(),
+                    },
+                ],
+                leader_commit: Some(1),
+            },
+        );
+        assert_eq!(p.commit_index, Some(1));
+        let decisions = p.take_decisions();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].slot, 0);
+        assert_eq!(decisions[0].value, "x");
+        assert_eq!(decisions[1].slot, 1);
+        assert_eq!(decisions[1].value, "y");
+    }
+
+    #[test]
+    fn leader_commit_is_capped_at_last_log_index() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: NodeId::new("b", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "x".into(),
+                }],
+                leader_commit: Some(99), // way past end
+            },
+        );
+        // Our log has only index 0; commit_index should be Some(0), not Some(99).
+        assert_eq!(p.commit_index, Some(0));
     }
 }
