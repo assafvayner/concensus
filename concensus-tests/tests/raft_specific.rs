@@ -390,6 +390,18 @@ async fn conflict_index_helps_recovery_after_long_isolation() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invariant_checker_observes_decisions() {
+    use helpers::raft_invariants::RaftClusterInvariantChecker;
+    let mut cluster = create_raft_cluster(3);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    cluster[0].handle.propose("v1".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut checker = RaftClusterInvariantChecker::new(3);
+    checker.poll(&mut cluster);
+    assert_eq!(checker.total_decided(), 1);
+}
+
 /// Single-node Raft end-to-end through the Node abstraction.
 ///
 /// `RaftProtocol::new(_, 1, _)` bootstraps the sole node as Leader at term 1,

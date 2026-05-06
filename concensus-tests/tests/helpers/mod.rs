@@ -4,6 +4,7 @@
 // at the module level so the workspace stays clippy-clean.
 #![allow(dead_code, unused_imports)]
 
+pub mod raft_invariants;
 pub mod transport_filters;
 
 use std::collections::HashMap;
