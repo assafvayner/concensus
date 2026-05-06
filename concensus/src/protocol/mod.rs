@@ -72,8 +72,11 @@ where
                     .into_iter()
                     .map(wrap_paxos)
                     .collect()
-            } // Once a Raft arm exists, also handle (Raft, Raft) and warn-and-drop on mismatches.
-              // For now we only have Paxos, so any unmatched WireVariant arm produces zero outgoing.
+            }
+            (Self::Paxos(_), WireVariant::Raft(_)) => {
+                tracing::warn!("Paxos node received Raft message, dropping");
+                Vec::new()
+            } // Once a Raft arm exists in ProtocolImpl, also handle (Raft, Raft) and (Raft, Paxos) warn-and-drop.
         }
     }
 

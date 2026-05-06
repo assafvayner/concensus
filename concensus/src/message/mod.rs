@@ -1,4 +1,5 @@
 pub(crate) mod paxos;
+pub(crate) mod raft;
 
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -6,10 +7,13 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::config::NodeId;
 
 pub(crate) use paxos::{PaxosMessage, ProposalNumber};
+#[allow(unused_imports)]
+pub(crate) use raft::{LogEntry, RaftMessage};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) enum WireVariant<V> {
     Paxos(PaxosMessage<V>),
+    Raft(RaftMessage<V>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -81,5 +85,67 @@ mod tests {
             decoded.variant,
             WireVariant::Paxos(PaxosMessage::Prepare { slot: 7, .. })
         ));
+    }
+
+    #[test]
+    fn raft_request_vote_serde_roundtrip() {
+        let msg: WireVariant<String> =
+            WireVariant::Raft(crate::message::raft::RaftMessage::RequestVote {
+                term: 5,
+                candidate: test_node_id(),
+                last_log_index: None,
+                last_log_term: 0,
+            });
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WireVariant<String> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            WireVariant::Raft(crate::message::raft::RaftMessage::RequestVote { term: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn raft_append_entries_serde_roundtrip() {
+        use crate::message::raft::{LogEntry, RaftMessage};
+        let msg: WireVariant<String> = WireVariant::Raft(RaftMessage::AppendEntries {
+            term: 7,
+            leader: test_node_id(),
+            prev_log_index: Some(2),
+            prev_log_term: 6,
+            entries: vec![LogEntry {
+                term: 7,
+                value: "x".to_string(),
+            }],
+            leader_commit: Some(2),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WireVariant<String> = serde_json::from_str(&json).unwrap();
+        match decoded {
+            WireVariant::Raft(RaftMessage::AppendEntries { term, entries, .. }) => {
+                assert_eq!(term, 7);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].value, "x");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn raft_log_entry_eq() {
+        use crate::message::raft::LogEntry;
+        let a = LogEntry {
+            term: 1,
+            value: "x".to_string(),
+        };
+        let b = LogEntry {
+            term: 1,
+            value: "x".to_string(),
+        };
+        let c = LogEntry {
+            term: 2,
+            value: "x".to_string(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }
