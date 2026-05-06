@@ -6,7 +6,6 @@
 
 #![cfg(test)]
 #![allow(dead_code)] // Items used only by proptest macros below — clippy false positive.
-#![allow(unused_imports)] // `vec` strategy is used only by the proptest! macro added in 3.3.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -256,5 +255,46 @@ impl Harness {
         self.assert_log_matching();
         self.assert_state_machine_safety();
         self.assert_term_monotonicity();
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        std::env::var("PROPTEST_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(256)
+    ))]
+
+    #[test]
+    fn random_steps_preserve_invariants(steps in vec(step_strategy(), 1..256)) {
+        let mut h = Harness::new();
+        for s in &steps {
+            h.step(s);
+            h.assert_invariants();
+        }
+    }
+}
+
+#[cfg(test)]
+mod sanity {
+    use super::*;
+
+    #[test]
+    fn harness_basic_election_and_propose() {
+        let mut h = Harness::new();
+        h.nodes[0].election_deadline = h.now - Duration::from_millis(1);
+        h.step(&Step::Tick(0));
+        for _ in 0..50 {
+            if h.queue.is_empty() {
+                h.step(&Step::Tick(0));
+            } else {
+                h.step(&Step::Deliver(0));
+            }
+        }
+        let leader_count = h
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.role, Role::Leader))
+            .count();
+        assert!(leader_count >= 1, "expected a leader to be elected");
+        h.assert_invariants();
     }
 }
