@@ -272,14 +272,29 @@ where
             }
         };
         if !prev_ok {
+            let (conflict_term, conflict_index) = match prev_log_index {
+                Some(idx) if (idx as usize) >= self.log.len() => {
+                    // Log is shorter than the leader expects. Hint: resume from our log's end.
+                    (None, Some(self.log.len() as u64))
+                }
+                Some(idx) => {
+                    // Term mismatch at prev_log_index. Hint with our term + first index of that term.
+                    let conflict_term_val = self.log[idx as usize].term;
+                    let first = (0..=idx as usize)
+                        .find(|&i| self.log[i].term == conflict_term_val)
+                        .map(|i| i as u64);
+                    (Some(conflict_term_val), first)
+                }
+                None => (None, Some(0)),
+            };
             return vec![Outgoing {
                 target: SendTarget::Peer(leader),
                 message: RaftMessage::AppendEntriesResponse {
                     term: self.current_term,
                     success: false,
                     match_index: None,
-                    conflict_term: None, // Task 14 fills these in
-                    conflict_index: None,
+                    conflict_term,
+                    conflict_index,
                 },
             }];
         }
@@ -375,7 +390,6 @@ where
         conflict_index: Option<u64>,
     ) -> Vec<Outgoing<RaftMessage<V>>> {
         let _ = conflict_term;
-        let _ = conflict_index;
         if !matches!(self.role, Role::Leader) || term != self.current_term {
             return Vec::new();
         }
@@ -387,20 +401,26 @@ where
             }
             Vec::new()
         } else {
-            let entry = self
-                .next_index
-                .entry(from.clone())
-                .or_insert(self.log.len() as u64);
-            if *entry > 0 {
-                *entry -= 1;
-            }
-            let next = *self.next_index.get(&from).unwrap();
-            let prev = if next == 0 { None } else { Some(next - 1) };
+            let new_next = if let Some(ci) = conflict_index {
+                ci
+            } else {
+                let cur = *self
+                    .next_index
+                    .get(&from)
+                    .unwrap_or(&(self.log.len() as u64));
+                cur.saturating_sub(1)
+            };
+            self.next_index.insert(from.clone(), new_next);
+            let prev = if new_next == 0 {
+                None
+            } else {
+                Some(new_next - 1)
+            };
             let prev_term = match prev {
                 Some(i) => self.log[i as usize].term,
                 None => 0,
             };
-            let entries: Vec<LogEntry<V>> = self.log[next as usize..].to_vec();
+            let entries: Vec<LogEntry<V>> = self.log[new_next as usize..].to_vec();
             vec![Outgoing {
                 target: SendTarget::Peer(from),
                 message: RaftMessage::AppendEntries {
@@ -1216,5 +1236,141 @@ mod tests {
         );
         // Our log has only index 0; commit_index should be Some(0), not Some(99).
         assert_eq!(p.commit_index, Some(0));
+    }
+
+    #[test]
+    fn follower_reports_conflict_index_on_log_gap() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(3), // gap: our log is empty, claimed prior at index 3
+                prev_log_term: 2,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: false,
+                conflict_term: None,     // we have no entry at that position
+                conflict_index: Some(0), // resume from start
+                ..
+            } => {}
+            other => panic!("expected reject with conflict_index hint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn follower_reports_conflict_term_on_term_mismatch_at_prev() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "c".into(),
+            },
+        ];
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(2),
+                prev_log_term: 4, // mismatch: ours at idx 2 has term 2
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: false,
+                conflict_term: Some(2),
+                conflict_index: Some(1), // first index of term 2 in our log
+                ..
+            } => {}
+            other => panic!("expected reject with conflict hints, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leader_uses_conflict_index_to_rewind_next_index_in_one_step() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        p.log = (0..10)
+            .map(|i| LogEntry {
+                term: 5,
+                value: format!("v{}", i),
+            })
+            .collect();
+        p.next_index.insert(b.clone(), 9);
+        let out = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 5,
+                success: false,
+                match_index: None,
+                conflict_term: None,
+                conflict_index: Some(2),
+            },
+        );
+        assert_eq!(p.next_index.get(&b), Some(&2));
+        match &out[0].message {
+            RaftMessage::AppendEntries {
+                prev_log_index: Some(1),
+                entries,
+                ..
+            } => {
+                assert_eq!(entries.len(), 8); // indices 2..=9
+            }
+            other => panic!("expected re-send from index 2, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leader_falls_back_to_decrement_when_no_conflict_index_hint() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        p.log = (0..5)
+            .map(|i| LogEntry {
+                term: 5,
+                value: format!("v{}", i),
+            })
+            .collect();
+        p.next_index.insert(b.clone(), 5);
+        let _ = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 5,
+                success: false,
+                match_index: None,
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert_eq!(p.next_index.get(&b), Some(&4));
     }
 }
