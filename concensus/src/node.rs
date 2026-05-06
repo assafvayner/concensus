@@ -781,4 +781,67 @@ mod tests {
         assert_eq!(da.slot, db.slot);
         assert_eq!(db.slot, dc.slot);
     }
+
+    #[tokio::test]
+    async fn paxos_node_drops_raft_messages_silently() {
+        use crate::config::NodeId;
+        use crate::message::{Message, RaftMessage, WireVariant};
+        use bytes::Bytes;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        // A receiver that yields one synthetic Raft-formatted message, then pends.
+        struct OneShot {
+            once: Arc<Mutex<Option<Bytes>>>,
+        }
+        #[async_trait::async_trait]
+        impl MessageReceiver for OneShot {
+            async fn recv(&mut self) -> Result<Bytes, crate::error::TransportError> {
+                let next = {
+                    let mut g = self.once.lock().await;
+                    g.take()
+                };
+                match next {
+                    Some(b) => Ok(b),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+
+        let raft_msg: Message<String> = Message {
+            sender: NodeId::new("attacker", 1),
+            variant: WireVariant::Raft(RaftMessage::RequestVote {
+                term: 99,
+                candidate: NodeId::new("attacker", 1),
+                last_log_index: None,
+                last_log_term: 0,
+            }),
+        };
+        let bytes = raft_msg.to_bytes().unwrap();
+        let one_shot = OneShot {
+            once: Arc::new(Mutex::new(Some(bytes))),
+        };
+
+        // Build a 1-node Paxos cluster with the synthetic receiver.
+        let id = NodeId::new("paxos-node", 1);
+        let (node, handle, mut decisions) = Node::<String, DummySender, OneShot>::with_id(
+            id,
+            vec![],
+            one_shot,
+            MemoryStorage::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+
+        // Wait briefly. The Raft message should be processed (and dropped) without panic.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The decision channel should remain empty.
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_millis(100), decisions.recv()).await;
+        assert!(decision.is_err(), "no decision should have been delivered");
+
+        // Cluster shutdown
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
+    }
 }
