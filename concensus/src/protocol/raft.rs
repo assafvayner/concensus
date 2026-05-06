@@ -421,8 +421,8 @@ where
         } else {
             Some(self.log.len() as u64 - 1)
         };
-        vec![Outgoing {
-            target: SendTarget::Peer(leader),
+        let response = Outgoing {
+            target: SendTarget::Peer(leader.clone()),
             message: RaftMessage::AppendEntriesResponse {
                 term: self.current_term,
                 success: true,
@@ -430,7 +430,15 @@ where
                 conflict_term: None,
                 conflict_index: None,
             },
-        }]
+        };
+        let mut all = vec![response];
+        for value in std::mem::take(&mut self.pending_proposals) {
+            all.push(Outgoing {
+                target: SendTarget::Peer(leader.clone()),
+                message: RaftMessage::Forward { value },
+            });
+        }
+        all
     }
 
     fn broadcast_with_entries(
@@ -570,22 +578,27 @@ where
     type Message = RaftMessage<V>;
 
     fn propose(&mut self, value: V) -> Vec<Outgoing<Self::Message>> {
-        if !matches!(self.role, Role::Leader) {
-            // Forwarding lands in Task 17. For now, buffer.
-            self.pending_proposals.push(value);
-            return Vec::new();
+        if matches!(self.role, Role::Leader) {
+            let entry = LogEntry {
+                term: self.current_term,
+                value,
+            };
+            let idx = self.log.len() as u64;
+            self.log.push(entry.clone());
+            if self.pending_persist_log_from.is_none() {
+                self.pending_persist_log_from = Some(idx);
+            }
+            self.match_index.insert(self.node_id.clone(), Some(idx));
+            return self.broadcast_with_entries(vec![entry]);
         }
-        let entry = LogEntry {
-            term: self.current_term,
-            value,
-        };
-        let idx = self.log.len() as u64;
-        self.log.push(entry.clone());
-        if self.pending_persist_log_from.is_none() {
-            self.pending_persist_log_from = Some(idx);
+        if let Some(leader) = self.leader.clone() {
+            return vec![Outgoing {
+                target: SendTarget::Peer(leader),
+                message: RaftMessage::Forward { value },
+            }];
         }
-        self.match_index.insert(self.node_id.clone(), Some(idx));
-        self.broadcast_with_entries(vec![entry])
+        self.pending_proposals.push(value);
+        Vec::new()
     }
 
     fn handle_message(&mut self, from: NodeId, msg: Self::Message) -> Vec<Outgoing<Self::Message>> {
@@ -642,7 +655,15 @@ where
                 conflict_term,
                 conflict_index,
             ),
-            RaftMessage::Forward { .. } => Vec::new(), // Task 17
+            RaftMessage::Forward { value } => {
+                if matches!(self.role, Role::Leader) {
+                    // Treat as a fresh proposal.
+                    <RaftProtocol<V> as ConsensusProtocol<V>>::propose(self, value)
+                } else {
+                    // Non-leader received a Forward — drop. Sender will retry once a leader is known.
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -1520,6 +1541,107 @@ mod tests {
         assert_eq!(p.log.len(), 1);
         assert_eq!(p.commit_index, None);
         assert_eq!(p.last_applied, None);
+    }
+
+    #[test]
+    fn follower_forwards_proposal_to_known_leader() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("b", 1);
+        // Receive an AppendEntries from a leader to set p.leader.
+        let _ = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.leader, Some(leader.clone()));
+
+        let out =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        assert_eq!(out.len(), 1);
+        match (&out[0].target, &out[0].message) {
+            (SendTarget::Peer(t), RaftMessage::Forward { value }) => {
+                assert_eq!(t, &leader);
+                assert_eq!(value, "hello");
+            }
+            (_, msg) => panic!("expected Forward to leader, got message {:?}", msg),
+        }
+        assert!(p.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn follower_buffers_proposal_when_no_leader_known() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        assert!(p.leader.is_none());
+        let out =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        assert!(out.is_empty());
+        assert_eq!(p.pending_proposals.len(), 1);
+        assert_eq!(p.pending_proposals[0], "hello");
+    }
+
+    #[test]
+    fn leader_handles_forwarded_proposal_as_normal_propose() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::Forward {
+                value: "from-b".into(),
+            },
+        );
+        assert_eq!(p.log.len(), 1);
+        assert_eq!(p.log[0].value, "from-b");
+    }
+
+    #[test]
+    fn pending_proposals_drained_as_forwards_when_leader_learned() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let _ =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "buffered".into());
+        assert_eq!(p.pending_proposals.len(), 1);
+        let leader = NodeId::new("b", 1);
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert!(p.pending_proposals.is_empty());
+        // Out should contain the AER + a Forward
+        let has_forward = out
+            .iter()
+            .any(|o| matches!(&o.message, RaftMessage::Forward { value } if value == "buffered"));
+        assert!(has_forward, "expected buffered proposal to be forwarded");
+    }
+
+    #[test]
+    fn non_leader_drops_received_forward() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        // p.role is Follower
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::Forward { value: "x".into() },
+        );
+        assert!(out.is_empty());
+        assert!(p.log.is_empty());
     }
 
     #[test]

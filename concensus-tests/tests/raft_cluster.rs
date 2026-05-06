@@ -14,7 +14,6 @@ async fn raft_cluster_starts_without_panic() {
 }
 
 #[tokio::test]
-#[ignore = "needs Task 17 forwarding"]
 async fn raft_three_node_consensus() {
     let mut cluster = create_raft_cluster(3);
     // Wait for an election to settle.
