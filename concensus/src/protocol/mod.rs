@@ -2,6 +2,9 @@
 pub(crate) mod paxos;
 pub(crate) mod raft;
 
+#[cfg(test)]
+mod raft_proptest;
+
 use std::time::Instant;
 
 use serde::{de::DeserializeOwned, Serialize};
