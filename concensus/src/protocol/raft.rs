@@ -2002,6 +2002,33 @@ mod tests {
     }
 
     #[test]
+    fn leader_does_not_advance_commit_past_log_end() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        p.log.push(LogEntry {
+            term: 1,
+            value: "x".into(),
+        });
+        p.match_index.insert(me.clone(), Some(0));
+        let _ = p.handle_message(
+            b,
+            RaftMessage::AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: Some(99),
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert!(p.commit_index.is_none() || p.commit_index.unwrap() < p.log.len() as u64);
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
