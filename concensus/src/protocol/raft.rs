@@ -78,25 +78,44 @@ where
 {
     pub(crate) fn new(node_id: NodeId, total_nodes: usize, config: RaftConfig) -> Self {
         let election_deadline = Instant::now() + sample_election_timeout(&config);
+        let (
+            role,
+            current_term,
+            voted_for,
+            leader,
+            pending_persist_term,
+            pending_persist_voted_for,
+        ) = if total_nodes == 1 {
+            (
+                Role::Leader,
+                1,
+                Some(node_id.clone()),
+                Some(node_id.clone()),
+                true,
+                true,
+            )
+        } else {
+            (Role::Follower, 0, None, None, false, false)
+        };
         Self {
             node_id,
             total_nodes,
             config,
-            current_term: 0,
-            voted_for: None,
+            current_term,
+            voted_for,
             log: Vec::new(),
             commit_index: None,
             last_applied: None,
-            role: Role::Follower,
-            leader: None,
+            role,
+            leader,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             election_deadline,
             votes_received: HashSet::new(),
             last_heartbeat_sent: None,
             pending_decisions: Vec::new(),
-            pending_persist_term: false,
-            pending_persist_voted_for: false,
+            pending_persist_term,
+            pending_persist_voted_for,
             pending_persist_log_from: None,
             pending_truncate_from: None,
             pending_proposals: Vec::new(),
@@ -589,6 +608,7 @@ where
                 self.pending_persist_log_from = Some(idx);
             }
             self.match_index.insert(self.node_id.clone(), Some(idx));
+            self.try_advance_commit();
             return self.broadcast_with_entries(vec![entry]);
         }
         if let Some(leader) = self.leader.clone() {
@@ -1642,6 +1662,42 @@ mod tests {
         );
         assert!(out.is_empty());
         assert!(p.log.is_empty());
+    }
+
+    #[test]
+    fn single_node_raft_starts_as_leader() {
+        let p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
+        assert_eq!(p.voted_for, Some(p.node_id.clone()));
+        assert_eq!(p.leader, Some(p.node_id.clone()));
+        assert!(p.pending_persist_term);
+        assert!(p.pending_persist_voted_for);
+    }
+
+    #[test]
+    fn single_node_raft_commits_immediately_on_propose() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        let _ =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        assert_eq!(p.commit_index, Some(0));
+        let decisions = p.take_decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].slot, 0);
+        assert_eq!(decisions[0].value, "hello");
+    }
+
+    #[test]
+    fn three_node_raft_does_not_commit_immediately_on_propose() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(p.node_id.clone());
+        let _ =
+            <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        // Quorum (2 of 3) not yet reached; only self matches.
+        assert_eq!(p.commit_index, None);
+        assert!(p.take_decisions().is_empty());
     }
 
     #[test]
