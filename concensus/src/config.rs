@@ -127,7 +127,8 @@ pub struct PaxosConfig {
 impl Default for PaxosConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Duration::from_millis(50),
+            // Matches the previous hard-coded leader heartbeat cadence.
+            heartbeat_interval: Duration::from_millis(100),
         }
     }
 }
@@ -233,7 +234,10 @@ mod tests {
     #[test]
     fn paxos_config_defaults() {
         let cfg = PaxosConfig::default();
-        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_millis(50));
+        assert_eq!(
+            cfg.heartbeat_interval,
+            std::time::Duration::from_millis(100)
+        );
     }
 
     #[test]

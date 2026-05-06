@@ -177,16 +177,41 @@ where
     /// Creates a new consensus node configured for Multi-Paxos with the supplied
     /// [`PaxosConfig`].
     ///
-    /// Currently behaves identically to [`Node::new`]; the configuration is
-    /// retained for forward compatibility (e.g., future heartbeat tuning).
+    /// The config's `heartbeat_interval` is plumbed through to the underlying
+    /// Paxos protocol; defaults match [`PaxosConfig::default`].
     pub fn with_paxos_config(
         name: impl Into<Arc<str>>,
-        _config: crate::config::PaxosConfig,
+        config: crate::config::PaxosConfig,
         peers: Vec<PeerInfo<S>>,
         receiver: R,
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
-        Self::new(name, peers, receiver, storage)
+        let incarnation = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let node_id = NodeId::new(name, incarnation);
+        let total_nodes = peers.len() + 1;
+        let protocol = ProtocolImpl::Paxos(PaxosProtocol::new_with_config(
+            node_id.clone(),
+            total_nodes,
+            config,
+        ));
+        let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
+        let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
+
+        let node = Self {
+            node_id,
+            peers,
+            receiver: Some(receiver),
+            storage: Box::new(storage),
+            raft_storage: None,
+            protocol,
+            proposal_rx,
+            decision_tx,
+        };
+
+        (node, NodeHandle { proposal_tx }, decision_rx)
     }
 
     /// Creates a new consensus node with an explicit [`NodeId`].

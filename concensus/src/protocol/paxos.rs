@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::RngExt;
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::config::NodeId;
+use crate::config::{NodeId, PaxosConfig};
 use crate::message::{PaxosMessage, ProposalNumber};
 use crate::protocol::{ConsensusProtocol, Decision, Outgoing, SendTarget};
 
@@ -52,6 +52,11 @@ pub(crate) struct PaxosProtocol<V> {
     /// matches the value within the timeout, we re-propose locally.
     #[cfg(feature = "multi-paxos")]
     forwarded_proposals: Vec<ForwardedProposal<V>>,
+    /// How often a leader emits heartbeats. Sourced from [`PaxosConfig`];
+    /// only consulted under the `multi-paxos` feature, but stored
+    /// unconditionally so the field is available regardless of features.
+    #[allow(dead_code)]
+    heartbeat_interval: Duration,
 }
 
 /// Per-slot Paxos instance
@@ -111,6 +116,14 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + PartialEq,
 {
     pub(crate) fn new(node_id: NodeId, total_nodes: usize) -> Self {
+        Self::new_with_config(node_id, total_nodes, PaxosConfig::default())
+    }
+
+    pub(crate) fn new_with_config(
+        node_id: NodeId,
+        total_nodes: usize,
+        config: PaxosConfig,
+    ) -> Self {
         Self {
             node_id,
             instances: HashMap::new(),
@@ -131,6 +144,7 @@ where
             last_heartbeat_time: None,
             #[cfg(feature = "multi-paxos")]
             forwarded_proposals: Vec::new(),
+            heartbeat_interval: config.heartbeat_interval,
         }
     }
 
@@ -834,9 +848,8 @@ where
             // which is the only way followers learn who the leader is. Without
             // periodic heartbeats, a busy leader that continuously sends Decides
             // would never announce itself to new followers.
-            let heartbeat_interval = std::time::Duration::from_millis(100);
             match self.last_heartbeat_time {
-                Some(t) => Instant::now().duration_since(t) >= heartbeat_interval,
+                Some(t) => Instant::now().duration_since(t) >= self.heartbeat_interval,
                 None => true,
             }
         } else {
