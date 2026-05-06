@@ -476,6 +476,7 @@ where
             Some(i) => (i + 1) as usize,
             None => 0,
         };
+        let new_entries_len = entries.len();
         for (insert_at, entry) in (start..).zip(entries) {
             if insert_at < self.log.len() {
                 if self.log[insert_at].term != entry.term {
@@ -508,10 +509,19 @@ where
             }
         }
 
-        let match_idx = if self.log.is_empty() {
-            None
-        } else {
-            Some(self.log.len() as u64 - 1)
+        // Report only the index this RPC actually verified — `prev_log_index`
+        // plus the entries we just placed. The follower's local log may extend
+        // beyond that with an unverified stale suffix from a prior leader; if
+        // we reported `self.log.len() - 1` here, an empty heartbeat that
+        // matched only at `prev_log_index` would let the leader treat that
+        // stale suffix as replicated, inflating `match_index`/`next_index` and
+        // letting `try_advance_commit` rely on a quorum that hasn't actually
+        // matched. The standard suffix is left in place — a future non-empty
+        // AppendEntries that conflicts will truncate it via the loop above.
+        let match_idx = match (prev_log_index, new_entries_len) {
+            (Some(p), n) => Some(p + n as u64),
+            (None, 0) => None,
+            (None, n) => Some(n as u64 - 1),
         };
         let response = Outgoing {
             target: SendTarget::Peer(leader.clone()),
@@ -752,8 +762,19 @@ where
                 if matches!(self.role, Role::Leader) {
                     // Treat as a fresh proposal.
                     <RaftProtocol<V> as ConsensusProtocol<V>>::propose(self, value)
+                } else if self.leader.as_ref().is_some_and(|l| *l != from) {
+                    // Chain-forward to whoever we currently believe is the leader.
+                    // The sender's view was stale; ours may still be wrong, but as
+                    // long as some node in the chain has accurate state the value
+                    // reaches a real leader. Refusing to forward back to `from`
+                    // prevents two-node ping-pong loops when both peers disagree
+                    // about who is leader.
+                    <RaftProtocol<V> as ConsensusProtocol<V>>::propose(self, value)
                 } else {
-                    // Non-leader received a Forward — drop. Sender will retry once a leader is known.
+                    // No usable leader to forward to (unknown, or it's the sender).
+                    // Buffer so the value drains to whichever leader we next learn
+                    // about (via `handle_append_entries` or `become_leader`).
+                    self.pending_proposals.push(value);
                     Vec::new()
                 }
             }
@@ -1213,6 +1234,211 @@ mod tests {
         assert_eq!(p.log[0].value, "a");
         assert_eq!(p.log[1].value, "fresh");
         assert_eq!(p.log[1].term, 2);
+    }
+
+    #[test]
+    fn empty_heartbeat_match_index_reflects_only_prev_log_index_with_stale_suffix() {
+        use crate::message::{LogEntry, RaftMessage};
+        // Follower has a matching prefix [0..=2] from term 1 plus an unverified
+        // stale suffix [3..=5] from a prior term that the current leader did
+        // not produce. A heartbeat with `prev_log_index = Some(2)` must report
+        // match_index = Some(2), not Some(5) — otherwise the leader treats the
+        // stale suffix as replicated.
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "0".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "1".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "2".into(),
+            },
+            // Stale suffix from a prior term — never confirmed by current leader.
+            LogEntry {
+                term: 2,
+                value: "stale-3".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-4".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-5".into(),
+            },
+        ];
+        let leader = NodeId::new("b", 1);
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: leader.clone(),
+                prev_log_index: Some(2),
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        let response = out
+            .iter()
+            .find_map(|o| match &o.message {
+                RaftMessage::AppendEntriesResponse {
+                    success,
+                    match_index,
+                    ..
+                } => Some((*success, *match_index)),
+                _ => None,
+            })
+            .expect("expected an AppendEntriesResponse");
+        assert!(response.0, "heartbeat with matching prev should succeed");
+        assert_eq!(
+            response.1,
+            Some(2),
+            "match_index should reflect only the verified prefix, not the stale suffix"
+        );
+        // Suffix is intentionally retained — a future non-empty AE will truncate it
+        // via the conflict path. Don't assert truncation here.
+        assert_eq!(p.log.len(), 6);
+    }
+
+    #[test]
+    fn append_entries_match_index_excludes_stale_suffix_beyond_request() {
+        use crate::message::{LogEntry, RaftMessage};
+        // Leader sends prev=2 with two new entries (covering indices 3 and 4).
+        // Follower has a longer stale suffix at indices 3..=5. After the loop,
+        // indices 3 and 4 match the leader (truncate-and-append on conflict),
+        // but index 5 is still unverified. match_index should be 4, not 5.
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "0".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "1".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "2".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-3".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-4".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-5".into(),
+            },
+        ];
+        let leader = NodeId::new("b", 1);
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: leader.clone(),
+                prev_log_index: Some(2),
+                prev_log_term: 1,
+                entries: vec![
+                    LogEntry {
+                        term: 5,
+                        value: "new-3".into(),
+                    },
+                    LogEntry {
+                        term: 5,
+                        value: "new-4".into(),
+                    },
+                ],
+                leader_commit: None,
+            },
+        );
+        let match_index = out
+            .iter()
+            .find_map(|o| match &o.message {
+                RaftMessage::AppendEntriesResponse { match_index, .. } => Some(*match_index),
+                _ => None,
+            })
+            .expect("expected an AppendEntriesResponse");
+        assert_eq!(
+            match_index,
+            Some(4),
+            "match_index should be prev_log_index + entries.len(), not log.len() - 1"
+        );
+    }
+
+    #[test]
+    fn append_entries_match_index_none_for_empty_initial_heartbeat() {
+        use crate::message::RaftMessage;
+        // First heartbeat from a new leader to a fresh follower: prev_log_index
+        // is None and entries is empty. Nothing has been verified by this RPC.
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("b", 1);
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        let match_index = out
+            .iter()
+            .find_map(|o| match &o.message {
+                RaftMessage::AppendEntriesResponse { match_index, .. } => Some(*match_index),
+                _ => None,
+            })
+            .expect("expected an AppendEntriesResponse");
+        assert_eq!(match_index, None);
+    }
+
+    #[test]
+    fn append_entries_match_index_when_prev_none_with_entries() {
+        use crate::message::{LogEntry, RaftMessage};
+        // prev_log_index = None, entries fill indices [0..=1]. Verified up to 1.
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("b", 1);
+        let out = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        value: "x".into(),
+                    },
+                    LogEntry {
+                        term: 1,
+                        value: "y".into(),
+                    },
+                ],
+                leader_commit: None,
+            },
+        );
+        let match_index = out
+            .iter()
+            .find_map(|o| match &o.message {
+                RaftMessage::AppendEntriesResponse { match_index, .. } => Some(*match_index),
+                _ => None,
+            })
+            .expect("expected an AppendEntriesResponse");
+        assert_eq!(match_index, Some(1));
     }
 
     #[test]
@@ -1727,16 +1953,78 @@ mod tests {
     }
 
     #[test]
-    fn non_leader_drops_received_forward() {
+    fn non_leader_buffers_received_forward_when_no_leader_known() {
         use crate::message::RaftMessage;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
-        // p.role is Follower
+        // p.role is Follower, p.leader is None
         let out = p.handle_message(
             NodeId::new("b", 1),
             RaftMessage::Forward { value: "x".into() },
         );
         assert!(out.is_empty());
         assert!(p.log.is_empty());
+        assert_eq!(p.pending_proposals, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn non_leader_chain_forwards_received_forward_to_known_leader() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("c", 1);
+        // Establish that we know c is the leader.
+        let _ = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        // A different peer (b) forwards to us; we should chain-forward to c.
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::Forward {
+                value: "relay".into(),
+            },
+        );
+        assert!(p.pending_proposals.is_empty());
+        let forward_to_leader = out.iter().any(|o| {
+            matches!(&o.target, SendTarget::Peer(t) if t == &leader)
+                && matches!(&o.message, RaftMessage::Forward { value } if value == "relay")
+        });
+        assert!(forward_to_leader, "expected chain-forward to known leader");
+    }
+
+    #[test]
+    fn non_leader_buffers_forward_when_sender_is_believed_leader() {
+        use crate::message::RaftMessage;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let b = NodeId::new("b", 1);
+        // Let p believe b is leader.
+        let _ = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: b.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        // b now forwards to us — which would imply b stepped down. Avoid the
+        // ping-pong loop by buffering instead of forwarding back to b.
+        let out = p.handle_message(
+            b.clone(),
+            RaftMessage::Forward {
+                value: "loop-guard".into(),
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(p.pending_proposals, vec!["loop-guard".to_string()]);
     }
 
     #[test]
@@ -2054,18 +2342,66 @@ mod tests {
     }
 
     #[test]
-    fn old_leader_after_term_bump_drops_forward() {
+    fn single_node_recover_from_empty_state_resumes_as_leader() {
+        let me = NodeId::new("solo", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
+        p.recover(0, None, Vec::new(), Vec::new());
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
+        assert_eq!(p.voted_for, Some(me.clone()));
+        assert_eq!(p.leader, Some(me));
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.term, Some(1));
+        assert!(intent.voted_for.is_some());
+    }
+
+    #[test]
+    fn single_node_recover_preserves_persisted_term_and_log() {
+        use crate::message::LogEntry;
+        let me = NodeId::new("solo", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
+        let log = vec![LogEntry {
+            term: 1,
+            value: "x".into(),
+        }];
+        p.recover(1, Some(me.clone()), log, vec![(0, "x".into())]);
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
+        assert_eq!(p.commit_index, Some(0));
+        assert_eq!(p.last_applied, Some(0));
+        // No persist needed — recovered state already matches leader bootstrap.
+        let intent = p.drain_persist_intent();
+        assert!(intent.term.is_none());
+        assert!(intent.voted_for.is_none());
+    }
+
+    #[test]
+    fn multi_node_recover_resets_to_follower() {
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.leader = Some(me.clone());
+        p.recover(5, Some(me.clone()), Vec::new(), Vec::new());
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.leader, None);
+        assert_eq!(p.current_term, 5);
+    }
+
+    #[test]
+    fn old_leader_after_term_bump_chain_forwards() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
         let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
+        // Step down on a higher-term AppendEntries from b. AE sets leader=b.
+        let new_leader = NodeId::new("b", 1);
         let _ = p.handle_message(
-            NodeId::new("b", 1),
+            new_leader.clone(),
             RaftMessage::AppendEntries {
                 term: 7,
-                leader: NodeId::new("b", 1),
+                leader: new_leader.clone(),
                 prev_log_index: None,
                 prev_log_term: 0,
                 entries: vec![],
@@ -2073,14 +2409,21 @@ mod tests {
             },
         );
         assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.leader, Some(new_leader.clone()));
+        // c was holding stale state and forwards to us; we should chain-forward
+        // to the leader we now know about (b) rather than silently drop.
         let out = p.handle_message(
             NodeId::new("c", 1),
             RaftMessage::Forward {
                 value: "delayed".into(),
             },
         );
-        assert!(out.is_empty());
         assert!(p.log.is_empty());
+        let forward_to_b = out.iter().any(|o| {
+            matches!(&o.target, SendTarget::Peer(t) if t == &new_leader)
+                && matches!(&o.message, RaftMessage::Forward { value } if value == "delayed")
+        });
+        assert!(forward_to_b, "expected chain-forward to new leader");
     }
 
     #[test]
@@ -2126,50 +2469,5 @@ mod tests {
         assert_eq!(snap.commit_index, Some(0));
         assert_eq!(snap.last_applied, Some(0));
         assert!(matches!(snap.role, Some(crate::node::NodeRole::Follower)));
-    }
-
-    #[test]
-    fn single_node_recover_from_empty_state_resumes_as_leader() {
-        let me = NodeId::new("solo", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
-        p.recover(0, None, Vec::new(), Vec::new());
-        assert!(matches!(p.role, Role::Leader));
-        assert_eq!(p.current_term, 1);
-        assert_eq!(p.voted_for, Some(me.clone()));
-        assert_eq!(p.leader, Some(me));
-        let intent = p.drain_persist_intent();
-        assert_eq!(intent.term, Some(1));
-        assert!(intent.voted_for.is_some());
-    }
-
-    #[test]
-    fn single_node_recover_preserves_persisted_term_and_log() {
-        use crate::message::LogEntry;
-        let me = NodeId::new("solo", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
-        let log = vec![LogEntry {
-            term: 1,
-            value: "x".into(),
-        }];
-        p.recover(1, Some(me.clone()), log, vec![(0, "x".into())]);
-        assert!(matches!(p.role, Role::Leader));
-        assert_eq!(p.current_term, 1);
-        assert_eq!(p.commit_index, Some(0));
-        assert_eq!(p.last_applied, Some(0));
-        let intent = p.drain_persist_intent();
-        assert!(intent.term.is_none());
-        assert!(intent.voted_for.is_none());
-    }
-
-    #[test]
-    fn multi_node_recover_resets_to_follower() {
-        let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
-        p.role = Role::Leader;
-        p.leader = Some(me.clone());
-        p.recover(5, Some(me.clone()), Vec::new(), Vec::new());
-        assert!(matches!(p.role, Role::Follower));
-        assert_eq!(p.leader, None);
-        assert_eq!(p.current_term, 5);
     }
 }
