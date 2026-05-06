@@ -29,9 +29,10 @@ pub(crate) struct PersistIntent<V> {
     pub log_snapshot: Vec<LogEntry<V>>,
 }
 
-/// Raft state machine. Implements `ConsensusProtocol<V>` with stubbed message
-/// handling and `on_tick` for now; election and log-replication land in
-/// subsequent tasks.
+/// Raft peers begin in term 0 as followers; single-node clusters complete a
+/// one-vote election on the first tick. `recover()` resumes leadership for a
+/// lone peer only when persisted state shows it already won an election in the
+/// loaded term (`term > 0` and `voted_for` is self).
 pub(crate) struct RaftProtocol<V> {
     pub(crate) node_id: NodeId,
     pub(crate) total_nodes: usize,
@@ -91,44 +92,25 @@ where
 {
     pub(crate) fn new(node_id: NodeId, total_nodes: usize, config: RaftConfig) -> Self {
         let election_deadline = Instant::now() + sample_election_timeout(&config);
-        let (
-            role,
-            current_term,
-            voted_for,
-            leader,
-            pending_persist_term,
-            pending_persist_voted_for,
-        ) = if total_nodes == 1 {
-            (
-                Role::Leader,
-                1,
-                Some(node_id.clone()),
-                Some(node_id.clone()),
-                true,
-                true,
-            )
-        } else {
-            (Role::Follower, 0, None, None, false, false)
-        };
         Self {
             node_id,
             total_nodes,
             config,
-            current_term,
-            voted_for,
+            current_term: 0,
+            voted_for: None,
             log: Vec::new(),
             commit_index: None,
             last_applied: None,
-            role,
-            leader,
+            role: Role::Follower,
+            leader: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             election_deadline,
             votes_received: HashSet::new(),
             last_heartbeat_sent: None,
             pending_decisions: Vec::new(),
-            pending_persist_term,
-            pending_persist_voted_for,
+            pending_persist_term: false,
+            pending_persist_voted_for: false,
             pending_persist_log_from: None,
             pending_truncate_from: None,
             pending_proposals: Vec::new(),
@@ -166,9 +148,10 @@ where
     ///
     /// Role normally resets to Follower: a freshly-started node cannot assume
     /// it is still leader, and the election timeout will trigger a fresh
-    /// election if needed. Single-node clusters are the exception — there are
-    /// no peers to elect us, so we mirror the constructor's bootstrap and
-    /// resume directly as Leader at term ≥ 1 with a vote for self.
+    /// election if needed. For a single-node cluster, resume as Leader only when
+    /// durable state shows this node already won an election in the loaded term
+    /// (`term > 0` and `voted_for == self`); otherwise stay Follower at `term`
+    /// until the event loop runs an election.
     pub(crate) fn recover(
         &mut self,
         term: u64,
@@ -194,16 +177,15 @@ where
         self.match_index.clear();
 
         if self.total_nodes == 1 {
-            if self.current_term == 0 {
-                self.current_term = 1;
-                self.pending_persist_term = true;
+            let resume_leader =
+                self.current_term > 0 && self.voted_for.as_ref() == Some(&self.node_id);
+            if resume_leader {
+                self.role = Role::Leader;
+                self.leader = Some(self.node_id.clone());
+            } else {
+                self.role = Role::Follower;
+                self.leader = None;
             }
-            if self.voted_for.as_ref() != Some(&self.node_id) {
-                self.voted_for = Some(self.node_id.clone());
-                self.pending_persist_voted_for = true;
-            }
-            self.role = Role::Leader;
-            self.leader = Some(self.node_id.clone());
         } else {
             self.role = Role::Follower;
             self.leader = None;
@@ -298,6 +280,9 @@ where
         self.pending_persist_term = true;
         self.pending_persist_voted_for = true;
         tracing::debug!(term = self.current_term, "starting Raft election");
+        if self.votes_received.len() >= self.quorum() {
+            return self.become_leader();
+        }
         vec![Outgoing {
             target: SendTarget::Broadcast,
             message: RaftMessage::RequestVote {
@@ -579,7 +564,6 @@ where
         conflict_term: Option<u64>,
         conflict_index: Option<u64>,
     ) -> Vec<Outgoing<RaftMessage<V>>> {
-        let _ = conflict_term;
         if !matches!(self.role, Role::Leader) || term != self.current_term {
             return Vec::new();
         }
@@ -591,15 +575,29 @@ where
             }
             Vec::new()
         } else {
+            let log_len = self.log.len() as u64;
             let new_next = if let Some(ci) = conflict_index {
-                ci
+                if let Some(ct) = conflict_term {
+                    if let Some(last_same_term_idx) = self
+                        .log
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, e)| e.term == ct)
+                        .map(|(i, _)| i as u64)
+                    {
+                        last_same_term_idx.saturating_add(1)
+                    } else {
+                        ci
+                    }
+                } else {
+                    ci
+                }
             } else {
-                let cur = *self
-                    .next_index
-                    .get(&from)
-                    .unwrap_or(&(self.log.len() as u64));
+                let cur = *self.next_index.get(&from).unwrap_or(&log_len);
                 cur.saturating_sub(1)
             };
+            let new_next = new_next.min(log_len);
             self.next_index.insert(from.clone(), new_next);
             let prev = if new_next == 0 {
                 None
@@ -1768,6 +1766,61 @@ mod tests {
     }
 
     #[test]
+    fn leader_uses_conflict_term_to_skip_shared_prefix() {
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 7;
+        p.leader = Some(me.clone());
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "c".into(),
+            },
+            LogEntry {
+                term: 7,
+                value: "d".into(),
+            },
+            LogEntry {
+                term: 7,
+                value: "e".into(),
+            },
+        ];
+        p.next_index.insert(b.clone(), 5);
+        let out = p.handle_message(
+            b.clone(),
+            RaftMessage::AppendEntriesResponse {
+                term: 7,
+                success: false,
+                match_index: None,
+                conflict_term: Some(1),
+                conflict_index: Some(0),
+            },
+        );
+        assert_eq!(p.next_index.get(&b), Some(&3));
+        match &out[0].message {
+            RaftMessage::AppendEntries {
+                prev_log_index: Some(2),
+                entries,
+                ..
+            } => {
+                assert_eq!(entries.len(), 2);
+            }
+            other => panic!("expected re-send from index 3, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn drain_persist_intent_returns_pending_state_and_clears_flags() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
@@ -2028,21 +2081,27 @@ mod tests {
     }
 
     #[test]
-    fn single_node_raft_starts_as_leader() {
+    fn single_node_raft_starts_as_follower_with_zero_term() {
         let p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
-        assert!(matches!(p.role, Role::Leader));
-        assert_eq!(p.current_term, 1);
-        assert_eq!(p.voted_for, Some(p.node_id.clone()));
-        assert_eq!(p.leader, Some(p.node_id.clone()));
-        assert!(p.pending_persist_term);
-        assert!(p.pending_persist_voted_for);
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.current_term, 0);
+        assert!(p.voted_for.is_none());
+        assert!(p.leader.is_none());
+        assert!(!p.pending_persist_term);
+        assert!(!p.pending_persist_voted_for);
     }
 
     #[test]
-    fn single_node_raft_commits_immediately_on_propose() {
+    fn single_node_raft_commits_after_solo_election() {
         let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
         let _ =
             <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.pending_proposals, vec!["hello".to_string()]);
+        p.election_deadline = Instant::now() - Duration::from_millis(1);
+        let _ = p.on_tick(Instant::now());
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.current_term, 1);
         assert_eq!(p.commit_index, Some(0));
         let decisions = p.take_decisions();
         assert_eq!(decisions.len(), 1);
@@ -2334,25 +2393,30 @@ mod tests {
     }
 
     #[test]
-    fn single_node_raft_drains_initial_persist_intent() {
+    fn single_node_raft_no_persist_intent_until_election() {
         let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
         let intent = p.drain_persist_intent();
+        assert!(intent.term.is_none());
+        assert!(intent.voted_for.is_none());
+        p.election_deadline = Instant::now() - Duration::from_millis(1);
+        let _ = p.on_tick(Instant::now());
+        let intent = p.drain_persist_intent();
         assert_eq!(intent.term, Some(1));
-        assert!(intent.voted_for.is_some());
+        assert_eq!(intent.voted_for, Some(Some(p.node_id.clone())));
     }
 
     #[test]
-    fn single_node_recover_from_empty_state_resumes_as_leader() {
+    fn single_node_recover_from_empty_storage_starts_as_follower() {
         let me = NodeId::new("solo", 1);
         let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
         p.recover(0, None, Vec::new(), Vec::new());
-        assert!(matches!(p.role, Role::Leader));
-        assert_eq!(p.current_term, 1);
-        assert_eq!(p.voted_for, Some(me.clone()));
-        assert_eq!(p.leader, Some(me));
+        assert!(matches!(p.role, Role::Follower));
+        assert_eq!(p.current_term, 0);
+        assert!(p.voted_for.is_none());
+        assert!(p.leader.is_none());
         let intent = p.drain_persist_intent();
-        assert_eq!(intent.term, Some(1));
-        assert!(intent.voted_for.is_some());
+        assert!(intent.term.is_none());
+        assert!(intent.voted_for.is_none());
     }
 
     #[test]

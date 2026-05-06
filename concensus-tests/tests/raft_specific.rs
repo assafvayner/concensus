@@ -407,10 +407,9 @@ async fn invariant_checker_observes_decisions() {
 
 /// Single-node Raft end-to-end through the Node abstraction.
 ///
-/// `RaftProtocol::new(_, 1, _)` bootstraps the sole node as Leader at term 1.
-/// `recover()` mirrors that bootstrap when `total_nodes == 1`, so the node
-/// resumes as Leader after `Node::run`'s recovery step and the no-peer event
-/// loop can drive proposals to commit immediately (single-node quorum is 1).
+/// The peer starts in term 0; the node's tick loop completes an election so it
+/// becomes leader, then proposals replicate with quorum 1. After restart with a
+/// durable vote for self in the loaded term, `recover()` resumes leadership.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_node_raft_end_to_end() {
     let mut cluster = create_raft_cluster(1);

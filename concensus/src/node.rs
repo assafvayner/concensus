@@ -114,7 +114,9 @@ const DECISION_CHANNEL_CAPACITY: usize = 1024;
 /// # Single-Node Mode
 ///
 /// When constructed with an empty peer list, the node acts as a single-node
-/// cluster and decides values immediately without network communication.
+/// cluster. Multi-Paxos decides values as soon as the leader proposes. Raft
+/// starts in term 0; the event loop runs periodic ticks so the peer can complete
+/// its one-vote election before replication commits with quorum 1.
 pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
     peers: Vec<PeerInfo<S>>,
@@ -457,7 +459,9 @@ where
                     }
                 }
             } else {
-                // No peers — single node, only listen for proposals
+                // No peers — single-node cluster. Still run `on_tick` so Raft can
+                // complete an initial election and send leader heartbeats; Paxos
+                // uses ticks for its leader-side timers as well.
                 tokio::select! {
                     proposal = self.proposal_rx.recv() => {
                         match proposal {
@@ -467,6 +471,9 @@ where
                                 return Ok(());
                             }
                         }
+                    }
+                    _ = retry_interval.tick() => {
+                        self.handle_retries(&senders).await?;
                     }
                 }
             }
@@ -970,8 +977,8 @@ mod tests {
         let s = node.peek_state();
         assert_eq!(s.node_id, id);
         assert_eq!(s.algorithm, crate::config::ConsensusAlgorithm::Raft);
-        // Single-node Raft starts as Leader at term 1 (per RaftProtocol::new logic).
-        assert_eq!(s.term, 1);
-        assert!(matches!(s.role, Some(NodeRole::Leader)));
+        // Before `run()`, Raft is a follower at term 0 (paper-aligned bootstrap).
+        assert_eq!(s.term, 0);
+        assert!(matches!(s.role, Some(NodeRole::Follower)));
     }
 }

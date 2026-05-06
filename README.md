@@ -7,7 +7,7 @@ A consensus library in Rust with pluggable transports and storage. Supports both
 `concensus` implements two consensus algorithms behind a single `Node` API:
 
 - **Multi-Paxos** (default) — leader-based optimization of Classic Paxos with Phase 1 skip on the steady-state leader, exponential-backoff retries, and nack-based conflict resolution.
-- **Raft** — strong-leader consensus with randomized election timeouts, log-replication via `AppendEntries`, persistent term/votedFor/log state, and conflict-index optimization for fast follower catch-up.
+- **Raft** — strong-leader consensus with randomized election timeouts, log-replication via `AppendEntries`, persistent term/votedFor/log state, and conflict-index / conflict-term hints for fast follower catch-up.
 
 Both algorithms expose the same external interface: `NodeHandle::propose` to submit values and `DecisionReceiver` to observe ordered decisions. The choice is per-cluster — every node in a cluster must run the same algorithm.
 
