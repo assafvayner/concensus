@@ -774,6 +774,8 @@ where
         Vec::new()
     }
 
+    // A Leader is never idle — it sends periodic heartbeats. Only Followers and
+    // Candidates with no log entries and no buffered proposals count as idle.
     fn is_idle(&self) -> bool {
         self.log.is_empty()
             && self.pending_proposals.is_empty()
