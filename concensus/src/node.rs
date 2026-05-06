@@ -784,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn paxos_node_drops_raft_messages_silently() {
-        use crate::config::NodeId;
+        use crate::config::{NodeId, PeerInfo};
         use crate::message::{Message, RaftMessage, WireVariant};
         use bytes::Bytes;
         use std::sync::Arc;
@@ -822,23 +822,32 @@ mod tests {
             once: Arc::new(Mutex::new(Some(bytes))),
         };
 
-        // Build a 1-node Paxos cluster with the synthetic receiver.
+        // 2-node Paxos cluster — multi-peer mode polls the receiver, so the
+        // injected Raft message will be dispatched through ProtocolImpl::handle_wire_message
+        // and hit the cross-algorithm rejection arm.
         let id = NodeId::new("paxos-node", 1);
+        let peer_id = NodeId::new("dummy-peer", 1);
         let (node, handle, mut decisions) = Node::<String, DummySender, OneShot>::with_id(
             id,
-            vec![],
+            vec![PeerInfo {
+                id: peer_id,
+                sender: DummySender,
+            }],
             one_shot,
             MemoryStorage::new(),
         );
         let run_handle = tokio::spawn(node.run());
 
-        // Wait briefly. The Raft message should be processed (and dropped) without panic.
+        // Wait for the receiver to be polled and the Raft bytes to be processed.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // The decision channel should remain empty.
+        // No decision should have been delivered.
         let decision =
             tokio::time::timeout(std::time::Duration::from_millis(100), decisions.recv()).await;
         assert!(decision.is_err(), "no decision should have been delivered");
+
+        // Run task is still alive (no panic).
+        assert!(!run_handle.is_finished(), "node should still be running");
 
         // Cluster shutdown
         drop(handle);
