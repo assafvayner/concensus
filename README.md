@@ -1,10 +1,15 @@
 # concensus
 
-A Paxos consensus library in Rust with pluggable transports and storage.
+A consensus library in Rust with pluggable transports and storage. Supports both Multi-Paxos (default) and Raft.
 
 ## Overview
 
-`concensus` implements the Classic Paxos (Multi-Paxos) consensus protocol as an async Rust library. Nodes coordinate over configurable transport layers to agree on an ordered sequence of values, each assigned to a numbered slot. The library handles leader election, proposal retries with exponential backoff, nack-based conflict resolution, and decision re-broadcasting for late joiners.
+`concensus` implements two consensus algorithms behind a single `Node` API:
+
+- **Multi-Paxos** (default) — leader-based optimization of Classic Paxos with Phase 1 skip on the steady-state leader, exponential-backoff retries, and nack-based conflict resolution.
+- **Raft** — strong-leader consensus with randomized election timeouts, log-replication via `AppendEntries`, persistent term/votedFor/log state, and conflict-index optimization for fast follower catch-up.
+
+Both algorithms expose the same external interface: `NodeHandle::propose` to submit values and `DecisionReceiver` to observe ordered decisions. The choice is per-cluster — every node in a cluster must run the same algorithm.
 
 Quorum is `(N/2) + 1` where N is the total number of nodes.
 
@@ -69,6 +74,34 @@ while let Some(decided) = decision_rx.recv().await {
 }
 ```
 
+## Choosing an algorithm
+
+`Node::new` and `Node::with_id` run Multi-Paxos and require storage that implements `Storage<V>`. To run Raft instead, use `Node::with_raft_config` and provide storage that implements `RaftStorage<V>` (which extends `Storage<V>` with persistent log + current term + votedFor).
+
+```rust
+use concensus::{Node, NodeId, MemoryStorage, RaftConfig};
+
+// MemoryStorage implements both Storage and RaftStorage.
+let storage = MemoryStorage::<String>::new();
+let (node, handle, mut decisions) = Node::with_raft_config(
+    NodeId::new("node-1", 0),
+    RaftConfig::default(),
+    peer_infos,
+    receiver,
+    storage,
+);
+```
+
+| Constructor | Algorithm | Storage requirement |
+|-------------|-----------|---------------------|
+| `Node::new` / `Node::with_id` | Multi-Paxos | `Storage<V>` |
+| `Node::with_paxos_config` | Multi-Paxos | `Storage<V>` |
+| `Node::with_raft_config` | Raft | `RaftStorage<V>` |
+
+`MemoryStorage<V>` implements both traits and is suitable for tests and ephemeral deployments. For production Raft deployments, provide a `RaftStorage` implementation that durably persists the current term, vote, and log on every state change before any wire message is sent.
+
+Cross-algorithm wire messages are silently dropped, so a Paxos node and a Raft node cannot accidentally interfere with each other.
+
 ## Feature Flags
 
 | Feature | Description |
@@ -82,12 +115,16 @@ while let Some(decided) = decision_rx.recv().await {
 
 | Type | Description |
 |------|-------------|
-| `Node<V, S, R>` | Consensus node — runs the Paxos event loop |
+| `Node<V, S, R>` | Consensus node — runs the Paxos or Raft event loop |
 | `NodeHandle<V>` | Cloneable handle for submitting proposals |
 | `Decided<V>` | A decided value with its slot number |
 | `DecisionReceiver<V>` | Channel receiver for consensus decisions |
 | `NodeId` | Node identifier (name + incarnation) |
-| `MemoryStorage<V>` | In-memory storage implementation |
+| `MemoryStorage<V>` | In-memory storage (implements both `Storage` and `RaftStorage`) |
+| `NodeConfig` | Algorithm + per-algorithm tuning, used by `Node::with_*_config` |
+| `ConsensusAlgorithm` | `Paxos` \| `Raft` discriminator |
+| `PaxosConfig` | Multi-Paxos tuning (retries, backoff) |
+| `RaftConfig` | Raft tuning (election timeout, heartbeat interval) |
 
 ### Traits
 
@@ -95,7 +132,8 @@ while let Some(decided) = decision_rx.recv().await {
 |-------|-------------|
 | `MessageSender` | Send bytes to a peer |
 | `MessageReceiver` | Receive bytes from peers |
-| `Storage<V>` | Persist and load decisions |
+| `Storage<V>` | Persist and load decided slot values (used by Multi-Paxos) |
+| `RaftStorage<V>` | Extends `Storage<V>` with persistent log entries, current term, and votedFor (required by Raft) |
 
 ## Workspace Crates
 
@@ -132,6 +170,10 @@ A Docker-based demo that runs a 3-node Paxos cluster with a gRPC API and CLI cli
 **Transport options:**
 - TCP (`docker-compose.tcp.yml`) — nodes communicate over a Docker bridge network
 - UDS (`docker-compose.uds.yml`) — nodes communicate via Unix domain sockets on a shared volume
+
+**Algorithm options:**
+- Multi-Paxos (default)
+- Raft (`docker-compose.raft.yml`, or set `ALGORITHM=raft` on the node binary)
 
 #### Quick Start
 
