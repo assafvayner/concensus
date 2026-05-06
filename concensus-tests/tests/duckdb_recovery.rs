@@ -2,7 +2,9 @@ mod helpers;
 
 use std::path::PathBuf;
 
-use concensus::{channel, ChannelSender, Decided, DuckDbStorage, Node, NodeId, PeerInfo};
+use concensus::{
+    channel, ChannelSender, Decided, DuckDbStorage, Node, NodeId, PeerInfo, ProposalNumber, Storage,
+};
 use tokio::time::{timeout, Duration};
 
 /// Create a temp directory and return a path like `{tmp}/concensus-integ-{pid}/{name}.db`.
@@ -127,10 +129,14 @@ async fn collect_until_value(
     }
 }
 
-/// Clean up temp DB files for this process.
-fn cleanup_temp_dir() {
-    let dir = std::env::temp_dir().join(format!("concensus-integ-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn cleanup_db_paths(db_paths: &[PathBuf; 3]) {
+    for path in db_paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn proposal_number(round: u64, node_id: &NodeId) -> ProposalNumber {
+    (round, node_id.clone())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -177,7 +183,55 @@ async fn duckdb_node_recovers_decisions_after_crash() {
     }
 
     teardown(handles2, decisions2, run_handles2);
-    cleanup_temp_dir();
+    cleanup_db_paths(&db_paths);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duckdb_restores_accepted_value_for_later_proposer() {
+    let ids: [NodeId; 3] = [
+        NodeId::new("node-0", 1000),
+        NodeId::new("node-1", 1000),
+        NodeId::new("node-2", 1000),
+    ];
+
+    let db_paths: [PathBuf; 3] = [
+        temp_db_path("restore-accepted-node-0"),
+        temp_db_path("restore-accepted-node-1"),
+        temp_db_path("restore-accepted-node-2"),
+    ];
+
+    {
+        let mut storage = DuckDbStorage::<String>::new(&db_paths[0])
+            .expect("failed to open DuckDB for preloaded node-0");
+        let accepted_proposal = proposal_number(1, &ids[0]);
+        storage
+            .save_acceptor_state(
+                0,
+                Some(accepted_proposal.clone()),
+                Some((accepted_proposal, "accepted-before-crash".to_string())),
+            )
+            .await
+            .expect("failed to preload acceptor state");
+    }
+
+    let (handles, mut decisions, run_handles) = build_cluster_with_duckdb(&ids, &db_paths);
+
+    handles[1]
+        .propose("new-after-restart".to_string())
+        .await
+        .unwrap();
+
+    for dec in &mut decisions {
+        let decided = timeout(Duration::from_secs(5), dec.recv())
+            .await
+            .expect("timed out waiting for decision")
+            .expect("decision channel closed");
+        assert_eq!(decided.slot, 0);
+        assert_eq!(decided.value, "accepted-before-crash");
+    }
+
+    teardown(handles, decisions, run_handles);
+    cleanup_db_paths(&db_paths);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -245,5 +299,5 @@ async fn duckdb_recovered_node_does_not_replay_old_decisions() {
     }
 
     teardown(handles2, decisions2, run_handles2);
-    cleanup_temp_dir();
+    cleanup_db_paths(&db_paths);
 }

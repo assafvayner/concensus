@@ -7,6 +7,7 @@ use duckdb::params;
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::{AcceptorState, Storage};
+use crate::config::NodeId;
 use crate::error::StorageError;
 use crate::message::ProposalNumber;
 
@@ -34,8 +35,13 @@ impl<V> DuckDbStorage<V> {
             );
             CREATE TABLE IF NOT EXISTS acceptor_state (
                 slot UBIGINT PRIMARY KEY,
-                highest_promised TEXT,
-                accepted TEXT
+                highest_promised_round UBIGINT,
+                highest_promised_node_name TEXT,
+                highest_promised_node_incarnation UBIGINT,
+                accepted_round UBIGINT,
+                accepted_node_name TEXT,
+                accepted_node_incarnation UBIGINT,
+                accepted_value TEXT
             );",
         )
         .map_err(|e| StorageError::Load(format!("failed to create tables: {e}")))?;
@@ -44,6 +50,116 @@ impl<V> DuckDbStorage<V> {
             conn: Arc::new(Mutex::new(conn)),
             _phantom: PhantomData,
         })
+    }
+}
+
+struct ProposalNumberColumns {
+    round: Option<u64>,
+    node_name: Option<String>,
+    node_incarnation: Option<u64>,
+}
+
+impl ProposalNumberColumns {
+    fn empty() -> Self {
+        Self {
+            round: None,
+            node_name: None,
+            node_incarnation: None,
+        }
+    }
+
+    fn from_proposal_number(proposal_number: ProposalNumber) -> Self {
+        let (round, node_id) = proposal_number;
+        Self {
+            round: Some(round),
+            node_name: Some(node_id.name().to_string()),
+            node_incarnation: Some(node_id.incarnation()),
+        }
+    }
+
+    fn into_proposal_number(self, slot: u64, label: &str) -> Option<Option<ProposalNumber>> {
+        match (self.round, self.node_name, self.node_incarnation) {
+            (None, None, None) => Some(None),
+            (Some(round), Some(node_name), Some(node_incarnation)) => {
+                Some(Some((round, NodeId::new(node_name, node_incarnation))))
+            }
+            _ => {
+                tracing::warn!(
+                    slot,
+                    label,
+                    "skipping acceptor state with incomplete proposal number"
+                );
+                None
+            }
+        }
+    }
+}
+
+fn split_proposal_number(proposal_number: Option<ProposalNumber>) -> ProposalNumberColumns {
+    proposal_number.map_or_else(
+        ProposalNumberColumns::empty,
+        ProposalNumberColumns::from_proposal_number,
+    )
+}
+
+struct AcceptedColumns {
+    proposal_number: ProposalNumberColumns,
+    value_json: Option<String>,
+}
+
+fn split_accepted<V>(accepted: Option<(ProposalNumber, V)>) -> Result<AcceptedColumns, StorageError>
+where
+    V: Serialize,
+{
+    match accepted {
+        Some((proposal_number, value)) => {
+            let value_json = serde_json::to_string(&value).map_err(|e| {
+                StorageError::Persist(format!("failed to serialize accepted value: {e}"))
+            })?;
+            Ok(AcceptedColumns {
+                proposal_number: ProposalNumberColumns::from_proposal_number(proposal_number),
+                value_json: Some(value_json),
+            })
+        }
+        None => Ok(AcceptedColumns {
+            proposal_number: ProposalNumberColumns::empty(),
+            value_json: None,
+        }),
+    }
+}
+
+fn restore_accepted<V>(
+    slot: u64,
+    proposal_number: ProposalNumberColumns,
+    value_json: Option<String>,
+) -> Option<Option<(ProposalNumber, V)>>
+where
+    V: DeserializeOwned,
+{
+    match (
+        proposal_number.into_proposal_number(slot, "accepted"),
+        value_json,
+    ) {
+        (Some(None), None) => Some(None),
+        (Some(Some(proposal_number)), Some(value_json)) => {
+            match serde_json::from_str::<V>(&value_json) {
+                Ok(value) => Some(Some((proposal_number, value))),
+                Err(e) => {
+                    tracing::warn!(
+                        slot,
+                        "skipping acceptor state with bad accepted value JSON: {e}"
+                    );
+                    None
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(
+                slot,
+                "skipping acceptor state with incomplete accepted value"
+            );
+            None
+        }
     }
 }
 
@@ -115,29 +231,37 @@ where
         highest_promised: Option<ProposalNumber>,
         accepted: Option<(ProposalNumber, V)>,
     ) -> Result<(), StorageError> {
-        let hp_json = highest_promised
-            .map(|hp| serde_json::to_string(&hp))
-            .transpose()
-            .map_err(|e| {
-                StorageError::Persist(format!("failed to serialize highest_promised: {e}"))
-            })?;
-        let accepted_json = accepted
-            .map(|a| serde_json::to_string(&a))
-            .transpose()
-            .map_err(|e| StorageError::Persist(format!("failed to serialize accepted: {e}")))?;
+        let highest_promised = split_proposal_number(highest_promised);
+        let accepted = split_accepted(accepted)?;
 
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().map_err(|e| {
-                StorageError::Persist(format!("failed to lock connection: {e}"))
-            })?;
+            let conn = conn
+                .lock()
+                .map_err(|e| StorageError::Persist(format!("failed to lock connection: {e}")))?;
             conn.execute(
-                "INSERT OR REPLACE INTO acceptor_state (slot, highest_promised, accepted) VALUES (?, ?, ?)",
-                params![slot, hp_json, accepted_json],
+                "INSERT OR REPLACE INTO acceptor_state (
+                    slot,
+                    highest_promised_round,
+                    highest_promised_node_name,
+                    highest_promised_node_incarnation,
+                    accepted_round,
+                    accepted_node_name,
+                    accepted_node_incarnation,
+                    accepted_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    slot,
+                    highest_promised.round,
+                    highest_promised.node_name,
+                    highest_promised.node_incarnation,
+                    accepted.proposal_number.round,
+                    accepted.proposal_number.node_name,
+                    accepted.proposal_number.node_incarnation,
+                    accepted.value_json,
+                ],
             )
-            .map_err(|e| {
-                StorageError::Persist(format!("failed to insert acceptor state: {e}"))
-            })?;
+            .map_err(|e| StorageError::Persist(format!("failed to insert acceptor state: {e}")))?;
             Ok(())
         })
         .await
@@ -151,48 +275,53 @@ where
                 .lock()
                 .map_err(|e| StorageError::Load(format!("failed to lock connection: {e}")))?;
             let mut stmt = conn
-                .prepare("SELECT slot, highest_promised, accepted FROM acceptor_state")
+                .prepare(
+                    "SELECT
+                        slot,
+                        highest_promised_round,
+                        highest_promised_node_name,
+                        highest_promised_node_incarnation,
+                        accepted_round,
+                        accepted_node_name,
+                        accepted_node_incarnation,
+                        accepted_value
+                    FROM acceptor_state",
+                )
                 .map_err(|e| StorageError::Load(format!("failed to prepare query: {e}")))?;
             let rows = stmt
                 .query_map([], |row| {
                     let slot: u64 = row.get(0)?;
-                    let hp_json: Option<String> = row.get(1)?;
-                    let accepted_json: Option<String> = row.get(2)?;
-                    Ok((slot, hp_json, accepted_json))
+                    Ok((
+                        slot,
+                        ProposalNumberColumns {
+                            round: row.get(1)?,
+                            node_name: row.get(2)?,
+                            node_incarnation: row.get(3)?,
+                        },
+                        ProposalNumberColumns {
+                            round: row.get(4)?,
+                            node_name: row.get(5)?,
+                            node_incarnation: row.get(6)?,
+                        },
+                        row.get(7)?,
+                    ))
                 })
                 .map_err(|e| StorageError::Load(format!("failed to query acceptor states: {e}")))?;
 
             let mut states = Vec::new();
             for row in rows {
-                let (slot, hp_json, accepted_json) =
+                let (slot, highest_promised_columns, accepted_columns, accepted_value_json) =
                     row.map_err(|e| StorageError::Load(format!("failed to read row: {e}")))?;
 
-                let highest_promised = match hp_json {
-                    Some(json) => match serde_json::from_str::<ProposalNumber>(&json) {
-                        Ok(hp) => Some(hp),
-                        Err(e) => {
-                            tracing::warn!(
-                                slot,
-                                "skipping acceptor state with bad highest_promised JSON: {e}"
-                            );
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
+                let highest_promised =
+                    match highest_promised_columns.into_proposal_number(slot, "highest_promised") {
+                        Some(highest_promised) => highest_promised,
+                        None => continue,
+                    };
 
-                let accepted = match accepted_json {
-                    Some(json) => match serde_json::from_str::<(ProposalNumber, V)>(&json) {
-                        Ok(a) => Some(a),
-                        Err(e) => {
-                            tracing::warn!(
-                                slot,
-                                "skipping acceptor state with bad accepted JSON: {e}"
-                            );
-                            continue;
-                        }
-                    },
-                    None => None,
+                let accepted = match restore_accepted(slot, accepted_columns, accepted_value_json) {
+                    Some(accepted) => accepted,
+                    None => continue,
                 };
 
                 states.push(AcceptorState {
@@ -226,10 +355,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::NodeId;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
-    fn temp_db_path() -> std::path::PathBuf {
+    use crate::config::NodeId;
+    use crate::message::ProposalNumber;
+    use crate::storage::{DuckDbStorage, Storage};
+
+    use duckdb::params;
+
+    fn temp_db_path() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("concensus-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{}.db", rand::random::<u64>()))
@@ -252,6 +387,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duckdb_acceptor_state_schema_uses_typed_columns() {
+        let path = temp_db_path();
+        let _storage = DuckDbStorage::<String>::new(&path).unwrap();
+        let conn = duckdb::Connection::open(&path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info('acceptor_state')").unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .unwrap();
+        let columns: HashSet<(String, String)> = rows.map(|row| row.unwrap()).collect();
+        let column_names: HashSet<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert!(column_names.contains("slot"));
+        assert!(columns.contains(&("slot".to_string(), "UBIGINT".to_string())));
+        assert!(column_names.contains("highest_promised_round"));
+        assert!(columns.contains(&("highest_promised_round".to_string(), "UBIGINT".to_string())));
+        assert!(column_names.contains("highest_promised_node_name"));
+        assert!(columns.contains(&(
+            "highest_promised_node_name".to_string(),
+            "VARCHAR".to_string()
+        )));
+        assert!(column_names.contains("highest_promised_node_incarnation"));
+        assert!(columns.contains(&(
+            "highest_promised_node_incarnation".to_string(),
+            "UBIGINT".to_string()
+        )));
+        assert!(column_names.contains("accepted_round"));
+        assert!(columns.contains(&("accepted_round".to_string(), "UBIGINT".to_string())));
+        assert!(column_names.contains("accepted_node_name"));
+        assert!(columns.contains(&("accepted_node_name".to_string(), "VARCHAR".to_string())));
+        assert!(column_names.contains("accepted_node_incarnation"));
+        assert!(columns.contains(&(
+            "accepted_node_incarnation".to_string(),
+            "UBIGINT".to_string()
+        )));
+        assert!(column_names.contains("accepted_value"));
+        assert!(columns.contains(&("accepted_value".to_string(), "VARCHAR".to_string())));
+        assert!(!column_names.contains("highest_promised"));
+        assert!(!column_names.contains("accepted"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn duckdb_save_and_load_decisions() {
         let path = temp_db_path();
         let mut storage = DuckDbStorage::new(&path).unwrap();
@@ -263,6 +443,20 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         assert!(decisions.contains(&(0, "hello".to_string())));
         assert!(decisions.contains(&(2, "world".to_string())));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn duckdb_save_decision_replaces_existing_value() {
+        let path = temp_db_path();
+        let mut storage = DuckDbStorage::new(&path).unwrap();
+
+        storage.save_decision(7, "old".to_string()).await.unwrap();
+        storage.save_decision(7, "new".to_string()).await.unwrap();
+
+        let decisions = storage.load_decisions().await.unwrap();
+        assert_eq!(decisions, vec![(7, "new".to_string())]);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -302,6 +496,41 @@ mod tests {
         assert_eq!(states[0].highest_promised, Some(make_pn(2)));
         assert_eq!(states[0].accepted, Some((make_pn(1), "hello".to_string())));
 
+        let conn = duckdb::Connection::open(&path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT
+                    highest_promised_round,
+                    highest_promised_node_name,
+                    highest_promised_node_incarnation,
+                    accepted_round,
+                    accepted_node_name,
+                    accepted_node_incarnation,
+                    accepted_value
+                FROM acceptor_state
+                WHERE slot = ?",
+                params![1u64],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 2);
+        assert_eq!(row.1, "node-1");
+        assert_eq!(row.2, 1000);
+        assert_eq!(row.3, 1);
+        assert_eq!(row.4, "node-1");
+        assert_eq!(row.5, 1000);
+        assert_eq!(row.6, serde_json::to_string(&"hello".to_string()).unwrap());
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -318,6 +547,30 @@ mod tests {
 
         storage.save_decision(1, "hello".to_string()).await.unwrap();
         assert!(storage.load_acceptor_states().await.unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn duckdb_save_decision_only_cleans_matching_acceptor_state() {
+        let path = temp_db_path();
+        let mut storage = DuckDbStorage::new(&path).unwrap();
+
+        storage
+            .save_acceptor_state(1, Some(make_pn(1)), Some((make_pn(1), "one".to_string())))
+            .await
+            .unwrap();
+        storage
+            .save_acceptor_state(2, Some(make_pn(2)), Some((make_pn(2), "two".to_string())))
+            .await
+            .unwrap();
+
+        storage.save_decision(1, "one".to_string()).await.unwrap();
+
+        let states = storage.load_acceptor_states().await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].slot, 2);
+        assert_eq!(states[0].accepted, Some((make_pn(2), "two".to_string())));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -361,10 +614,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duckdb_save_acceptor_state_upsert_clears_accepted_columns() {
+        let path = temp_db_path();
+        let mut storage = DuckDbStorage::<String>::new(&path).unwrap();
+
+        storage
+            .save_acceptor_state(1, Some(make_pn(2)), Some((make_pn(1), "old".to_string())))
+            .await
+            .unwrap();
+        storage
+            .save_acceptor_state(1, Some(make_pn(3)), None)
+            .await
+            .unwrap();
+
+        let states = storage.load_acceptor_states().await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].highest_promised, Some(make_pn(3)));
+        assert!(states[0].accepted.is_none());
+
+        let conn = duckdb::Connection::open(&path).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT
+                    accepted_round,
+                    accepted_node_name,
+                    accepted_node_incarnation,
+                    accepted_value
+                FROM acceptor_state
+                WHERE slot = ?",
+                params![1u64],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, None, None));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn duckdb_persistence_survives_reopen() {
         let path = temp_db_path();
 
-        // Write data and drop
         {
             let mut storage = DuckDbStorage::new(&path).unwrap();
             storage.save_decision(0, "hello".to_string()).await.unwrap();
@@ -374,7 +671,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Reopen and verify
         {
             let storage = DuckDbStorage::<String>::new(&path).unwrap();
             let decisions = storage.load_decisions().await.unwrap();
@@ -387,6 +683,176 @@ mod tests {
             assert_eq!(states[0].highest_promised, Some(make_pn(3)));
             assert_eq!(states[0].accepted, Some((make_pn(2), "world".to_string())));
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn duckdb_load_decisions_skips_bad_json_rows() {
+        let path = temp_db_path();
+        {
+            let mut storage = DuckDbStorage::new(&path).unwrap();
+            storage.save_decision(0, "valid".to_string()).await.unwrap();
+        }
+
+        let conn = duckdb::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO decisions (slot, value) VALUES (?, ?)",
+            params![1u64, "{not-json"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = DuckDbStorage::<String>::new(&path).unwrap();
+        let decisions = storage.load_decisions().await.unwrap();
+        assert_eq!(decisions, vec![(0, "valid".to_string())]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn duckdb_load_acceptor_states_skips_invalid_rows() {
+        let path = temp_db_path();
+
+        {
+            let mut storage = DuckDbStorage::<String>::new(&path).unwrap();
+            storage
+                .save_acceptor_state(
+                    5,
+                    Some(make_pn(3)),
+                    Some((make_pn(2), "accepted".to_string())),
+                )
+                .await
+                .unwrap();
+        }
+
+        let conn = duckdb::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO acceptor_state (
+                slot,
+                highest_promised_round,
+                highest_promised_node_name,
+                highest_promised_node_incarnation,
+                accepted_round,
+                accepted_node_name,
+                accepted_node_incarnation,
+                accepted_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                6u64,
+                4u64,
+                Option::<String>::None,
+                1000u64,
+                Option::<u64>::None,
+                Option::<String>::None,
+                Option::<u64>::None,
+                Option::<String>::None,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acceptor_state (
+                slot,
+                highest_promised_round,
+                highest_promised_node_name,
+                highest_promised_node_incarnation,
+                accepted_round,
+                accepted_node_name,
+                accepted_node_incarnation,
+                accepted_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                7u64,
+                3u64,
+                "node-1",
+                1000u64,
+                2u64,
+                Option::<String>::None,
+                1000u64,
+                serde_json::to_string(&"accepted".to_string()).unwrap(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acceptor_state (
+                slot,
+                highest_promised_round,
+                highest_promised_node_name,
+                highest_promised_node_incarnation,
+                accepted_round,
+                accepted_node_name,
+                accepted_node_incarnation,
+                accepted_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                8u64,
+                3u64,
+                "node-1",
+                1000u64,
+                2u64,
+                "node-1",
+                1000u64,
+                "{bad-accepted",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acceptor_state (
+                slot,
+                highest_promised_round,
+                highest_promised_node_name,
+                highest_promised_node_incarnation,
+                accepted_round,
+                accepted_node_name,
+                accepted_node_incarnation,
+                accepted_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                9u64,
+                3u64,
+                "node-1",
+                1000u64,
+                Option::<u64>::None,
+                Option::<String>::None,
+                Option::<u64>::None,
+                serde_json::to_string(&"accepted-without-proposal".to_string()).unwrap(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acceptor_state (
+                slot,
+                highest_promised_round,
+                highest_promised_node_name,
+                highest_promised_node_incarnation,
+                accepted_round,
+                accepted_node_name,
+                accepted_node_incarnation,
+                accepted_value
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                10u64,
+                3u64,
+                "node-1",
+                1000u64,
+                2u64,
+                "node-1",
+                1000u64,
+                Option::<String>::None,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = DuckDbStorage::<String>::new(&path).unwrap();
+        let states = storage.load_acceptor_states().await.unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].slot, 5);
+        assert_eq!(states[0].highest_promised, Some(make_pn(3)));
+        assert_eq!(
+            states[0].accepted,
+            Some((make_pn(2), "accepted".to_string()))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
