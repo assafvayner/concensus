@@ -40,6 +40,14 @@ pub(crate) enum MessageVariant<V> {
         proposal_number: ProposalNumber,
         highest_promised: ProposalNumber,
     },
+    #[cfg(feature = "multi-paxos")]
+    Forward {
+        value: V,
+    },
+    #[cfg(feature = "multi-paxos")]
+    Heartbeat {
+        term: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
