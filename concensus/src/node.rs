@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 use crate::config::{NodeId, PeerInfo};
 use crate::error::{NodeError, ProposeError};
 use crate::message::Message;
+#[cfg(feature = "multi-paxos")]
+use crate::message::MessageVariant;
 use crate::protocol::{Outgoing, ProtocolState, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
@@ -96,6 +98,10 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     protocol: ProtocolState<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
+    #[cfg(feature = "multi-paxos")]
+    forwarded_proposals: Vec<(u64, std::time::Instant, V)>,
+    #[cfg(feature = "multi-paxos")]
+    next_forward_id: u64,
 }
 
 /// A cloneable handle for submitting proposals to a running [`Node`].
@@ -182,6 +188,10 @@ where
             protocol,
             proposal_rx,
             decision_tx,
+            #[cfg(feature = "multi-paxos")]
+            forwarded_proposals: Vec::new(),
+            #[cfg(feature = "multi-paxos")]
+            next_forward_id: 0,
         };
 
         (node, NodeHandle { proposal_tx }, decision_rx)
@@ -310,6 +320,27 @@ where
         value: V,
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
+        #[cfg(feature = "multi-paxos")]
+        {
+            if let Some(leader_id) = self.protocol.get_leader() {
+                if leader_id != self.node_id {
+                    tracing::debug!(leader = %leader_id, "forwarding proposal to leader");
+                    let outgoing = vec![Outgoing {
+                        target: SendTarget::Peer(leader_id),
+                        message: MessageVariant::Forward {
+                            value: value.clone(),
+                        },
+                    }];
+                    Self::send_outgoing(&self.node_id, &outgoing, senders).await;
+                    let fwd_id = self.next_forward_id;
+                    self.next_forward_id += 1;
+                    self.forwarded_proposals
+                        .push((fwd_id, std::time::Instant::now(), value));
+                    return Ok(());
+                }
+            }
+        }
+
         let (slot, outgoing) = self.protocol.propose(value);
         tracing::debug!(slot, "new proposal");
         self.persist_dirty_acceptor_slots().await?;
@@ -362,6 +393,42 @@ where
         if !rebroadcasts.is_empty() {
             Self::send_outgoing(&self.node_id, &rebroadcasts, senders).await;
         }
+
+        #[cfg(feature = "multi-paxos")]
+        {
+            // Send heartbeat if we're the leader and haven't sent a Decide recently
+            if self.protocol.should_send_heartbeat() {
+                let heartbeat = self.protocol.make_heartbeat();
+                Self::send_outgoing(&self.node_id, &heartbeat, senders).await;
+            }
+
+            // Check for leader timeout — start election if leader is unresponsive
+            if self.protocol.check_leader_timeout() {
+                let outgoing = self.protocol.start_election();
+                Self::send_outgoing(&self.node_id, &outgoing, senders).await;
+            }
+
+            // Check forwarded proposal timeouts (1 second)
+            let forward_timeout = std::time::Duration::from_secs(1);
+            let now = std::time::Instant::now();
+            let timed_out: Vec<V> = self
+                .forwarded_proposals
+                .iter()
+                .filter(|(_, t, _)| now.duration_since(*t) >= forward_timeout)
+                .map(|(_, _, v)| v.clone())
+                .collect();
+            self.forwarded_proposals
+                .retain(|(_, t, _)| now.duration_since(*t) < forward_timeout);
+
+            for value in timed_out {
+                tracing::debug!("forwarded proposal timed out, proposing directly");
+                let (_, outgoing) = self.protocol.propose(value);
+                self.persist_dirty_acceptor_slots().await?;
+                Self::send_outgoing(&self.node_id, &outgoing, senders).await;
+                self.process_decisions().await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -395,7 +462,7 @@ where
 
     async fn process_decisions(&mut self) -> Result<(), NodeError> {
         let decisions = self.protocol.take_decisions();
-        for decision in decisions {
+        for decision in &decisions {
             self.storage
                 .save_decision(decision.slot, decision.value.clone())
                 .await
@@ -407,7 +474,7 @@ where
                 .decision_tx
                 .send(Decided {
                     slot: decision.slot,
-                    value: decision.value,
+                    value: decision.value.clone(),
                 })
                 .await
                 .is_err()
@@ -415,6 +482,24 @@ where
                 tracing::warn!("decision receiver dropped, decisions will not be delivered");
             }
         }
+
+        // Remove at most one forwarded proposal per decided value. Using per-request
+        // IDs ensures that if the same value is forwarded twice, only one entry is
+        // cleared per decision — the other stays and will either get its own decision
+        // or time out and fall back to direct proposal.
+        #[cfg(feature = "multi-paxos")]
+        {
+            for decision in &decisions {
+                if let Some(pos) = self
+                    .forwarded_proposals
+                    .iter()
+                    .position(|(_, _, v)| *v == decision.value)
+                {
+                    self.forwarded_proposals.remove(pos);
+                }
+            }
+        }
+
         Ok(())
     }
 }

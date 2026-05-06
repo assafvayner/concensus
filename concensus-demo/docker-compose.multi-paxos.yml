@@ -2,6 +2,8 @@ x-node: &node-base
   build:
     context: ..
     dockerfile: concensus-demo/Dockerfile
+    args:
+      FEATURES: multi-paxos
   environment: &node-env
     TRANSPORT: tcp
     BIND_ADDR: "0.0.0.0:9000"
@@ -26,9 +28,13 @@ services:
   node-2:
     <<: *node-base
     hostname: node-2
+    ports:
+      - "50052:50051"
   node-3:
     <<: *node-base
     hostname: node-3
+    ports:
+      - "50053:50051"
 
 networks:
   consensus-net:

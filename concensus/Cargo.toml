@@ -9,6 +9,7 @@ test-support = []
 tcp-transport = ["tokio/net", "tokio/io-util"]
 uds-transport = ["tokio/net", "tokio/io-util"]
 duckdb-storage = ["dep:duckdb"]
+multi-paxos = []
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }

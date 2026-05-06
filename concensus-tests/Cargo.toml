@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+multi-paxos = ["concensus/multi-paxos"]
+
 [dev-dependencies]
 concensus = { path = "../concensus", features = ["channel-transport", "test-support", "duckdb-storage"] }
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
