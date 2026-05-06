@@ -146,6 +146,21 @@ where
         Self::with_id_inner(node_id, peers, receiver, storage)
     }
 
+    /// Creates a new consensus node configured for Multi-Paxos with the supplied
+    /// [`PaxosConfig`].
+    ///
+    /// Currently behaves identically to [`Node::new`]; the configuration is
+    /// retained for forward compatibility (e.g., future heartbeat tuning).
+    pub fn with_paxos_config(
+        name: impl Into<Arc<str>>,
+        _config: crate::config::PaxosConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl Storage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
+        Self::new(name, peers, receiver, storage)
+    }
+
     /// Creates a new consensus node with an explicit [`NodeId`].
     ///
     /// This is useful in tests where you need deterministic, matching node
@@ -440,6 +455,18 @@ mod tests {
     fn node_new_returns_node_handle_and_receiver() {
         let (_node, _handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::new(
             "test-node",
+            vec![],
+            DummyReceiver,
+            MemoryStorage::new(),
+        );
+    }
+
+    #[tokio::test]
+    async fn with_paxos_config_works() {
+        use crate::config::PaxosConfig;
+        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::with_paxos_config(
+            "test",
+            PaxosConfig::default(),
             vec![],
             DummyReceiver,
             MemoryStorage::new(),
