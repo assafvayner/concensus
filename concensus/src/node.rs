@@ -93,7 +93,6 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
     storage: Box<dyn Storage<V> + Send>,
-    #[allow(dead_code)] // wired in Tasks 15/16
     raft_storage: Option<Box<dyn crate::storage::RaftStorage<V> + Send>>,
     protocol: ProtocolImpl<V>,
     proposal_rx: mpsc::Receiver<V>,
@@ -381,6 +380,7 @@ where
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
         let outgoing = self.protocol.propose(value);
+        self.flush_raft_persist().await?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
         Ok(())
@@ -395,6 +395,7 @@ where
             Ok(msg) => {
                 let from = msg.sender;
                 let outgoing = self.protocol.handle_wire_message(from, msg.variant);
+                self.flush_raft_persist().await?;
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
@@ -402,6 +403,7 @@ where
                 let lost = self.protocol.take_lost_proposals();
                 for value in lost {
                     let outgoing = self.protocol.propose(value);
+                    self.flush_raft_persist().await?;
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                     self.process_decisions().await?;
                 }
@@ -415,8 +417,54 @@ where
 
     async fn handle_retries(&mut self, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
         let outgoing = self.protocol.on_tick(Instant::now());
+        self.flush_raft_persist().await?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
+        Ok(())
+    }
+
+    /// Drains any pending Raft persistence intent from the protocol and
+    /// writes it through `RaftStorage` before any outgoing wire message is
+    /// sent. No-op for Paxos nodes (where `raft_storage` is `None`).
+    ///
+    /// Order matters: term -> voted_for -> truncate -> append. Truncating
+    /// before appending guarantees we never briefly persist entries that
+    /// conflict with what's about to be truncated.
+    async fn flush_raft_persist(&mut self) -> Result<(), NodeError> {
+        let raft_storage = match self.raft_storage.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let proto = match &mut self.protocol {
+            crate::protocol::ProtocolImpl::Raft(p) => p,
+            _ => return Ok(()),
+        };
+        let intent = proto.drain_persist_intent();
+        if let Some(term) = intent.term {
+            raft_storage
+                .save_term(term)
+                .await
+                .map_err(NodeError::Storage)?;
+        }
+        if let Some(vf) = intent.voted_for {
+            raft_storage
+                .save_voted_for(vf)
+                .await
+                .map_err(NodeError::Storage)?;
+        }
+        if let Some(idx) = intent.truncate_from {
+            raft_storage
+                .truncate_log_from(idx)
+                .await
+                .map_err(NodeError::Storage)?;
+        }
+        if let Some(idx) = intent.append_from {
+            let to_append = &intent.log_snapshot[idx as usize..];
+            raft_storage
+                .append_log(to_append)
+                .await
+                .map_err(NodeError::Storage)?;
+        }
         Ok(())
     }
 

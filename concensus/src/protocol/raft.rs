@@ -16,10 +16,22 @@ pub(crate) enum Role {
     Leader,
 }
 
+/// Snapshot of pending persistence work drained from a `RaftProtocol`.
+///
+/// The Node calls [`RaftProtocol::drain_persist_intent`] before sending any
+/// outgoing message and writes the captured state through `RaftStorage`. This
+/// satisfies Raft's "durability before send" rule.
+pub(crate) struct PersistIntent<V> {
+    pub term: Option<u64>,
+    pub voted_for: Option<Option<NodeId>>,
+    pub truncate_from: Option<u64>,
+    pub append_from: Option<u64>,
+    pub log_snapshot: Vec<LogEntry<V>>,
+}
+
 /// Raft state machine. Implements `ConsensusProtocol<V>` with stubbed message
 /// handling and `on_tick` for now; election and log-replication land in
 /// subsequent tasks.
-#[allow(dead_code)] // pending_persist_*/pending_truncate_from drained in Task 15
 pub(crate) struct RaftProtocol<V> {
     pub(crate) node_id: NodeId,
     pub(crate) total_nodes: usize,
@@ -64,7 +76,6 @@ impl<V> RaftProtocol<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
 {
-    #[allow(dead_code)] // wired in Task 10
     pub(crate) fn new(node_id: NodeId, total_nodes: usize, config: RaftConfig) -> Self {
         let election_deadline = Instant::now() + sample_election_timeout(&config);
         Self {
@@ -94,6 +105,39 @@ where
 
     pub(crate) fn quorum(&self) -> usize {
         (self.total_nodes / 2) + 1
+    }
+
+    /// Drain the pending persistence intent — the Node will write it through
+    /// `RaftStorage` before sending any outgoing wire message. Clears the
+    /// underlying flags so subsequent calls return empty intents until new
+    /// state changes occur.
+    pub(crate) fn drain_persist_intent(&mut self) -> PersistIntent<V> {
+        let term = if self.pending_persist_term {
+            Some(self.current_term)
+        } else {
+            None
+        };
+        let voted_for = if self.pending_persist_voted_for {
+            Some(self.voted_for.clone())
+        } else {
+            None
+        };
+        let truncate_from = self.pending_truncate_from.take();
+        let append_from = self.pending_persist_log_from.take();
+        self.pending_persist_term = false;
+        self.pending_persist_voted_for = false;
+        let log_snapshot = if append_from.is_some() {
+            self.log.clone()
+        } else {
+            Vec::new()
+        };
+        PersistIntent {
+            term,
+            voted_for,
+            truncate_from,
+            append_from,
+            log_snapshot,
+        }
     }
 
     fn last_log_index(&self) -> Option<u64> {
@@ -1343,6 +1387,50 @@ mod tests {
             }
             other => panic!("expected re-send from index 2, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn drain_persist_intent_returns_pending_state_and_clears_flags() {
+        use crate::message::LogEntry;
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.voted_for = Some(NodeId::new("b", 1));
+        p.log = vec![
+            LogEntry {
+                term: 5,
+                value: "x".into(),
+            },
+            LogEntry {
+                term: 5,
+                value: "y".into(),
+            },
+        ];
+        p.pending_persist_term = true;
+        p.pending_persist_voted_for = true;
+        p.pending_persist_log_from = Some(1);
+        p.pending_truncate_from = Some(1);
+
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.term, Some(5));
+        assert_eq!(intent.voted_for, Some(Some(NodeId::new("b", 1))));
+        assert_eq!(intent.truncate_from, Some(1));
+        assert_eq!(intent.append_from, Some(1));
+        assert_eq!(intent.log_snapshot.len(), 2);
+        assert!(!p.pending_persist_term);
+        assert!(!p.pending_persist_voted_for);
+        assert!(p.pending_persist_log_from.is_none());
+        assert!(p.pending_truncate_from.is_none());
+    }
+
+    #[test]
+    fn drain_persist_intent_returns_empty_when_no_pending() {
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let intent = p.drain_persist_intent();
+        assert!(intent.term.is_none());
+        assert!(intent.voted_for.is_none());
+        assert!(intent.truncate_from.is_none());
+        assert!(intent.append_from.is_none());
+        assert!(intent.log_snapshot.is_empty());
     }
 
     #[test]
