@@ -83,6 +83,76 @@ impl<'de> Deserialize<'de> for NodeId {
     }
 }
 
+use std::time::Duration;
+
+/// Which consensus algorithm a [`Node`](crate::Node) should run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConsensusAlgorithm {
+    /// Multi-Paxos with optional leader optimization.
+    MultiPaxos,
+    /// Raft consensus.
+    Raft,
+}
+
+/// Aggregate configuration for a [`Node`](crate::Node).
+///
+/// Selects the algorithm and provides timing parameters used by the active protocol.
+/// Algorithm-specific subsets are also available as [`PaxosConfig`] and [`RaftConfig`].
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    pub algorithm: ConsensusAlgorithm,
+    pub heartbeat_interval: Duration,
+    pub election_timeout_min: Duration,
+    pub election_timeout_max: Duration,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            algorithm: ConsensusAlgorithm::MultiPaxos,
+            heartbeat_interval: Duration::from_millis(50),
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+        }
+    }
+}
+
+/// Configuration specific to the Multi-Paxos algorithm.
+#[derive(Clone, Debug)]
+pub struct PaxosConfig {
+    /// How often a leader sends heartbeats to followers.
+    pub heartbeat_interval: Duration,
+}
+
+impl Default for PaxosConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_millis(50),
+        }
+    }
+}
+
+/// Configuration specific to the Raft algorithm.
+#[derive(Clone, Debug)]
+pub struct RaftConfig {
+    /// How often a leader sends heartbeats to followers.
+    pub heartbeat_interval: Duration,
+    /// Lower bound of the randomized election timeout (inclusive).
+    pub election_timeout_min: Duration,
+    /// Upper bound of the randomized election timeout (inclusive).
+    pub election_timeout_max: Duration,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_millis(50),
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +222,41 @@ mod tests {
             id: NodeId::new("peer-1", 1000),
             sender: DummySender,
         };
+    }
+
+    #[test]
+    fn node_config_defaults_to_multi_paxos() {
+        let cfg = NodeConfig::default();
+        assert!(matches!(cfg.algorithm, ConsensusAlgorithm::MultiPaxos));
+    }
+
+    #[test]
+    fn paxos_config_defaults() {
+        let cfg = PaxosConfig::default();
+        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn raft_config_defaults() {
+        let cfg = RaftConfig::default();
+        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_millis(50));
+        assert_eq!(
+            cfg.election_timeout_min,
+            std::time::Duration::from_millis(150)
+        );
+        assert_eq!(
+            cfg.election_timeout_max,
+            std::time::Duration::from_millis(300)
+        );
+    }
+
+    #[test]
+    fn consensus_algorithm_eq() {
+        assert_eq!(
+            ConsensusAlgorithm::MultiPaxos,
+            ConsensusAlgorithm::MultiPaxos
+        );
+        assert_eq!(ConsensusAlgorithm::Raft, ConsensusAlgorithm::Raft);
+        assert_ne!(ConsensusAlgorithm::MultiPaxos, ConsensusAlgorithm::Raft);
     }
 }
