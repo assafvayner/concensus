@@ -346,8 +346,12 @@ where
             (crate::protocol::ProtocolImpl::Raft(raft), Some((term, voted_for, log))) => {
                 raft.recover(term, voted_for, log, decisions);
             }
-            (proto, _) => {
-                proto.initialize_from_decisions(decisions);
+            (crate::protocol::ProtocolImpl::Paxos(p), _) => {
+                p.initialize_from_decisions(decisions);
+            }
+            (crate::protocol::ProtocolImpl::Raft(_), None) => {
+                // Raft without a RaftStorage cannot recover; nothing to initialize.
+                let _ = decisions;
             }
         }
 
