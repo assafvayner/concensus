@@ -200,6 +200,65 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Raft cluster creation
+// ---------------------------------------------------------------------------
+
+pub fn create_raft_cluster(n: usize) -> Vec<ClusterNode> {
+    create_raft_cluster_inner(n, concensus::RaftConfig::default())
+}
+
+pub fn create_raft_cluster_with_config(
+    n: usize,
+    config: concensus::RaftConfig,
+) -> Vec<ClusterNode> {
+    create_raft_cluster_inner(n, config)
+}
+
+fn create_raft_cluster_inner(n: usize, config: concensus::RaftConfig) -> Vec<ClusterNode> {
+    assert!(n > 0);
+
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{}", i), 1000))
+        .collect();
+
+    let mut tx_for: HashMap<NodeId, ChannelSender> = HashMap::new();
+    let mut rx_for: HashMap<NodeId, ChannelReceiver> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = channel(64);
+        tx_for.insert(id.clone(), tx);
+        rx_for.insert(id.clone(), rx);
+    }
+
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<ChannelSender>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: tx_for[other].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            config.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Lossy cluster creation
 // ---------------------------------------------------------------------------
 
