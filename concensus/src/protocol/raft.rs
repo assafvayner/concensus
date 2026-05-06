@@ -1864,6 +1864,42 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_with_conflict_yields_truncate_and_append_intent() {
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.current_term = 2;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "stale".into(),
+            },
+        ];
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 2,
+                leader: NodeId::new("b", 1),
+                prev_log_index: Some(0),
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 2,
+                    value: "fresh".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.truncate_from, Some(1));
+        assert_eq!(intent.append_from, Some(1));
+        assert_eq!(intent.log_snapshot.len(), 2);
+        assert_eq!(intent.log_snapshot[1].value, "fresh");
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
