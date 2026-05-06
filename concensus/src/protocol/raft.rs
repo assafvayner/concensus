@@ -2037,6 +2037,36 @@ mod tests {
     }
 
     #[test]
+    fn old_leader_after_term_bump_drops_forward() {
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        let _ = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::AppendEntries {
+                term: 7,
+                leader: NodeId::new("b", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert!(matches!(p.role, Role::Follower));
+        let out = p.handle_message(
+            NodeId::new("c", 1),
+            RaftMessage::Forward {
+                value: "delayed".into(),
+            },
+        );
+        assert!(out.is_empty());
+        assert!(p.log.is_empty());
+    }
+
+    #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
         let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
