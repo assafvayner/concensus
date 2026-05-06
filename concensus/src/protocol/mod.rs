@@ -1,14 +1,16 @@
 // concensus/src/protocol/mod.rs
 pub(crate) mod paxos;
+pub(crate) mod raft;
 
 use std::time::Instant;
 
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
-use crate::message::{PaxosMessage, WireVariant};
+use crate::message::{PaxosMessage, RaftMessage, WireVariant};
 
 pub(crate) use paxos::PaxosProtocol;
+pub(crate) use raft::RaftProtocol;
 
 pub(crate) enum SendTarget {
     Peer(NodeId),
@@ -38,13 +40,21 @@ pub(crate) trait ConsensusProtocol<V> {
 
 pub(crate) enum ProtocolImpl<V> {
     Paxos(PaxosProtocol<V>),
-    // Raft variant added in Task 8.
+    #[allow(dead_code)]
+    Raft(RaftProtocol<V>),
 }
 
 fn wrap_paxos<V>(o: Outgoing<PaxosMessage<V>>) -> Outgoing<WireVariant<V>> {
     Outgoing {
         target: o.target,
         message: WireVariant::Paxos(o.message),
+    }
+}
+
+fn wrap_raft<V>(o: Outgoing<RaftMessage<V>>) -> Outgoing<WireVariant<V>> {
+    Outgoing {
+        target: o.target,
+        message: WireVariant::Raft(o.message),
     }
 }
 
@@ -57,6 +67,10 @@ where
             Self::Paxos(p) => <PaxosProtocol<V> as ConsensusProtocol<V>>::propose(p, value)
                 .into_iter()
                 .map(wrap_paxos)
+                .collect(),
+            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::propose(r, value)
+                .into_iter()
+                .map(wrap_raft)
                 .collect(),
         }
     }
@@ -73,10 +87,20 @@ where
                     .map(wrap_paxos)
                     .collect()
             }
+            (Self::Raft(r), WireVariant::Raft(m)) => {
+                <RaftProtocol<V> as ConsensusProtocol<V>>::handle_message(r, from, m)
+                    .into_iter()
+                    .map(wrap_raft)
+                    .collect()
+            }
             (Self::Paxos(_), WireVariant::Raft(_)) => {
                 tracing::warn!("Paxos node received Raft message, dropping");
                 Vec::new()
-            } // Once a Raft arm exists in ProtocolImpl, also handle (Raft, Raft) and (Raft, Paxos) warn-and-drop.
+            }
+            (Self::Raft(_), WireVariant::Paxos(_)) => {
+                tracing::warn!("Raft node received Paxos message, dropping");
+                Vec::new()
+            }
         }
     }
 
@@ -86,24 +110,31 @@ where
                 .into_iter()
                 .map(wrap_paxos)
                 .collect(),
+            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::on_tick(r, now)
+                .into_iter()
+                .map(wrap_raft)
+                .collect(),
         }
     }
 
     pub(crate) fn take_decisions(&mut self) -> Vec<Decision<V>> {
         match self {
             Self::Paxos(p) => <PaxosProtocol<V> as ConsensusProtocol<V>>::take_decisions(p),
+            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::take_decisions(r),
         }
     }
 
     pub(crate) fn take_lost_proposals(&mut self) -> Vec<V> {
         match self {
             Self::Paxos(p) => <PaxosProtocol<V> as ConsensusProtocol<V>>::take_lost_proposals(p),
+            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::take_lost_proposals(r),
         }
     }
 
     pub(crate) fn is_idle(&self) -> bool {
         match self {
             Self::Paxos(p) => <PaxosProtocol<V> as ConsensusProtocol<V>>::is_idle(p),
+            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::is_idle(r),
         }
     }
 
@@ -111,6 +142,10 @@ where
     pub(crate) fn initialize_from_decisions(&mut self, decisions: Vec<(u64, V)>) {
         match self {
             Self::Paxos(p) => p.initialize_from_decisions(decisions),
+            Self::Raft(_) => {
+                // TODO(Task 16): Restart recovery via RaftProtocol::recover.
+                let _ = decisions;
+            }
         }
     }
 }
