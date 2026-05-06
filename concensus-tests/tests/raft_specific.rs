@@ -278,3 +278,50 @@ async fn election_livelock_resolves() {
         "cluster must settle on a leader and decide within 30s"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_completeness_under_churn() {
+    let mut cluster = create_raft_cluster(5);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let mut counter = 0u32;
+    let mut killed: Vec<usize> = Vec::new();
+    for round in 0..3 {
+        let leader_idx = match detect_active_leader_index(&mut cluster).await {
+            Some(i) if !killed.contains(&i) => i,
+            _ => {
+                // Could not find a leader in a survivor set — bail out the loop.
+                break;
+            }
+        };
+        for _ in 0..5 {
+            counter += 1;
+            let _ = cluster[leader_idx]
+                .handle
+                .propose(format!("round-{round}-v-{counter}"))
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        cluster[leader_idx].run_handle.abort();
+        killed.push(leader_idx);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    // Drain remaining decisions across all surviving nodes; assert safety.
+    let mut all = Vec::new();
+    for (i, node) in cluster.iter_mut().enumerate() {
+        if killed.contains(&i) {
+            continue;
+        }
+        let mut d = Vec::new();
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(500), node.decisions.recv()).await {
+                Ok(Some(x)) => d.push(x),
+                _ => break,
+            }
+        }
+        all.push(d);
+    }
+    assert_safety_invariant(&all);
+    assert!(!all.is_empty(), "expected surviving nodes to have decisions");
+}
