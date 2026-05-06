@@ -171,8 +171,12 @@ where
 
     pub(crate) fn take_dirty_acceptor_slots(&mut self) -> Vec<DirtyAcceptorState<V>> {
         let slots = std::mem::take(&mut self.dirty_acceptor_slots);
+        let mut seen_slots = HashSet::new();
         let mut result = Vec::new();
         for slot in slots {
+            if !seen_slots.insert(slot) {
+                continue;
+            }
             if let Some(instance) = self.instances.get(&slot) {
                 result.push(DirtyAcceptorState {
                     slot,
@@ -1740,6 +1744,34 @@ mod tests {
         assert_eq!(dirty1.len(), 1);
         let dirty2 = proto.take_dirty_acceptor_slots();
         assert!(dirty2.is_empty());
+    }
+
+    #[test]
+    fn take_dirty_deduplicates_slot_and_keeps_latest_state() {
+        let mut proto = make_protocol("a", 3);
+        let from = node("b");
+        let pn = (1, from.clone());
+        proto.handle_message(
+            from.clone(),
+            MessageVariant::Prepare {
+                slot: 0,
+                proposal_number: pn.clone(),
+            },
+        );
+        proto.handle_message(
+            from,
+            MessageVariant::Accept {
+                slot: 0,
+                proposal_number: pn,
+                value: "hello".to_string(),
+            },
+        );
+
+        let dirty = proto.take_dirty_acceptor_slots();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].slot, 0);
+        assert!(dirty[0].highest_promised.is_some());
+        assert!(dirty[0].accepted.is_some());
     }
 
     #[test]

@@ -29,37 +29,40 @@ pub struct AcceptorState<V> {
 }
 
 impl<V> AcceptorState<V> {
+    pub(crate) fn validation_error(&self) -> Option<&'static str> {
+        if self.accepted.is_some() && self.highest_promised.is_none() {
+            return Some("accepted value without highest promised proposal");
+        }
+
+        if let Some(ref highest_promised) = self.highest_promised {
+            if highest_promised.0 == 0 {
+                return Some("highest promised proposal round must be greater than zero");
+            }
+        }
+        if let Some((ref accepted_proposal, _)) = self.accepted {
+            if accepted_proposal.0 == 0 {
+                return Some("accepted proposal round must be greater than zero");
+            }
+        }
+
+        if let (Some(ref highest_promised), Some((ref accepted_proposal, _))) =
+            (&self.highest_promised, &self.accepted)
+        {
+            if accepted_proposal > highest_promised {
+                return Some("accepted proposal must not exceed highest promised proposal");
+            }
+        }
+
+        None
+    }
+
     /// Returns `true` if this state satisfies Paxos invariants:
     ///
     /// 1. If `accepted` is `Some`, then `highest_promised` must also be `Some`.
     /// 2. All proposal round numbers (first element of the tuple) must be > 0.
     /// 3. The accepted proposal number must be <= `highest_promised`.
     pub fn is_valid(&self) -> bool {
-        // (a) If accepted is Some, highest_promised must be Some.
-        if self.accepted.is_some() && self.highest_promised.is_none() {
-            return false;
-        }
-
-        // (b) Proposal rounds must be > 0.
-        if let Some(ref hp) = self.highest_promised {
-            if hp.0 == 0 {
-                return false;
-            }
-        }
-        if let Some((ref apn, _)) = self.accepted {
-            if apn.0 == 0 {
-                return false;
-            }
-        }
-
-        // (c) Accepted pn <= highest_promised.
-        if let (Some(ref hp), Some((ref apn, _))) = (&self.highest_promised, &self.accepted) {
-            if apn > hp {
-                return false;
-            }
-        }
-
-        true
+        self.validation_error().is_none()
     }
 }
 
@@ -81,8 +84,10 @@ where
     /// Persist a decided value for the given slot.
     ///
     /// Called exactly once per slot when a value reaches consensus.
-    /// Implementations should also remove any acceptor state for this slot,
-    /// since it is no longer needed after a decision.
+    /// Implementations must also remove any acceptor state for this slot in
+    /// this method, since [`Node`](crate::Node) relies on `save_decision` for
+    /// decision-time cleanup and does not call
+    /// [`delete_acceptor_state`](Storage::delete_acceptor_state) separately.
     async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError>;
 
     /// Load all previously persisted decisions.
@@ -109,7 +114,9 @@ where
 
     /// Delete the acceptor state for a slot.
     ///
-    /// Called when acceptor state is no longer needed (e.g. after a decision).
+    /// This is for explicit garbage collection or test setup. Decision-time
+    /// cleanup is part of the [`save_decision`](Storage::save_decision)
+    /// contract.
     async fn delete_acceptor_state(&mut self, slot: u64) -> Result<(), StorageError>;
 }
 

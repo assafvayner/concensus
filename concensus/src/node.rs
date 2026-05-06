@@ -233,10 +233,18 @@ where
             .load_acceptor_states()
             .await
             .map_err(NodeError::Storage)?;
-        let valid_states: Vec<_> = acceptor_states
-            .into_iter()
-            .filter(|s| s.is_valid())
-            .collect();
+        let mut valid_states = Vec::new();
+        for state in acceptor_states {
+            if let Some(reason) = state.validation_error() {
+                tracing::warn!(
+                    slot = state.slot,
+                    reason,
+                    "skipping invalid acceptor state during recovery"
+                );
+                continue;
+            }
+            valid_states.push(state);
+        }
         self.protocol.initialize_from_acceptor_states(valid_states);
 
         // Build senders list
