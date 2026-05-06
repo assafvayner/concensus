@@ -26,8 +26,6 @@ pub(crate) enum LeaderState {
 /// to a direct propose if no decision is heard back within the timeout.
 #[cfg(feature = "multi-paxos")]
 struct ForwardedProposal<V> {
-    #[allow(dead_code)]
-    id: u64,
     sent_at: Instant,
     value: V,
 }
@@ -54,8 +52,6 @@ pub(crate) struct PaxosProtocol<V> {
     /// matches the value within the timeout, we re-propose locally.
     #[cfg(feature = "multi-paxos")]
     forwarded_proposals: Vec<ForwardedProposal<V>>,
-    #[cfg(feature = "multi-paxos")]
-    next_forward_id: u64,
 }
 
 /// Per-slot Paxos instance
@@ -135,8 +131,6 @@ where
             last_heartbeat_time: None,
             #[cfg(feature = "multi-paxos")]
             forwarded_proposals: Vec::new(),
-            #[cfg(feature = "multi-paxos")]
-            next_forward_id: 0,
         }
     }
 
@@ -932,10 +926,7 @@ where
         if let Some(leader_id) = self.get_leader() {
             if leader_id != self.node_id {
                 tracing::debug!(leader = %leader_id, "forwarding proposal to leader");
-                let id = self.next_forward_id;
-                self.next_forward_id += 1;
                 self.forwarded_proposals.push(ForwardedProposal {
-                    id,
                     sent_at: Instant::now(),
                     value: value.clone(),
                 });
