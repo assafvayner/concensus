@@ -17,7 +17,7 @@ pub mod consensus_proto {
 use consensus_proto::consensus_service_server::{ConsensusService, ConsensusServiceServer};
 use consensus_proto::{
     Decision, GetDecisionsRequest, GetDecisionsResponse, HealthRequest, HealthResponse,
-    ProposeRequest, ProposeResponse,
+    ProposeRequest, ProposeResponse, StatusRequest, StatusResponse,
 };
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -167,6 +167,8 @@ type DecisionList = Arc<RwLock<Vec<Decision>>>;
 struct ConsensusServiceImpl {
     handle: NodeHandle<String>,
     decisions: DecisionList,
+    node_id: String,
+    algorithm: Algorithm,
 }
 
 #[tonic::async_trait]
@@ -203,6 +205,24 @@ impl ConsensusService for ConsensusServiceImpl {
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             status: "ok".to_string(),
+        }))
+    }
+
+    async fn status(
+        &self,
+        _request: Request<StatusRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        Ok(Response::new(StatusResponse {
+            node_id: self.node_id.clone(),
+            algorithm: self.algorithm.as_str().to_string(),
+            role: "N/A".into(),
+            term: 0,
+            leader: String::new(),
+            log_len: 0,
+            has_commit_index: false,
+            commit_index: 0,
+            has_last_applied: false,
+            last_applied: 0,
         }))
     }
 }
@@ -364,7 +384,12 @@ async fn main() {
         .parse()
         .expect("invalid gRPC address");
 
-    let service = ConsensusServiceImpl { handle, decisions };
+    let service = ConsensusServiceImpl {
+        handle,
+        decisions,
+        node_id: config.node_name.clone(),
+        algorithm: config.algorithm,
+    };
 
     tracing::info!(addr = %grpc_addr, "gRPC server starting");
 
