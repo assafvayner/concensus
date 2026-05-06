@@ -169,6 +169,23 @@ async fn node_recovers_from_storage_and_continues() {
     teardown(handles2, decisions2, run_handles2);
 }
 
+#[tokio::test]
+async fn shared_raft_storage_handoff_preserves_term_and_log() {
+    use concensus::{LogEntry, RaftStorage};
+    use helpers::SharedRaftStorage;
+    let mut s1 = SharedRaftStorage::<String>::new();
+    s1.save_term(7).await.unwrap();
+    s1.append_log(&[LogEntry {
+        term: 7,
+        value: "x".into(),
+    }])
+    .await
+    .unwrap();
+    let s2 = s1.clone();
+    assert_eq!(s2.load_term().await.unwrap(), 7);
+    assert_eq!(s2.load_log().await.unwrap().len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovered_node_skips_decided_slots() {
     let ids: [NodeId; 3] = [
