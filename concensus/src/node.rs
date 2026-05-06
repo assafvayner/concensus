@@ -93,6 +93,8 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
     storage: Box<dyn Storage<V> + Send>,
+    #[allow(dead_code)] // wired in Tasks 15/16
+    raft_storage: Option<Box<dyn crate::storage::RaftStorage<V> + Send>>,
     protocol: ProtocolImpl<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
@@ -194,11 +196,87 @@ where
             peers,
             receiver: Some(receiver),
             storage: Box::new(storage),
+            raft_storage: None,
             protocol,
             proposal_rx,
             decision_tx,
         };
 
+        (node, NodeHandle { proposal_tx }, decision_rx)
+    }
+
+    /// Creates a consensus node configured for Raft.
+    ///
+    /// Requires storage that implements [`RaftStorage`](crate::RaftStorage) so
+    /// the node can persist `currentTerm`, `votedFor`, and the replicated log.
+    /// `MemoryStorage` satisfies this in tests; production deployments should
+    /// provide a durable backing store.
+    pub fn with_raft_config(
+        name: impl Into<Arc<str>>,
+        config: crate::config::RaftConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl crate::storage::RaftStorage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
+    where
+        V: Sync,
+    {
+        let incarnation = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+        let node_id = NodeId::new(name, incarnation);
+        Self::with_raft_id_inner(node_id, config, peers, receiver, storage)
+    }
+
+    /// Creates a consensus node configured for Raft with an explicit [`NodeId`].
+    ///
+    /// Useful in tests for deterministic IDs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_raft_config_and_id(
+        node_id: NodeId,
+        config: crate::config::RaftConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl crate::storage::RaftStorage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
+    where
+        V: Sync,
+    {
+        Self::with_raft_id_inner(node_id, config, peers, receiver, storage)
+    }
+
+    fn with_raft_id_inner(
+        node_id: NodeId,
+        config: crate::config::RaftConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl crate::storage::RaftStorage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
+    where
+        V: Sync,
+    {
+        let total_nodes = peers.len() + 1;
+        let shared = crate::storage::SharedRaftStorage::new(storage);
+        let storage_role: Box<dyn Storage<V> + Send> = Box::new(shared.clone());
+        let raft_role: Box<dyn crate::storage::RaftStorage<V> + Send> = Box::new(shared);
+        let protocol = ProtocolImpl::Raft(crate::protocol::RaftProtocol::new(
+            node_id.clone(),
+            total_nodes,
+            config,
+        ));
+        let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
+        let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
+        let node = Self {
+            node_id,
+            peers,
+            receiver: Some(receiver),
+            storage: storage_role,
+            raft_storage: Some(raft_role),
+            protocol,
+            proposal_rx,
+            decision_tx,
+        };
         (node, NodeHandle { proposal_tx }, decision_rx)
     }
 
@@ -467,6 +545,18 @@ mod tests {
         let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::with_paxos_config(
             "test",
             PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            MemoryStorage::new(),
+        );
+    }
+
+    #[tokio::test]
+    async fn with_raft_config_works() {
+        use crate::config::RaftConfig;
+        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::with_raft_config(
+            "test",
+            RaftConfig::default(),
             vec![],
             DummyReceiver,
             MemoryStorage::new(),

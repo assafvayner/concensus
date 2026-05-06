@@ -4,6 +4,8 @@ use crate::message::LogEntry;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Durable storage for consensus decisions.
 ///
@@ -153,6 +155,76 @@ where
 
     async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
         Ok(self.log.clone())
+    }
+}
+
+/// Adapter that lets one `RaftStorage<V>` instance be shared between
+/// the [`Node`](crate::Node) `Storage<V>` and `RaftStorage<V>` requirements.
+///
+/// `Node::with_raft_config` boxes the user's storage once and gives both
+/// roles a clone of this adapter. All operations are serialized through an
+/// internal `tokio::sync::Mutex`.
+pub(crate) struct SharedRaftStorage<V> {
+    inner: Arc<Mutex<Box<dyn RaftStorage<V> + Send>>>,
+}
+
+impl<V> SharedRaftStorage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send,
+{
+    pub(crate) fn new(s: impl RaftStorage<V> + 'static) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Box::new(s))),
+        }
+    }
+}
+
+impl<V> Clone for SharedRaftStorage<V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[async_trait]
+impl<V> Storage<V> for SharedRaftStorage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError> {
+        self.inner.lock().await.save_decision(slot, value).await
+    }
+    async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
+        self.inner.lock().await.load_decisions().await
+    }
+}
+
+#[async_trait]
+impl<V> RaftStorage<V> for SharedRaftStorage<V>
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    async fn save_term(&mut self, term: u64) -> Result<(), StorageError> {
+        self.inner.lock().await.save_term(term).await
+    }
+    async fn load_term(&self) -> Result<u64, StorageError> {
+        self.inner.lock().await.load_term().await
+    }
+    async fn save_voted_for(&mut self, voted_for: Option<NodeId>) -> Result<(), StorageError> {
+        self.inner.lock().await.save_voted_for(voted_for).await
+    }
+    async fn load_voted_for(&self) -> Result<Option<NodeId>, StorageError> {
+        self.inner.lock().await.load_voted_for().await
+    }
+    async fn append_log(&mut self, entries: &[LogEntry<V>]) -> Result<(), StorageError> {
+        self.inner.lock().await.append_log(entries).await
+    }
+    async fn truncate_log_from(&mut self, index: u64) -> Result<(), StorageError> {
+        self.inner.lock().await.truncate_log_from(index).await
+    }
+    async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
+        self.inner.lock().await.load_log().await
     }
 }
 
