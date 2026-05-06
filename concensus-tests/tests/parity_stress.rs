@@ -22,6 +22,10 @@ async fn stress_concurrent_proposals_for(alg: Algorithm) {
         }
         all.push(d);
     }
+    use helpers::raft_invariants::RaftClusterInvariantChecker;
+    let mut checker = RaftClusterInvariantChecker::new(cluster.len());
+    checker.poll(&mut cluster);
+    let _ = checker.total_decided();
     assert_safety_invariant(&all);
 }
 

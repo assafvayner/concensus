@@ -279,9 +279,11 @@ async fn election_livelock_resolves() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_completeness_under_churn() {
+    use helpers::raft_invariants::RaftClusterInvariantChecker;
     let mut cluster = create_raft_cluster(5);
     tokio::time::sleep(Duration::from_millis(800)).await;
 
+    let mut checker = RaftClusterInvariantChecker::new(cluster.len());
     let mut counter = 0u32;
     let mut killed: Vec<usize> = Vec::new();
     for round in 0..3 {
@@ -300,6 +302,7 @@ async fn leader_completeness_under_churn() {
                 .await;
         }
         tokio::time::sleep(Duration::from_millis(800)).await;
+        checker.poll(&mut cluster);
         cluster[leader_idx].run_handle.abort();
         killed.push(leader_idx);
         tokio::time::sleep(Duration::from_millis(1500)).await;
