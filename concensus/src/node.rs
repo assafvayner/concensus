@@ -1,15 +1,15 @@
 //! Core consensus node and its associated handle types.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::{NodeId, PeerInfo};
 use crate::error::{NodeError, ProposeError};
-use crate::message::{Message, PaxosMessage, WireVariant};
-use crate::protocol::{Outgoing, PaxosProtocol, SendTarget};
+use crate::message::{Message, WireVariant};
+use crate::protocol::{Outgoing, PaxosProtocol, ProtocolImpl, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
 
@@ -93,13 +93,9 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
     storage: Box<dyn Storage<V> + Send>,
-    protocol: PaxosProtocol<V>,
+    protocol: ProtocolImpl<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
-    #[cfg(feature = "multi-paxos")]
-    forwarded_proposals: Vec<(u64, std::time::Instant, V)>,
-    #[cfg(feature = "multi-paxos")]
-    next_forward_id: u64,
 }
 
 /// A cloneable handle for submitting proposals to a running [`Node`].
@@ -174,7 +170,7 @@ where
         storage: impl Storage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
-        let protocol = PaxosProtocol::new(node_id.clone(), total_nodes);
+        let protocol = ProtocolImpl::Paxos(PaxosProtocol::new(node_id.clone(), total_nodes));
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
 
@@ -186,10 +182,6 @@ where
             protocol,
             proposal_rx,
             decision_tx,
-            #[cfg(feature = "multi-paxos")]
-            forwarded_proposals: Vec::new(),
-            #[cfg(feature = "multi-paxos")]
-            next_forward_id: 0,
         };
 
         (node, NodeHandle { proposal_tx }, decision_rx)
@@ -295,29 +287,7 @@ where
         value: V,
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
-        #[cfg(feature = "multi-paxos")]
-        {
-            if let Some(leader_id) = self.protocol.get_leader() {
-                if leader_id != self.node_id {
-                    tracing::debug!(leader = %leader_id, "forwarding proposal to leader");
-                    let outgoing = vec![Outgoing {
-                        target: SendTarget::Peer(leader_id),
-                        message: PaxosMessage::Forward {
-                            value: value.clone(),
-                        },
-                    }];
-                    Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-                    let fwd_id = self.next_forward_id;
-                    self.next_forward_id += 1;
-                    self.forwarded_proposals
-                        .push((fwd_id, std::time::Instant::now(), value));
-                    return Ok(());
-                }
-            }
-        }
-
-        let (slot, outgoing) = self.protocol.propose(value);
-        tracing::debug!(slot, "new proposal");
+        let outgoing = self.protocol.propose(value);
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
         Ok(())
@@ -331,16 +301,14 @@ where
         match Message::<V>::from_bytes(data) {
             Ok(msg) => {
                 let from = msg.sender;
-                let outgoing = match msg.variant {
-                    WireVariant::Paxos(pm) => self.protocol.handle_message(from, pm),
-                };
+                let outgoing = self.protocol.handle_wire_message(from, msg.variant);
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
                 // Re-propose any lost proposals
                 let lost = self.protocol.take_lost_proposals();
                 for value in lost {
-                    let (_, outgoing) = self.protocol.propose(value);
+                    let outgoing = self.protocol.propose(value);
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                     self.process_decisions().await?;
                 }
@@ -353,66 +321,21 @@ where
     }
 
     async fn handle_retries(&mut self, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
-        let slots = self.protocol.get_retryable_proposals();
-        for slot in slots {
-            tracing::debug!(slot, "retrying proposal");
-            let outgoing = self.protocol.retry_proposal(slot);
-            Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-        }
-
-        // Re-broadcast recent decisions so peers that missed the original
-        // Decide message can learn the outcome.
-        let rebroadcasts = self.protocol.get_decision_rebroadcasts();
-        if !rebroadcasts.is_empty() {
-            Self::send_outgoing(&self.node_id, &rebroadcasts, senders).await;
-        }
-
-        #[cfg(feature = "multi-paxos")]
-        {
-            // Send heartbeat if we're the leader and haven't sent a Decide recently
-            if self.protocol.should_send_heartbeat() {
-                let heartbeat = self.protocol.make_heartbeat();
-                Self::send_outgoing(&self.node_id, &heartbeat, senders).await;
-            }
-
-            // Check for leader timeout — start election if leader is unresponsive
-            if self.protocol.check_leader_timeout() {
-                let outgoing = self.protocol.start_election();
-                Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-            }
-
-            // Check forwarded proposal timeouts (1 second)
-            let forward_timeout = std::time::Duration::from_secs(1);
-            let now = std::time::Instant::now();
-            let timed_out: Vec<V> = self
-                .forwarded_proposals
-                .iter()
-                .filter(|(_, t, _)| now.duration_since(*t) >= forward_timeout)
-                .map(|(_, _, v)| v.clone())
-                .collect();
-            self.forwarded_proposals
-                .retain(|(_, t, _)| now.duration_since(*t) < forward_timeout);
-
-            for value in timed_out {
-                tracing::debug!("forwarded proposal timed out, proposing directly");
-                let (_, outgoing) = self.protocol.propose(value);
-                Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-                self.process_decisions().await?;
-            }
-        }
-
+        let outgoing = self.protocol.on_tick(Instant::now());
+        Self::send_outgoing(&self.node_id, &outgoing, senders).await;
+        self.process_decisions().await?;
         Ok(())
     }
 
     async fn send_outgoing(
         node_id: &NodeId,
-        outgoing: &[Outgoing<PaxosMessage<V>>],
+        outgoing: &[Outgoing<WireVariant<V>>],
         senders: &[(NodeId, S)],
     ) {
         for out in outgoing {
             let msg = Message {
                 sender: node_id.clone(),
-                variant: WireVariant::Paxos(out.message.clone()),
+                variant: out.message.clone(),
             };
             let bytes = match msg.to_bytes() {
                 Ok(b) => b,
@@ -456,23 +379,6 @@ where
                 .is_err()
             {
                 tracing::warn!("decision receiver dropped, decisions will not be delivered");
-            }
-        }
-
-        // Remove at most one forwarded proposal per decided value. Using per-request
-        // IDs ensures that if the same value is forwarded twice, only one entry is
-        // cleared per decision — the other stays and will either get its own decision
-        // or time out and fall back to direct proposal.
-        #[cfg(feature = "multi-paxos")]
-        {
-            for decision in &decisions {
-                if let Some(pos) = self
-                    .forwarded_proposals
-                    .iter()
-                    .position(|(_, _, v)| *v == decision.value)
-                {
-                    self.forwarded_proposals.remove(pos);
-                }
             }
         }
 
