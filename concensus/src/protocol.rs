@@ -6,7 +6,7 @@ use rand::RngExt;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
-use crate::message::{MessageVariant, ProposalNumber};
+use crate::message::{PaxosMessage, ProposalNumber};
 
 /// Where to send an outgoing message
 pub(crate) enum SendTarget {
@@ -19,7 +19,7 @@ pub(crate) enum SendTarget {
 /// An outgoing message produced by the protocol state machine
 pub(crate) struct Outgoing<V> {
     pub target: SendTarget,
-    pub message: MessageVariant<V>,
+    pub message: PaxosMessage<V>,
 }
 
 /// A decided value ready to be delivered
@@ -31,8 +31,13 @@ pub(crate) struct Decision<V> {
 #[cfg(feature = "multi-paxos")]
 #[derive(Debug)]
 pub(crate) enum LeaderState {
-    Leader { term: u64 },
-    Follower { leader: Option<NodeId>, last_contact: Instant },
+    Leader {
+        term: u64,
+    },
+    Follower {
+        leader: Option<NodeId>,
+        last_contact: Instant,
+    },
     Candidate,
 }
 
@@ -159,33 +164,33 @@ where
     pub(crate) fn handle_message(
         &mut self,
         from: NodeId,
-        msg: MessageVariant<V>,
+        msg: PaxosMessage<V>,
     ) -> Vec<Outgoing<V>> {
         match msg {
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot,
                 proposal_number,
             } => self.handle_prepare(from, slot, proposal_number),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot,
                 proposal_number,
                 accepted,
             } => self.handle_promise(from, slot, proposal_number, accepted),
-            MessageVariant::Accept {
+            PaxosMessage::Accept {
                 slot,
                 proposal_number,
                 value,
             } => self.handle_accept(from, slot, proposal_number, value),
-            MessageVariant::Accepted {
+            PaxosMessage::Accepted {
                 slot,
                 proposal_number,
                 value,
             } => self.handle_accepted(from, slot, proposal_number, value),
-            MessageVariant::Decide { slot, value } => {
+            PaxosMessage::Decide { slot, value } => {
                 self.handle_decide(from, slot, value);
                 vec![]
             }
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot,
                 highest_promised,
                 ..
@@ -193,7 +198,7 @@ where
                 self.handle_nack(slot, highest_promised);
                 vec![]
             }
-            MessageVariant::NackAccept {
+            PaxosMessage::NackAccept {
                 slot,
                 highest_promised,
                 ..
@@ -202,9 +207,9 @@ where
                 vec![]
             }
             #[cfg(feature = "multi-paxos")]
-            MessageVariant::Forward { value } => self.handle_forward(from, value),
+            PaxosMessage::Forward { value } => self.handle_forward(from, value),
             #[cfg(feature = "multi-paxos")]
-            MessageVariant::Heartbeat { term } => self.handle_heartbeat(from, term),
+            PaxosMessage::Heartbeat { term } => self.handle_heartbeat(from, term),
         }
     }
 
@@ -227,7 +232,7 @@ where
             // Inform the sender about the decision they missed
             return vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::Decide { slot, value },
+                message: PaxosMessage::Decide { slot, value },
             }];
         }
 
@@ -241,7 +246,7 @@ where
             instance.highest_promised = Some(proposal_number.clone());
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::Promise {
+                message: PaxosMessage::Promise {
                     slot,
                     proposal_number,
                     accepted: instance.accepted.clone(),
@@ -250,7 +255,7 @@ where
         } else {
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::NackPrepare {
+                message: PaxosMessage::NackPrepare {
                     slot,
                     proposal_number,
                     highest_promised: instance.highest_promised.clone().unwrap(),
@@ -273,7 +278,7 @@ where
             // Inform the sender about the decision they missed
             return vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::Decide {
+                message: PaxosMessage::Decide {
                     slot,
                     value: decided_value,
                 },
@@ -291,7 +296,7 @@ where
             instance.accepted = Some((proposal_number.clone(), value.clone()));
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::Accepted {
+                message: PaxosMessage::Accepted {
                     slot,
                     proposal_number,
                     value,
@@ -300,7 +305,7 @@ where
         } else {
             vec![Outgoing {
                 target: SendTarget::Peer(from),
-                message: MessageVariant::NackAccept {
+                message: PaxosMessage::NackAccept {
                     slot,
                     proposal_number,
                     highest_promised: instance.highest_promised.clone().unwrap(),
@@ -390,7 +395,7 @@ where
             self.instances.remove(&slot);
             vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Decide { slot, value },
+                message: PaxosMessage::Decide { slot, value },
             }]
         } else {
             vec![]
@@ -408,7 +413,11 @@ where
             // cause other nodes to treat it as the leader. Leader identity is only
             // established via Heartbeat messages (which carry an explicit term and
             // are only sent by the actual leader).
-            if let LeaderState::Follower { leader: Some(ref leader_id), ref mut last_contact } = self.leader_state {
+            if let LeaderState::Follower {
+                leader: Some(ref leader_id),
+                ref mut last_contact,
+            } = self.leader_state
+            {
                 if *leader_id == from {
                     *last_contact = Instant::now();
                 }
@@ -523,7 +532,7 @@ where
             slot,
             vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Prepare {
+                message: PaxosMessage::Prepare {
                     slot,
                     proposal_number,
                 },
@@ -567,7 +576,7 @@ where
                 slot,
                 vec![Outgoing {
                     target: SendTarget::Broadcast,
-                    message: MessageVariant::Decide { slot, value },
+                    message: PaxosMessage::Decide { slot, value },
                 }],
             );
         }
@@ -576,7 +585,7 @@ where
             slot,
             vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Accept {
+                message: PaxosMessage::Accept {
                     slot,
                     proposal_number,
                     value,
@@ -620,13 +629,13 @@ where
             self.instances.remove(&slot);
             return vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Decide { slot, value },
+                message: PaxosMessage::Decide { slot, value },
             }];
         }
 
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: MessageVariant::Accept {
+            message: PaxosMessage::Accept {
                 slot,
                 proposal_number,
                 value,
@@ -684,7 +693,7 @@ where
             .iter()
             .map(|(_, slot, value)| Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Decide {
+                message: PaxosMessage::Decide {
                     slot: *slot,
                     value: value.clone(),
                 },
@@ -736,7 +745,7 @@ where
 
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: MessageVariant::Prepare {
+            message: PaxosMessage::Prepare {
                 slot,
                 proposal_number,
             },
@@ -829,7 +838,7 @@ where
             self.last_heartbeat_time = Some(Instant::now());
             vec![Outgoing {
                 target: SendTarget::Broadcast,
-                message: MessageVariant::Heartbeat { term: *term },
+                message: PaxosMessage::Heartbeat { term: *term },
             }]
         } else {
             vec![]
@@ -883,7 +892,7 @@ where
 
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: MessageVariant::Prepare {
+            message: PaxosMessage::Prepare {
                 slot,
                 proposal_number,
             },
@@ -934,7 +943,7 @@ mod tests {
 
         let responses = proto.handle_message(
             from,
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: pn.clone(),
             },
@@ -942,7 +951,7 @@ mod tests {
 
         assert_eq!(responses.len(), 1);
         match &responses[0].message {
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot,
                 proposal_number,
                 accepted,
@@ -963,7 +972,7 @@ mod tests {
         // First prepare with higher number
         proto.handle_message(
             from.clone(),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (5, from.clone()),
             },
@@ -972,7 +981,7 @@ mod tests {
         // Second prepare with lower number
         let responses = proto.handle_message(
             from.clone(),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (1, from.clone()),
             },
@@ -981,7 +990,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(matches!(
             &responses[0].message,
-            MessageVariant::NackPrepare { .. }
+            PaxosMessage::NackPrepare { .. }
         ));
     }
 
@@ -998,7 +1007,7 @@ mod tests {
 
         let responses = proto.handle_message(
             from.clone(),
-            MessageVariant::Accept {
+            PaxosMessage::Accept {
                 slot: 0,
                 proposal_number: pn.clone(),
                 value: "hello".to_string(),
@@ -1007,7 +1016,7 @@ mod tests {
 
         assert_eq!(responses.len(), 1);
         match &responses[0].message {
-            MessageVariant::Accepted {
+            PaxosMessage::Accepted {
                 slot,
                 proposal_number,
                 value,
@@ -1028,7 +1037,7 @@ mod tests {
         // Promise a higher number first
         proto.handle_message(
             from.clone(),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (5, from.clone()),
             },
@@ -1037,7 +1046,7 @@ mod tests {
         // Try to accept with lower number
         let responses = proto.handle_message(
             from.clone(),
-            MessageVariant::Accept {
+            PaxosMessage::Accept {
                 slot: 0,
                 proposal_number: (1, from.clone()),
                 value: "hello".to_string(),
@@ -1047,7 +1056,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(matches!(
             &responses[0].message,
-            MessageVariant::NackAccept { .. }
+            PaxosMessage::NackAccept { .. }
         ));
     }
 
@@ -1060,7 +1069,7 @@ mod tests {
         // Accept a value
         proto.handle_message(
             from.clone(),
-            MessageVariant::Accept {
+            PaxosMessage::Accept {
                 slot: 0,
                 proposal_number: pn1.clone(),
                 value: "hello".to_string(),
@@ -1071,14 +1080,14 @@ mod tests {
         let pn2 = (2, from.clone());
         let responses = proto.handle_message(
             from.clone(),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: pn2.clone(),
             },
         );
 
         match &responses[0].message {
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 accepted: Some((pn, val)),
                 ..
             } => {
@@ -1102,7 +1111,7 @@ mod tests {
         for out in &outgoing {
             assert!(matches!(
                 &out.message,
-                MessageVariant::Prepare { slot: 0, .. }
+                PaxosMessage::Prepare { slot: 0, .. }
             ));
             assert!(matches!(&out.target, SendTarget::Broadcast));
         }
@@ -1130,7 +1139,7 @@ mod tests {
         // Should produce Decide broadcast
         assert!(outgoing
             .iter()
-            .any(|o| matches!(&o.message, MessageVariant::Decide { .. })));
+            .any(|o| matches!(&o.message, PaxosMessage::Decide { .. })));
 
         let decisions = proto.take_decisions();
         assert_eq!(decisions.len(), 1);
@@ -1147,7 +1156,7 @@ mod tests {
         let pn = proto.instances.get(&0).unwrap().proposal_number.clone();
         let responses = proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1158,7 +1167,7 @@ mod tests {
         assert!(!responses.is_empty());
         for out in &responses {
             match &out.message {
-                MessageVariant::Accept { value, .. } => assert_eq!(value, "hello"),
+                PaxosMessage::Accept { value, .. } => assert_eq!(value, "hello"),
                 _ => panic!("expected Accept, got {:?}", out.message),
             }
         }
@@ -1174,7 +1183,7 @@ mod tests {
         // Peer b already accepted a value at a lower proposal number
         let responses = proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: Some(((1, node("c")), "previous-value".to_string())),
@@ -1184,7 +1193,7 @@ mod tests {
         // Phase 2 should use "previous-value", not "my-value"
         for out in &responses {
             match &out.message {
-                MessageVariant::Accept { value, .. } => assert_eq!(value, "previous-value"),
+                PaxosMessage::Accept { value, .. } => assert_eq!(value, "previous-value"),
                 _ => panic!("expected Accept"),
             }
         }
@@ -1199,7 +1208,7 @@ mod tests {
         // Peer b accepted at round 1
         proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: Some(((1, node("x")), "old-value".to_string())),
@@ -1209,7 +1218,7 @@ mod tests {
         // Peer c accepted at round 3 (higher)
         let responses = proto.handle_message(
             node("c"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: Some(((3, node("y")), "newer-value".to_string())),
@@ -1219,7 +1228,7 @@ mod tests {
         // Should use "newer-value" (highest proposal number)
         for out in &responses {
             match &out.message {
-                MessageVariant::Accept { value, .. } => assert_eq!(value, "newer-value"),
+                PaxosMessage::Accept { value, .. } => assert_eq!(value, "newer-value"),
                 _ => panic!("expected Accept"),
             }
         }
@@ -1234,7 +1243,7 @@ mod tests {
         // Same peer sends Promise twice
         proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1242,7 +1251,7 @@ mod tests {
         );
         let responses = proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1264,7 +1273,7 @@ mod tests {
         // Get quorum of promises to move to Phase 2
         proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1274,7 +1283,7 @@ mod tests {
         // Now we need one more Accepted (already have self-vote from Phase 2)
         let responses = proto.handle_message(
             node("b"),
-            MessageVariant::Accepted {
+            PaxosMessage::Accepted {
                 slot: 0,
                 proposal_number: pn.clone(),
                 value: "hello".to_string(),
@@ -1284,7 +1293,7 @@ mod tests {
         // Should broadcast Decide
         assert!(responses
             .iter()
-            .any(|o| matches!(&o.message, MessageVariant::Decide { .. })));
+            .any(|o| matches!(&o.message, PaxosMessage::Decide { .. })));
 
         let decisions = proto.take_decisions();
         assert_eq!(decisions.len(), 1);
@@ -1300,7 +1309,7 @@ mod tests {
         // Get quorum of promises (self + b + c = 3)
         proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1308,7 +1317,7 @@ mod tests {
         );
         proto.handle_message(
             node("c"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1318,7 +1327,7 @@ mod tests {
         // Same peer sends Accepted twice — should not trigger early quorum
         proto.handle_message(
             node("b"),
-            MessageVariant::Accepted {
+            PaxosMessage::Accepted {
                 slot: 0,
                 proposal_number: pn.clone(),
                 value: "hello".to_string(),
@@ -1326,7 +1335,7 @@ mod tests {
         );
         let responses = proto.handle_message(
             node("b"),
-            MessageVariant::Accepted {
+            PaxosMessage::Accepted {
                 slot: 0,
                 proposal_number: pn.clone(),
                 value: "hello".to_string(),
@@ -1344,7 +1353,7 @@ mod tests {
 
         proto.handle_message(
             node("b"),
-            MessageVariant::Decide {
+            PaxosMessage::Decide {
                 slot: 5,
                 value: "remote-decision".to_string(),
             },
@@ -1364,7 +1373,7 @@ mod tests {
         let mut proto = make_protocol("a", 3);
         proto.handle_message(
             node("b"),
-            MessageVariant::Decide {
+            PaxosMessage::Decide {
                 slot: 0,
                 value: "decided".to_string(),
             },
@@ -1375,7 +1384,7 @@ mod tests {
         // so the sender can learn the outcome (important for lossy networks).
         let responses = proto.handle_message(
             node("c"),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (10, node("c")),
             },
@@ -1383,7 +1392,7 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(matches!(
             &responses[0].message,
-            MessageVariant::Decide { slot: 0, value } if value == "decided"
+            PaxosMessage::Decide { slot: 0, value } if value == "decided"
         ));
         assert!(matches!(&responses[0].target, SendTarget::Peer(id) if id == &node("c")));
     }
@@ -1393,7 +1402,7 @@ mod tests {
         let mut proto = make_protocol("a", 3);
         proto.handle_message(
             node("b"),
-            MessageVariant::Decide {
+            PaxosMessage::Decide {
                 slot: 0,
                 value: "done".to_string(),
             },
@@ -1413,7 +1422,7 @@ mod tests {
 
         proto.handle_message(
             node("b"),
-            MessageVariant::Decide {
+            PaxosMessage::Decide {
                 slot: 0,
                 value: "my-value".to_string(),
             },
@@ -1431,7 +1440,7 @@ mod tests {
         // A different value decided for our slot
         proto.handle_message(
             node("b"),
-            MessageVariant::Decide {
+            PaxosMessage::Decide {
                 slot: 0,
                 value: "other-value".to_string(),
             },
@@ -1452,7 +1461,7 @@ mod tests {
 
         proto.handle_message(
             node("b"),
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot: 0,
                 proposal_number: pn,
                 highest_promised: (10, node("b")),
@@ -1474,7 +1483,7 @@ mod tests {
         // Nack so retry is allowed
         proto.handle_message(
             node("b"),
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot: 0,
                 proposal_number: old_pn.clone(),
                 highest_promised: (5, node("b")),
@@ -1499,7 +1508,7 @@ mod tests {
         let from = node("b");
         proto.handle_message(
             from.clone(),
-            MessageVariant::Accept {
+            PaxosMessage::Accept {
                 slot: 0,
                 proposal_number: (5, from.clone()),
                 value: "other".to_string(),
@@ -1509,7 +1518,7 @@ mod tests {
         // Nack and retry
         proto.handle_message(
             from.clone(),
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot: 0,
                 proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
                 highest_promised: (10, from),
@@ -1532,7 +1541,7 @@ mod tests {
         // Another proposer's Prepare updates our acceptor's highest_promised to round 20
         proto.handle_message(
             node("c"),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (20, node("c")),
             },
@@ -1541,7 +1550,7 @@ mod tests {
         // Our proposal gets nacked with a lower round (5)
         proto.handle_message(
             node("b"),
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot: 0,
                 proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
                 highest_promised: (5, node("b")),
@@ -1564,7 +1573,7 @@ mod tests {
         // Another proposer updates our highest_promised to a high round
         proto.handle_message(
             node("c"),
-            MessageVariant::Prepare {
+            PaxosMessage::Prepare {
                 slot: 0,
                 proposal_number: (100, node("c")),
             },
@@ -1573,7 +1582,7 @@ mod tests {
         // Now peer b sends Promise for our original (low) proposal number
         let _responses = proto.handle_message(
             node("b"),
-            MessageVariant::Promise {
+            PaxosMessage::Promise {
                 slot: 0,
                 proposal_number: pn.clone(),
                 accepted: None,
@@ -1597,7 +1606,7 @@ mod tests {
 
         proto.handle_message(
             node("b"),
-            MessageVariant::NackPrepare {
+            PaxosMessage::NackPrepare {
                 slot: 0,
                 proposal_number: proto.instances.get(&0).unwrap().proposal_number.clone(),
                 highest_promised: (5, node("b")),

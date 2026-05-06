@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::config::{NodeId, PeerInfo};
 use crate::error::{NodeError, ProposeError};
-use crate::message::{Message, MessageVariant};
+#[cfg(feature = "multi-paxos")]
+use crate::message::PaxosMessage;
+use crate::message::{Message, WireVariant};
 use crate::protocol::{Outgoing, ProtocolState, SendTarget};
 use crate::storage::Storage;
 use crate::transport::{MessageReceiver, MessageSender};
@@ -302,7 +304,7 @@ where
                     tracing::debug!(leader = %leader_id, "forwarding proposal to leader");
                     let outgoing = vec![Outgoing {
                         target: SendTarget::Peer(leader_id),
-                        message: MessageVariant::Forward {
+                        message: PaxosMessage::Forward {
                             value: value.clone(),
                         },
                     }];
@@ -331,8 +333,9 @@ where
         match Message::<V>::from_bytes(data) {
             Ok(msg) => {
                 let from = msg.sender;
-                let variant = msg.variant;
-                let outgoing = self.protocol.handle_message(from, variant);
+                let outgoing = match msg.variant {
+                    WireVariant::Paxos(pm) => self.protocol.handle_message(from, pm),
+                };
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
@@ -407,7 +410,7 @@ where
         for out in outgoing {
             let msg = Message {
                 sender: node_id.clone(),
-                variant: out.message.clone(),
+                variant: WireVariant::Paxos(out.message.clone()),
             };
             let bytes = match msg.to_bytes() {
                 Ok(b) => b,
