@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rand::seq::SliceRandom;
 use rand::RngExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use concensus::{MessageReceiver, MessageSender, TransportError};
@@ -341,6 +341,49 @@ impl<R: MessageReceiver + Send> MessageReceiver for ReorderingReceiver<R> {
         batch.reverse();
         self.buffer = batch;
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toggleable drop transport (for partition simulation)
+// ---------------------------------------------------------------------------
+
+/// Sender that drops all messages when `drop` is true; otherwise forwards.
+/// Use for partition simulation — flip per-edge drop flags from a test.
+pub struct ToggleDropSender<S: MessageSender> {
+    inner: S,
+    drop: std::sync::Arc<AtomicBool>,
+}
+
+impl<S: MessageSender> ToggleDropSender<S> {
+    pub fn new(inner: S) -> (Self, std::sync::Arc<AtomicBool>) {
+        let drop = std::sync::Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                inner,
+                drop: drop.clone(),
+            },
+            drop,
+        )
+    }
+}
+
+impl<S: MessageSender + Clone> Clone for ToggleDropSender<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            drop: self.drop.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: MessageSender + Sync> MessageSender for ToggleDropSender<S> {
+    async fn send(&self, data: Bytes) -> Result<(), TransportError> {
+        if self.drop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.inner.send(data).await
     }
 }
 

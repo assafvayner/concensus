@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use transport_filters::{
     DelayedSender, LossyReceiver, LossySender, ReorderingReceiver, ReorderingSender,
+    ToggleDropSender,
 };
 
 // ---------------------------------------------------------------------------
@@ -528,6 +529,69 @@ pub fn create_raft_lossy_delayed_cluster(
         });
     }
     out
+}
+
+pub fn create_raft_cluster_with_edge_filters(
+    n: usize,
+) -> (
+    Vec<ClusterNode>,
+    HashMap<(NodeId, NodeId), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) {
+    assert!(n > 0);
+    let cfg = test_raft_config();
+    let ids: Vec<NodeId> = (0..n)
+        .map(|i| NodeId::new(format!("node-{i}"), 1000))
+        .collect();
+    // Each peer has its own incoming receiver. Per-edge senders wrap the
+    // receiver's tx with a ToggleDropSender — one per (from, to) pair.
+    let mut rx_for: HashMap<NodeId, ChannelReceiver> = HashMap::new();
+    let mut base_tx: HashMap<NodeId, ChannelSender> = HashMap::new();
+    for id in &ids {
+        let (tx, rx) = unbounded_channel();
+        base_tx.insert(id.clone(), tx);
+        rx_for.insert(id.clone(), rx);
+    }
+    let mut edges: HashMap<(NodeId, NodeId), std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        HashMap::new();
+    let mut edge_senders: HashMap<(NodeId, NodeId), ToggleDropSender<ChannelSender>> =
+        HashMap::new();
+    for from in &ids {
+        for to in &ids {
+            if from == to {
+                continue;
+            }
+            let (sender, flag) = ToggleDropSender::new(base_tx[to].clone());
+            edge_senders.insert((from.clone(), to.clone()), sender);
+            edges.insert((from.clone(), to.clone()), flag);
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for me in &ids {
+        let peers: Vec<PeerInfo<ToggleDropSender<ChannelSender>>> = ids
+            .iter()
+            .filter(|other| *other != me)
+            .map(|other| PeerInfo {
+                id: other.clone(),
+                sender: edge_senders[&(me.clone(), other.clone())].clone(),
+            })
+            .collect();
+        let recv = rx_for.remove(me).unwrap();
+        let (node, handle, decisions) = Node::with_raft_config_and_id(
+            me.clone(),
+            cfg.clone(),
+            peers,
+            recv,
+            MemoryStorage::<String>::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+        out.push(ClusterNode {
+            handle,
+            decisions,
+            run_handle,
+            id: me.clone(),
+        });
+    }
+    (out, edges)
 }
 
 fn create_raft_cluster_inner(n: usize, config: concensus::RaftConfig) -> Vec<ClusterNode> {

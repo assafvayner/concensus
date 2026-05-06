@@ -75,3 +75,69 @@ async fn leader_failover_resumes_progress() {
     );
     let _ = cluster;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_partition_majority_progresses() {
+    use std::sync::atomic::Ordering;
+    let (mut cluster, edges) = helpers::create_raft_cluster_with_edge_filters(5);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Partition: nodes [0,1,2] | nodes [3,4]. Drop every cross-group edge.
+    let group_a = vec![
+        cluster[0].id.clone(),
+        cluster[1].id.clone(),
+        cluster[2].id.clone(),
+    ];
+    let group_b = vec![cluster[3].id.clone(), cluster[4].id.clone()];
+    for from in &group_a {
+        for to in &group_b {
+            edges[&(from.clone(), to.clone())].store(true, Ordering::Relaxed);
+            edges[&(to.clone(), from.clone())].store(true, Ordering::Relaxed);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    cluster[0]
+        .handle
+        .propose("majority-1".into())
+        .await
+        .unwrap();
+    cluster[1]
+        .handle
+        .propose("majority-2".into())
+        .await
+        .unwrap();
+    let mut majority_decisions = Vec::new();
+    for i in 0..3 {
+        let d =
+            collect_decisions_with_timeout(&mut cluster[i].decisions, 2, Duration::from_secs(8))
+                .await;
+        majority_decisions.push(d);
+    }
+
+    // Minority side cannot commit (no quorum). Try to propose; expect no decision.
+    cluster[3].handle.propose("minority".into()).await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), cluster[3].decisions.recv()).await;
+    assert!(
+        res.is_err() || res.ok().flatten().is_none(),
+        "minority must not decide while partitioned"
+    );
+
+    // Heal.
+    for from in &group_a {
+        for to in &group_b {
+            edges[&(from.clone(), to.clone())].store(false, Ordering::Relaxed);
+            edges[&(to.clone(), from.clone())].store(false, Ordering::Relaxed);
+        }
+    }
+    let mut minority_decisions = Vec::new();
+    for i in 3..5 {
+        let d =
+            collect_decisions_with_timeout(&mut cluster[i].decisions, 2, Duration::from_secs(15))
+                .await;
+        minority_decisions.push(d);
+    }
+    let mut all = majority_decisions;
+    all.extend(minority_decisions);
+    assert_safety_invariant(&all);
+}
