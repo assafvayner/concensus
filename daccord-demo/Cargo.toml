@@ -27,6 +27,7 @@ hostname = "0.4"
 
 [features]
 multi-paxos = ["daccord/multi-paxos"]
+duckdb-bundled = ["daccord/duckdb-bundled"]
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -9,6 +9,8 @@ use daccord::{
     DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, ProposeError,
     RaftConfig, RaftMemoryStorage, TcpTransport, UdsTransport,
 };
+#[cfg(feature = "duckdb-bundled")]
+use daccord::{DuckdbPaxosStorage, DuckdbRaftStorage};
 
 pub mod consensus_proto {
     tonic::include_proto!("consensus");
@@ -55,6 +57,7 @@ struct Config {
     transport: Transport,
     grpc_port: u16,
     algorithm: Algorithm,
+    data_dir: Option<PathBuf>,
 }
 
 fn resolve_algorithm() -> Algorithm {
@@ -108,12 +111,14 @@ fn parse_config() -> Config {
     };
 
     let algorithm = resolve_algorithm();
+    let data_dir = std::env::var("DATA_DIR").ok().map(PathBuf::from);
 
     Config {
         node_name,
         transport,
         grpc_port,
         algorithm,
+        data_dir,
     }
 }
 
@@ -256,6 +261,7 @@ async fn start_node_tcp(
     algorithm: Algorithm,
     bind_addr: SocketAddr,
     peers: Vec<(NodeId, String)>,
+    data_dir: Option<&Path>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
     let peers = resolve_tcp_peers(peers).await;
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
@@ -263,15 +269,33 @@ async fn start_node_tcp(
         .expect("failed to bind TCP transport");
 
     let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::paxos_with_id(
+    let (node, handle, decision_rx) = match (algorithm, data_dir) {
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            node_id,
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            DuckdbPaxosStorage::<String>::open(dir.join("paxos.db"))
+                .expect("failed to open DuckDB Paxos storage"),
+        ),
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            node_id,
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            DuckdbRaftStorage::<String>::open(dir.join("raft.db"))
+                .expect("failed to open DuckDB Raft storage"),
+        ),
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
             node_id,
             PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<String>::new(),
         ),
-        Algorithm::Raft => Node::raft_with_id(
+        (Algorithm::Raft, _) => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
@@ -296,21 +320,40 @@ async fn start_node_uds(
     algorithm: Algorithm,
     bind_path: PathBuf,
     peers: Vec<(NodeId, PathBuf)>,
+    data_dir: Option<&Path>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
     let (peer_infos, receiver) = UdsTransport::create(bind_path, peers)
         .await
         .expect("failed to bind UDS transport");
 
     let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::paxos_with_id(
+    let (node, handle, decision_rx) = match (algorithm, data_dir) {
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            node_id,
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            DuckdbPaxosStorage::<String>::open(dir.join("paxos.db"))
+                .expect("failed to open DuckDB Paxos storage"),
+        ),
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            node_id,
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            DuckdbRaftStorage::<String>::open(dir.join("raft.db"))
+                .expect("failed to open DuckDB Raft storage"),
+        ),
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
             node_id,
             PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<String>::new(),
         ),
-        Algorithm::Raft => Node::raft_with_id(
+        (Algorithm::Raft, _) => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
@@ -349,6 +392,7 @@ async fn main() {
         "using consensus algorithm"
     );
 
+    let data_dir = config.data_dir.as_deref();
     let (handle, decision_rx) = match config.transport {
         Transport::Tcp { bind_addr, peers } => {
             tracing::info!(
@@ -357,9 +401,17 @@ async fn main() {
                 bind = %bind_addr,
                 grpc_port = config.grpc_port,
                 algorithm = %config.algorithm.as_str(),
+                data_dir = ?data_dir,
                 "node started"
             );
-            start_node_tcp(&config.node_name, config.algorithm, bind_addr, peers).await
+            start_node_tcp(
+                &config.node_name,
+                config.algorithm,
+                bind_addr,
+                peers,
+                data_dir,
+            )
+            .await
         }
         Transport::Uds { bind_path, peers } => {
             tracing::info!(
@@ -368,9 +420,17 @@ async fn main() {
                 bind = ?bind_path,
                 grpc_port = config.grpc_port,
                 algorithm = %config.algorithm.as_str(),
+                data_dir = ?data_dir,
                 "node started"
             );
-            start_node_uds(&config.node_name, config.algorithm, bind_path, peers).await
+            start_node_uds(
+                &config.node_name,
+                config.algorithm,
+                bind_path,
+                peers,
+                data_dir,
+            )
+            .await
         }
     };
 

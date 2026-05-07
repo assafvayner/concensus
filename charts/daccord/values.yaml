@@ -1,0 +1,77 @@
+# Default values for the daccord chart.
+# A 3-node consensus cluster requires odd replicaCount; the design point is 3.
+
+replicaCount: 3
+
+image:
+  # Set repository to the registry/path where you've pushed the image built
+  # from daccord-demo/Dockerfile with --build-arg FEATURES=duckdb-bundled.
+  # Example: ghcr.io/assafvayner/daccord-node
+  repository: ""
+  # Falls back to .Chart.AppVersion if empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Consensus algorithm. Valid: "paxos" | "raft" | "multi-paxos".
+# Note: "multi-paxos" requires the image to be built with
+# --build-arg FEATURES=duckdb-bundled,multi-paxos. The chart sets ALGORITHM=paxos
+# in that case (the multi-paxos variant is selected at compile time, not runtime).
+algorithm: raft
+
+ports:
+  # Inter-node TCP transport (consensus traffic between pods).
+  consensus: 9000
+  # Client gRPC API.
+  grpc: 50051
+
+persistence:
+  # When true, each pod gets a PVC mounted at mountPath and DATA_DIR is set so
+  # the binary uses DuckDB-backed storage. When false, an emptyDir is used and
+  # state is in-memory only — pods restarting will lose all consensus state.
+  enabled: true
+  size: 1Gi
+  # Empty string => use cluster default StorageClass.
+  storageClassName: ""
+  mountPath: /data
+  # accessModes for the PVC. ReadWriteOnce is correct for per-pod storage.
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  # ClusterIP for in-cluster access. The chart also creates a separate headless
+  # service for stable per-pod DNS used by inter-node consensus traffic.
+  type: ClusterIP
+  # Optional annotations on the client-facing Service.
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+logging:
+  # Mapped to RUST_LOG. Examples: "info", "debug", "daccord=debug,info".
+  level: info
+
+probes:
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 6
+  liveness:
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 4
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
