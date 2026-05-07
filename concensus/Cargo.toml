@@ -22,3 +22,4 @@ rand = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
+proptest = "1.4"

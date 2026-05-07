@@ -14,12 +14,8 @@ async fn safety_under_loss_with_concurrent_proposers() {
     let mut cluster = create_lossy_cluster(5, 0.15);
 
     // All 5 nodes propose simultaneously.
-    for i in 0..5 {
-        cluster[i]
-            .handle
-            .propose(format!("val-{}", i))
-            .await
-            .unwrap();
+    for (i, node) in cluster.iter().enumerate().take(5) {
+        node.handle.propose(format!("val-{}", i)).await.unwrap();
     }
 
     // Collect up to 5 decisions per node, tolerating fewer.
@@ -51,12 +47,8 @@ async fn safety_four_node_under_loss_with_concurrent_proposers() {
     let mut cluster = create_lossy_cluster(4, 0.15);
 
     // All 4 nodes propose simultaneously.
-    for i in 0..4 {
-        cluster[i]
-            .handle
-            .propose(format!("val-{}", i))
-            .await
-            .unwrap();
+    for (i, node) in cluster.iter().enumerate().take(4) {
+        node.handle.propose(format!("val-{}", i)).await.unwrap();
     }
 
     // Collect up to 4 decisions per node, tolerating fewer.
@@ -88,13 +80,9 @@ async fn safety_under_rapid_concurrent_proposals() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
     // Each node proposes 10 values.
-    for i in 0..3 {
+    for (i, node) in cluster.iter().enumerate().take(3) {
         for j in 0..10 {
-            cluster[i]
-                .handle
-                .propose(format!("n{}-v{}", i, j))
-                .await
-                .unwrap();
+            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
         }
     }
 
@@ -130,13 +118,9 @@ async fn safety_under_loss_and_delay() {
     let mut cluster = create_lossy_delayed_cluster(5, 0.10, 0, 30);
 
     // First 3 nodes propose 5 values each.
-    for i in 0..3 {
+    for (i, node) in cluster.iter().enumerate().take(3) {
         for j in 0..5 {
-            cluster[i]
-                .handle
-                .propose(format!("n{}-v{}", i, j))
-                .await
-                .unwrap();
+            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
         }
     }
 

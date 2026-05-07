@@ -83,6 +83,61 @@ impl<'de> Deserialize<'de> for NodeId {
     }
 }
 
+use std::time::Duration;
+
+/// Configuration specific to the Multi-Paxos algorithm.
+#[derive(Clone, Debug)]
+pub struct PaxosConfig {
+    /// How often a leader sends heartbeats to followers.
+    pub heartbeat_interval: Duration,
+}
+
+impl Default for PaxosConfig {
+    fn default() -> Self {
+        Self {
+            // Matches the previous hard-coded leader heartbeat cadence.
+            heartbeat_interval: Duration::from_millis(100),
+        }
+    }
+}
+
+/// Configuration specific to the Raft algorithm.
+///
+/// `election_timeout_min` must be `<= election_timeout_max`; otherwise the
+/// timeout sampler degenerates to a fixed value, defeating the randomization
+/// that prevents split-vote storms. Validate with [`RaftConfig::validate`]
+/// before constructing a [`Node::raft`](crate::Node::raft).
+#[derive(Clone, Debug)]
+pub struct RaftConfig {
+    /// How often a leader sends heartbeats to followers.
+    pub heartbeat_interval: Duration,
+    /// Lower bound of the randomized election timeout (inclusive).
+    pub election_timeout_min: Duration,
+    /// Upper bound of the randomized election timeout (inclusive).
+    pub election_timeout_max: Duration,
+}
+
+impl RaftConfig {
+    /// Returns `Err` with a description if the config is internally inconsistent.
+    /// Currently checks `election_timeout_min <= election_timeout_max`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.election_timeout_min > self.election_timeout_max {
+            return Err("election_timeout_min must be <= election_timeout_max");
+        }
+        Ok(())
+    }
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_millis(50),
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +207,28 @@ mod tests {
             id: NodeId::new("peer-1", 1000),
             sender: DummySender,
         };
+    }
+
+    #[test]
+    fn paxos_config_defaults() {
+        let cfg = PaxosConfig::default();
+        assert_eq!(
+            cfg.heartbeat_interval,
+            std::time::Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn raft_config_defaults() {
+        let cfg = RaftConfig::default();
+        assert_eq!(cfg.heartbeat_interval, std::time::Duration::from_millis(50));
+        assert_eq!(
+            cfg.election_timeout_min,
+            std::time::Duration::from_millis(150)
+        );
+        assert_eq!(
+            cfg.election_timeout_max,
+            std::time::Duration::from_millis(300)
+        );
     }
 }

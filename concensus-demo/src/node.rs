@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use concensus::{
-    DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, ProposeError, TcpTransport,
-    UdsTransport,
+    DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, ProposeError,
+    RaftConfig, RaftMemoryStorage, TcpTransport, UdsTransport,
 };
 
 pub mod consensus_proto {
@@ -17,7 +17,7 @@ pub mod consensus_proto {
 use consensus_proto::consensus_service_server::{ConsensusService, ConsensusServiceServer};
 use consensus_proto::{
     Decision, GetDecisionsRequest, GetDecisionsResponse, HealthRequest, HealthResponse,
-    ProposeRequest, ProposeResponse,
+    ProposeRequest, ProposeResponse, StatusRequest, StatusResponse,
 };
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -34,11 +34,36 @@ enum Transport {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Algorithm {
+    Paxos,
+    Raft,
+}
+
+impl Algorithm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Algorithm::Paxos => "paxos",
+            Algorithm::Raft => "raft",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     node_name: String,
     transport: Transport,
     grpc_port: u16,
+    algorithm: Algorithm,
+}
+
+fn resolve_algorithm() -> Algorithm {
+    let raw = std::env::var("ALGORITHM").unwrap_or_else(|_| "paxos".to_string());
+    match raw.as_str() {
+        "raft" => Algorithm::Raft,
+        "paxos" | "" => Algorithm::Paxos,
+        other => panic!("ALGORITHM must be 'paxos' or 'raft', got '{}'", other),
+    }
 }
 
 fn resolve_node_name() -> String {
@@ -82,10 +107,13 @@ fn parse_config() -> Config {
         other => panic!("TRANSPORT must be 'tcp' or 'uds', got '{}'", other),
     };
 
+    let algorithm = resolve_algorithm();
+
     Config {
         node_name,
         transport,
         grpc_port,
+        algorithm,
     }
 }
 
@@ -139,6 +167,8 @@ type DecisionList = Arc<RwLock<Vec<Decision>>>;
 struct ConsensusServiceImpl {
     handle: NodeHandle<String>,
     decisions: DecisionList,
+    node_id: String,
+    algorithm: Algorithm,
 }
 
 #[tonic::async_trait]
@@ -177,6 +207,24 @@ impl ConsensusService for ConsensusServiceImpl {
             status: "ok".to_string(),
         }))
     }
+
+    async fn status(
+        &self,
+        _request: Request<StatusRequest>,
+    ) -> Result<Response<StatusResponse>, Status> {
+        Ok(Response::new(StatusResponse {
+            node_id: self.node_id.clone(),
+            algorithm: self.algorithm.as_str().to_string(),
+            role: "N/A".into(),
+            term: 0,
+            leader: String::new(),
+            log_len: 0,
+            has_commit_index: false,
+            commit_index: 0,
+            has_last_applied: false,
+            last_applied: 0,
+        }))
+    }
 }
 
 // ─── Decision collector ──────────────────────────────────────────────────────
@@ -205,17 +253,32 @@ async fn collect_decisions(
 
 async fn start_node_tcp(
     node_name: &str,
+    algorithm: Algorithm,
     bind_addr: SocketAddr,
     peers: Vec<(NodeId, String)>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
     let peers = resolve_tcp_peers(peers).await;
-    let storage = MemoryStorage::<String>::new();
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
         .await
         .expect("failed to bind TCP transport");
 
     let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = Node::with_id(node_id, peer_infos, receiver, storage);
+    let (node, handle, decision_rx) = match algorithm {
+        Algorithm::Paxos => Node::paxos_with_id(
+            node_id,
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            PaxosMemoryStorage::<String>::new(),
+        ),
+        Algorithm::Raft => Node::raft_with_id(
+            node_id,
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            RaftMemoryStorage::<String>::new(),
+        ),
+    };
 
     let name = node_name.to_string();
     tokio::spawn(async move {
@@ -230,16 +293,31 @@ async fn start_node_tcp(
 
 async fn start_node_uds(
     node_name: &str,
+    algorithm: Algorithm,
     bind_path: PathBuf,
     peers: Vec<(NodeId, PathBuf)>,
 ) -> (NodeHandle<String>, DecisionReceiver<String>) {
-    let storage = MemoryStorage::<String>::new();
     let (peer_infos, receiver) = UdsTransport::create(bind_path, peers)
         .await
         .expect("failed to bind UDS transport");
 
     let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = Node::with_id(node_id, peer_infos, receiver, storage);
+    let (node, handle, decision_rx) = match algorithm {
+        Algorithm::Paxos => Node::paxos_with_id(
+            node_id,
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            PaxosMemoryStorage::<String>::new(),
+        ),
+        Algorithm::Raft => Node::raft_with_id(
+            node_id,
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            RaftMemoryStorage::<String>::new(),
+        ),
+    };
 
     let name = node_name.to_string();
     tokio::spawn(async move {
@@ -266,6 +344,11 @@ async fn main() {
 
     let config = parse_config();
 
+    tracing::info!(
+        algorithm = %config.algorithm.as_str(),
+        "using consensus algorithm"
+    );
+
     let (handle, decision_rx) = match config.transport {
         Transport::Tcp { bind_addr, peers } => {
             tracing::info!(
@@ -273,9 +356,10 @@ async fn main() {
                 transport = "tcp",
                 bind = %bind_addr,
                 grpc_port = config.grpc_port,
+                algorithm = %config.algorithm.as_str(),
                 "node started"
             );
-            start_node_tcp(&config.node_name, bind_addr, peers).await
+            start_node_tcp(&config.node_name, config.algorithm, bind_addr, peers).await
         }
         Transport::Uds { bind_path, peers } => {
             tracing::info!(
@@ -283,9 +367,10 @@ async fn main() {
                 transport = "uds",
                 bind = ?bind_path,
                 grpc_port = config.grpc_port,
+                algorithm = %config.algorithm.as_str(),
                 "node started"
             );
-            start_node_uds(&config.node_name, bind_path, peers).await
+            start_node_uds(&config.node_name, config.algorithm, bind_path, peers).await
         }
     };
 
@@ -301,7 +386,12 @@ async fn main() {
         .parse()
         .expect("invalid gRPC address");
 
-    let service = ConsensusServiceImpl { handle, decisions };
+    let service = ConsensusServiceImpl {
+        handle,
+        decisions,
+        node_id: config.node_name.clone(),
+        algorithm: config.algorithm,
+    };
 
     tracing::info!(addr = %grpc_addr, "gRPC server starting");
 

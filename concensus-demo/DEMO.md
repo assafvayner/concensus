@@ -19,13 +19,14 @@ Install protoc:
 
 ## Architecture
 
-The demo runs a 3-node Paxos consensus cluster. Each node runs:
-- A **consensus transport** (TCP or UDS) for inter-node Paxos messages
+The demo runs a 3-node consensus cluster. Each node runs:
+- A **consensus transport** (TCP or UDS) for inter-node messages
 - A **gRPC server** for external interaction (propose values, query decisions, health checks)
 
-Two transport configurations are available:
-- **TCP** (`docker-compose.tcp.yml`) — nodes communicate over a Docker bridge network
-- **UDS** (`docker-compose.uds.yml`) — nodes communicate via Unix domain sockets on a shared volume
+Three compose configurations are available:
+- **TCP** (`docker-compose.tcp.yml`) — Paxos over a Docker bridge network
+- **UDS** (`docker-compose.uds.yml`) — Paxos over Unix domain sockets on a shared volume
+- **Raft** (`docker-compose.raft.yml`) — Raft over TCP (selects the algorithm via `ALGORITHM=raft`)
 
 Node 1 exposes its gRPC port (50051) to the host for CLI access.
 
@@ -44,6 +45,28 @@ docker compose -f docker-compose.tcp.yml up --build -d
 ```bash
 docker compose -f docker-compose.uds.yml up --build -d
 ```
+
+### Running with Raft
+
+The demo also supports Raft as an alternative consensus algorithm:
+
+```bash
+docker compose -f docker-compose.raft.yml up --build -d
+
+# Wait for nodes to become healthy and elect a leader (~1-2 seconds)
+docker compose -f docker-compose.raft.yml ps
+
+# Propose values
+cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 propose --value "alice"
+
+# View decided values
+cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 decisions
+
+# Shut down
+docker compose -f docker-compose.raft.yml down
+```
+
+The cluster runs with the same gRPC API as the TCP/UDS variants — only the underlying consensus algorithm changes.
 
 ### Verify nodes are healthy
 
@@ -197,6 +220,7 @@ These are configured in the compose files but can be overridden:
 | `BIND_PATH` | — | UDS socket path (e.g. `/sockets/node-1.sock`) |
 | `PEERS` | — | Comma-separated `name=address` pairs |
 | `GRPC_PORT` | — | gRPC server port |
+| `ALGORITHM` | `paxos` | Consensus algorithm (`paxos` or `raft`) |
 | `RUST_LOG` | `info` | Log level filter (`debug`, `info`, `warn`, `error`) |
 
 ## Adding More Nodes

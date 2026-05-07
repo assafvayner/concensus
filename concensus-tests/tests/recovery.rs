@@ -1,11 +1,14 @@
 mod helpers;
 
-use concensus::{channel, ChannelSender, Decided, MemoryStorage, Node, NodeId, PeerInfo};
+use concensus::{
+    channel, ChannelSender, Decided, Node, NodeId, PaxosConfig, PaxosMemoryStorage, PeerInfo,
+};
 use helpers::SharedMemoryStorage;
 use tokio::time::{timeout, Duration};
 
 /// Helper: build a 3-node cluster where node-0 uses the given `SharedMemoryStorage`
-/// and the other two use fresh `MemoryStorage`.
+/// and the other two use fresh `PaxosMemoryStorage`.
+#[allow(clippy::type_complexity)]
 fn build_cluster(
     ids: &[NodeId; 3],
     storage0: SharedMemoryStorage<String>,
@@ -49,18 +52,26 @@ fn build_cluster(
         },
     ];
 
-    let (node0, handle0, dec0) = Node::with_id(ids[0].clone(), peers_for_0, rx0, storage0);
-    let (node1, handle1, dec1) = Node::with_id(
+    let (node0, handle0, dec0) = Node::paxos_with_id(
+        ids[0].clone(),
+        PaxosConfig::default(),
+        peers_for_0,
+        rx0,
+        storage0,
+    );
+    let (node1, handle1, dec1) = Node::paxos_with_id(
         ids[1].clone(),
+        PaxosConfig::default(),
         peers_for_1,
         rx1,
-        MemoryStorage::<String>::new(),
+        PaxosMemoryStorage::<String>::new(),
     );
-    let (node2, handle2, dec2) = Node::with_id(
+    let (node2, handle2, dec2) = Node::paxos_with_id(
         ids[2].clone(),
+        PaxosConfig::default(),
         peers_for_2,
         rx2,
-        MemoryStorage::<String>::new(),
+        PaxosMemoryStorage::<String>::new(),
     );
 
     let rh0 = tokio::spawn(node0.run());
@@ -168,6 +179,23 @@ async fn node_recovers_from_storage_and_continues() {
     teardown(handles2, decisions2, run_handles2);
 }
 
+#[tokio::test]
+async fn shared_raft_storage_handoff_preserves_term_and_log() {
+    use concensus::{LogEntry, RaftStorage};
+    use helpers::SharedRaftStorage;
+    let mut s1 = SharedRaftStorage::<String>::new();
+    s1.save_term(7).await.unwrap();
+    s1.append_log(&[LogEntry {
+        term: 7,
+        value: "x".into(),
+    }])
+    .await
+    .unwrap();
+    let s2 = s1.clone();
+    assert_eq!(s2.load_term().await.unwrap(), 7);
+    assert_eq!(s2.load_log().await.unwrap().len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovered_node_skips_decided_slots() {
     let ids: [NodeId; 3] = [
@@ -223,9 +251,8 @@ async fn recovered_node_skips_decided_slots() {
 
     // Verify nodes 1 and 2 also decided "value-b" (they may decide "value-a" first
     // since they have fresh storage and re-learn slot 0).
-    for i in 1..3 {
-        let collected =
-            collect_until_value(&mut decisions2[i], "value-b", Duration::from_secs(5)).await;
+    for decisions in decisions2.iter_mut().take(3).skip(1) {
+        let collected = collect_until_value(decisions, "value-b", Duration::from_secs(5)).await;
         assert_eq!(collected.last().unwrap().value, "value-b");
     }
 

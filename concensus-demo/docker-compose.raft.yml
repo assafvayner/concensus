@@ -1,0 +1,36 @@
+x-node: &node-base
+  build:
+    context: ..
+    dockerfile: concensus-demo/Dockerfile
+  environment: &node-env
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "node-1=node-1:9000,node-2=node-2:9000,node-3=node-3:9000"
+    GRPC_PORT: "50051"
+    ALGORITHM: raft
+    RUST_LOG: info
+  healthcheck:
+    test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - consensus-net
+
+services:
+  node-1:
+    <<: *node-base
+    hostname: node-1
+    ports:
+      - "50051:50051"
+  node-2:
+    <<: *node-base
+    hostname: node-2
+  node-3:
+    <<: *node-base
+    hostname: node-3
+
+networks:
+  consensus-net:
+    driver: bridge

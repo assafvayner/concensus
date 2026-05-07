@@ -118,8 +118,8 @@ mod tests {
         let msg1 = receiver.recv().await.unwrap();
         let msg2 = receiver.recv().await.unwrap();
         // Both messages received (order is deterministic in bounded channel)
-        assert!(msg1 == Bytes::from("from-1") || msg1 == Bytes::from("from-2"));
-        assert!(msg2 == Bytes::from("from-1") || msg2 == Bytes::from("from-2"));
+        assert!(msg1 == "from-1" || msg1 == "from-2");
+        assert!(msg2 == "from-1" || msg2 == "from-2");
         assert_ne!(msg1, msg2);
     }
 
