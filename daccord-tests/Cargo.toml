@@ -8,6 +8,7 @@ publish = false
 multi-paxos = ["daccord/multi-paxos"]
 duckdb = ["daccord/duckdb"]
 duckdb-bundled = ["daccord/duckdb-bundled"]
+redb = ["daccord/redb"]
 
 [dev-dependencies]
 daccord = { path = "../daccord", features = ["channel-transport", "test-support"] }
