@@ -74,7 +74,9 @@ where
     R: Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut guard = conn.lock().expect("duckdb storage mutex poisoned");
+        let mut guard = conn
+            .lock()
+            .map_err(|e| StorageError::Persist(format!("duckdb storage mutex poisoned: {e}")))?;
         f(&mut guard)
     })
     .await
@@ -86,6 +88,11 @@ where
 // ============================================================================
 
 /// DuckDB-backed [`PaxosStorage`] implementation.
+///
+/// The schema does not encode the value type `V`; values round-trip as JSON
+/// `TEXT`. Reopening an existing file with a different `V` will either
+/// silently misdeserialize (if the JSON happens to be compatible) or fail at
+/// row-load — `V` must remain stable across reopens of the same database.
 pub struct DuckdbPaxosStorage<V> {
     conn: Arc<Mutex<Connection>>,
     _marker: PhantomData<fn() -> V>,
@@ -159,6 +166,12 @@ where
 // ============================================================================
 
 /// DuckDB-backed [`RaftStorage`] implementation.
+///
+/// The schema does not encode the value type `V`; log entries and decisions
+/// round-trip as JSON `TEXT`. Reopening an existing file with a different `V`
+/// will either silently misdeserialize (if the JSON happens to be compatible)
+/// or fail at row-load — `V` must remain stable across reopens of the same
+/// database.
 pub struct DuckdbRaftStorage<V> {
     conn: Arc<Mutex<Connection>>,
     _marker: PhantomData<fn() -> V>,

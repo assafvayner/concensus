@@ -349,11 +349,27 @@ async fn paxos_cluster_restart_recovers_decisions_via_duckdb() {
     }
 
     // Phase 2: rebuild cluster against the same file, propose another value.
+    // Decision delivery is at-least-once across restart, so the channel may
+    // replay any of slots 0..=2 before surfacing the new proposal. Drain until
+    // we see slot 3 — a broken recovery that failed to seed `next_slot` would
+    // land "v3" at slot 0 and we'd time out here.
     let storage0 = DuckdbPaxosStorage::<String>::open(&path).unwrap();
     let (handles2, mut decisions2, run_handles2) = build_paxos_cluster_with_duckdb(&ids, storage0);
     handles2[0].propose("v3".into()).await.unwrap();
-    let timeout_dec = timeout(Duration::from_secs(10), decisions2[0].recv()).await;
-    assert!(timeout_dec.is_ok());
+    let resumed = timeout(Duration::from_secs(10), async {
+        loop {
+            let d = decisions2[0]
+                .recv()
+                .await
+                .expect("decision channel closed");
+            if d.slot == 3 {
+                break d;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for slot 3 decision");
+    assert_eq!(resumed.value, "v3");
 
     for h in handles2 {
         drop(h);
