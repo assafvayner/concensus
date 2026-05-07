@@ -125,7 +125,7 @@ where
 {
     async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError> {
         let serialized = serde_json::to_string(&value).map_err(persist)?;
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute(
                 "INSERT INTO paxos_decisions (slot, value) VALUES (?, ?) \
                  ON CONFLICT (slot) DO UPDATE SET value = excluded.value",
@@ -138,7 +138,7 @@ where
     }
 
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             let mut stmt = conn
                 .prepare("SELECT slot, value FROM paxos_decisions")
                 .map_err(load)?;
@@ -205,7 +205,7 @@ where
 {
     async fn save_decision(&mut self, slot: u64, value: V) -> Result<(), StorageError> {
         let serialized = serde_json::to_string(&value).map_err(persist)?;
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute(
                 "INSERT INTO raft_decisions (slot, value) VALUES (?, ?) \
                  ON CONFLICT (slot) DO UPDATE SET value = excluded.value",
@@ -218,7 +218,7 @@ where
     }
 
     async fn load_decisions(&self) -> Result<Vec<(u64, V)>, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             let mut stmt = conn
                 .prepare("SELECT slot, value FROM raft_decisions")
                 .map_err(load)?;
@@ -241,7 +241,7 @@ where
     }
 
     async fn save_term(&mut self, term: u64) -> Result<(), StorageError> {
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute("UPDATE raft_meta SET term = ? WHERE id = 0", params![term])
                 .map(|_| ())
                 .map_err(persist)
@@ -250,7 +250,7 @@ where
     }
 
     async fn load_term(&self) -> Result<u64, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             conn.query_row("SELECT term FROM raft_meta WHERE id = 0", [], |row| {
                 row.get::<_, u64>(0)
             })
@@ -264,7 +264,7 @@ where
             Some(id) => (Some(id.name().to_string()), Some(id.incarnation())),
             None => (None::<String>, None::<u64>),
         };
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute(
                 "UPDATE raft_meta SET voted_for_name = ?, voted_for_incarnation = ? WHERE id = 0",
                 params![name, incarnation],
@@ -276,7 +276,7 @@ where
     }
 
     async fn load_voted_for(&self) -> Result<Option<NodeId>, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             let row: (Option<String>, Option<u64>) = conn
                 .query_row(
                     "SELECT voted_for_name, voted_for_incarnation FROM raft_meta WHERE id = 0",
@@ -311,7 +311,7 @@ where
         if serialized.is_empty() {
             return Ok(());
         }
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             let tx = conn.transaction().map_err(persist)?;
             let next_index: u64 = tx
                 .query_row(
@@ -335,7 +335,7 @@ where
     }
 
     async fn truncate_log_from(&mut self, index: u64) -> Result<(), StorageError> {
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute("DELETE FROM raft_log WHERE log_index >= ?", params![index])
                 .map(|_| ())
                 .map_err(persist)
@@ -344,7 +344,7 @@ where
     }
 
     async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             let mut stmt = conn
                 .prepare("SELECT term, value FROM raft_log ORDER BY log_index ASC")
                 .map_err(load)?;
@@ -367,7 +367,7 @@ where
     }
 
     async fn save_commit_index(&mut self, commit_index: Option<u64>) -> Result<(), StorageError> {
-        run_blocking(Arc::clone(&self.conn), move |conn| {
+        run_blocking(self.conn.clone(), move |conn| {
             conn.execute(
                 "UPDATE raft_meta SET commit_index = ? WHERE id = 0",
                 params![commit_index],
@@ -379,7 +379,7 @@ where
     }
 
     async fn load_commit_index(&self) -> Result<Option<u64>, StorageError> {
-        run_blocking(Arc::clone(&self.conn), |conn| {
+        run_blocking(self.conn.clone(), |conn| {
             conn.query_row(
                 "SELECT commit_index FROM raft_meta WHERE id = 0",
                 [],
