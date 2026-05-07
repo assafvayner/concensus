@@ -15,12 +15,12 @@
 ## Task 1: Feature flag and message types
 
 **Files:**
-- Modify: `concensus/Cargo.toml`
-- Modify: `concensus/src/message.rs`
+- Modify: `daccord/Cargo.toml`
+- Modify: `daccord/src/message.rs`
 
 - [ ] **Step 1: Add `multi-paxos` feature flag**
 
-In `concensus/Cargo.toml`, add to the `[features]` section:
+In `daccord/Cargo.toml`, add to the `[features]` section:
 
 ```toml
 multi-paxos = []
@@ -28,7 +28,7 @@ multi-paxos = []
 
 - [ ] **Step 2: Add `Forward` and `Heartbeat` message variants**
 
-In `concensus/src/message.rs`, add two new variants to `MessageVariant<V>` gated behind the feature:
+In `daccord/src/message.rs`, add two new variants to `MessageVariant<V>` gated behind the feature:
 
 ```rust
 #[cfg(feature = "multi-paxos")]
@@ -43,12 +43,12 @@ Heartbeat {
 
 - [ ] **Step 3: Verify compilation with and without feature**
 
-Run: `cargo build -p concensus` (without feature — should compile)
-Run: `cargo build -p concensus --features multi-paxos` (with feature — should compile)
+Run: `cargo build -p daccord` (without feature — should compile)
+Run: `cargo build -p daccord --features multi-paxos` (with feature — should compile)
 
 - [ ] **Step 4: Verify existing tests still pass**
 
-Run: `cargo test -p concensus --all-features`
+Run: `cargo test -p daccord --all-features`
 
 - [ ] **Step 5: Commit**
 
@@ -57,7 +57,7 @@ Run: `cargo test -p concensus --all-features`
 ## Task 2: Leader state in ProtocolState
 
 **Files:**
-- Modify: `concensus/src/protocol.rs`
+- Modify: `daccord/src/protocol.rs`
 
 - [ ] **Step 1: Add `LeaderState` enum**
 
@@ -111,8 +111,8 @@ last_decide_time: None,
 
 - [ ] **Step 4: Verify compilation**
 
-Run: `cargo build -p concensus --features multi-paxos`
-Run: `cargo test -p concensus --all-features`
+Run: `cargo build -p daccord --features multi-paxos`
+Run: `cargo test -p daccord --all-features`
 
 - [ ] **Step 5: Commit**
 
@@ -121,7 +121,7 @@ Run: `cargo test -p concensus --all-features`
 ## Task 3: Leader state transitions
 
 **Files:**
-- Modify: `concensus/src/protocol.rs`
+- Modify: `daccord/src/protocol.rs`
 
 This task adds the methods that transition leader state. These are called by the handlers in later tasks.
 
@@ -200,7 +200,7 @@ fn update_highest_seen_round(&mut self, round: u64) {
 
 - [ ] **Step 5: Verify compilation and tests**
 
-Run: `cargo test -p concensus --all-features`
+Run: `cargo test -p daccord --all-features`
 
 - [ ] **Step 6: Commit**
 
@@ -209,7 +209,7 @@ Run: `cargo test -p concensus --all-features`
 ## Task 4: Multi-Paxos propose (Phase 1 skip)
 
 **Files:**
-- Modify: `concensus/src/protocol.rs`
+- Modify: `daccord/src/protocol.rs`
 
 - [ ] **Step 1: Add multi-paxos `propose()` variant**
 
@@ -351,8 +351,8 @@ MessageVariant::Decide { slot, value } => {
 
 - [ ] **Step 6: Verify compilation and existing tests**
 
-Run: `cargo test -p concensus --all-features`
-Run: `cargo test -p concensus` (without multi-paxos — ensure classic path unchanged)
+Run: `cargo test -p daccord --all-features`
+Run: `cargo test -p daccord` (without multi-paxos — ensure classic path unchanged)
 
 - [ ] **Step 7: Commit**
 
@@ -361,7 +361,7 @@ Run: `cargo test -p concensus` (without multi-paxos — ensure classic path unch
 ## Task 5: Heartbeat and election logic
 
 **Files:**
-- Modify: `concensus/src/protocol.rs`
+- Modify: `daccord/src/protocol.rs`
 
 - [ ] **Step 1: Add `should_send_heartbeat()` method**
 
@@ -511,8 +511,8 @@ MessageVariant::Heartbeat { term } => self.handle_heartbeat(from, term),
 
 - [ ] **Step 9: Verify compilation and tests**
 
-Run: `cargo test -p concensus --all-features`
-Run: `cargo test -p concensus` (classic paxos path)
+Run: `cargo test -p daccord --all-features`
+Run: `cargo test -p daccord` (classic paxos path)
 
 - [ ] **Step 10: Commit**
 
@@ -521,7 +521,7 @@ Run: `cargo test -p concensus` (classic paxos path)
 ## Task 6: Node event loop changes
 
 **Files:**
-- Modify: `concensus/src/node.rs`
+- Modify: `daccord/src/node.rs`
 
 - [ ] **Step 1: Add forwarding state to Node struct**
 
@@ -654,8 +654,8 @@ This requires capturing the decisions before they're consumed. Restructure `proc
 
 - [ ] **Step 5: Verify compilation and tests**
 
-Run: `cargo test -p concensus --all-features`
-Run: `cargo test -p concensus` (classic path)
+Run: `cargo test -p daccord --all-features`
+Run: `cargo test -p daccord` (classic path)
 
 - [ ] **Step 6: Commit**
 
@@ -664,16 +664,16 @@ Run: `cargo test -p concensus` (classic path)
 ## Task 7: Multi-Paxos integration tests
 
 **Files:**
-- Modify: `concensus-tests/Cargo.toml`
-- Create: `concensus-tests/tests/multi_paxos.rs`
+- Modify: `daccord-tests/Cargo.toml`
+- Create: `daccord-tests/tests/multi_paxos.rs`
 
 - [ ] **Step 1: Add multi-paxos feature to test crate**
 
-In `concensus-tests/Cargo.toml`:
+In `daccord-tests/Cargo.toml`:
 
 ```toml
 [features]
-multi-paxos = ["concensus/multi-paxos"]
+multi-paxos = ["daccord/multi-paxos"]
 ```
 
 - [ ] **Step 2: Create `multi_paxos.rs` test file**
@@ -919,7 +919,7 @@ async fn lossy_network_with_leader() {
 
 - [ ] **Step 11: Verify all multi-paxos tests pass**
 
-Run: `cargo test -p concensus-tests --features multi-paxos --test multi_paxos -- --test-threads=1`
+Run: `cargo test -p daccord-tests --features multi-paxos --test multi_paxos -- --test-threads=1`
 
 - [ ] **Step 12: Commit**
 
@@ -935,16 +935,16 @@ The public API is unchanged, so all existing tests should pass transparently whe
 - [ ] **Step 1: Run all existing test suites with multi-paxos enabled**
 
 ```bash
-cargo test -p concensus --all-features
-cargo test -p concensus-tests --features multi-paxos --test cluster
-cargo test -p concensus-tests --features multi-paxos --test adversarial_cluster -- --test-threads=1
-cargo test -p concensus-tests --features multi-paxos --test larger_clusters -- --test-threads=1
-cargo test -p concensus-tests --features multi-paxos --test delayed_cluster -- --test-threads=1
-cargo test -p concensus-tests --features multi-paxos --test lifecycle
-cargo test -p concensus-tests --features multi-paxos --test safety_invariants -- --test-threads=1
-cargo test -p concensus-tests --features multi-paxos --test stress -- --test-threads=1
-cargo test -p concensus-tests --features multi-paxos --test complex_values
-cargo test -p concensus-tests --features multi-paxos --test recovery
+cargo test -p daccord --all-features
+cargo test -p daccord-tests --features multi-paxos --test cluster
+cargo test -p daccord-tests --features multi-paxos --test adversarial_cluster -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test larger_clusters -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test delayed_cluster -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test lifecycle
+cargo test -p daccord-tests --features multi-paxos --test safety_invariants -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test stress -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test complex_values
+cargo test -p daccord-tests --features multi-paxos --test recovery
 ```
 
 - [ ] **Step 2: Fix any failures**
@@ -961,22 +961,22 @@ If any test fails, debug and fix. Common issues:
 ## Task 9: Docker Compose demo with multi-paxos
 
 **Files:**
-- Modify: `concensus-demo/Cargo.toml`
-- Modify: `concensus-demo/Dockerfile`
-- Create: `concensus-demo/docker-compose.multi-paxos.yml`
+- Modify: `daccord-demo/Cargo.toml`
+- Modify: `daccord-demo/Dockerfile`
+- Create: `daccord-demo/docker-compose.multi-paxos.yml`
 
 - [ ] **Step 1: Add multi-paxos feature to demo crate**
 
-In `concensus-demo/Cargo.toml`, add:
+In `daccord-demo/Cargo.toml`, add:
 
 ```toml
 [features]
-multi-paxos = ["concensus/multi-paxos"]
+multi-paxos = ["daccord/multi-paxos"]
 ```
 
 - [ ] **Step 2: Update Dockerfile to accept optional features**
 
-Modify `concensus-demo/Dockerfile` to accept a build arg:
+Modify `daccord-demo/Dockerfile` to accept a build arg:
 
 ```dockerfile
 # Stage 3: Builder - cache deps, then build
@@ -984,12 +984,12 @@ FROM chef AS builder
 ARG FEATURES=""
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p concensus-demo
+RUN cargo chef cook --release --recipe-path recipe.json -p daccord-demo
 COPY . .
 RUN if [ -n "$FEATURES" ]; then \
-      cargo build --release -p concensus-demo --features "$FEATURES"; \
+      cargo build --release -p daccord-demo --features "$FEATURES"; \
     else \
-      cargo build --release -p concensus-demo; \
+      cargo build --release -p daccord-demo; \
     fi
 ```
 
@@ -1001,7 +1001,7 @@ Based on `docker-compose.tcp.yml` but with the `FEATURES` build arg:
 x-node: &node-base
   build:
     context: ../..
-    dockerfile: concensus-demo/Dockerfile
+    dockerfile: daccord-demo/Dockerfile
     args:
       FEATURES: multi-paxos
   environment: &node-env
@@ -1011,7 +1011,7 @@ x-node: &node-base
     GRPC_PORT: "50051"
     RUST_LOG: info
   healthcheck:
-    test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+    test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
     interval: 5s
     timeout: 3s
     retries: 10
@@ -1047,7 +1047,7 @@ Note: all 3 nodes expose their gRPC port so we can test failover by proposing to
 
 Run from repo root:
 ```bash
-cd concensus-demo
+cd daccord-demo
 docker compose -f docker-compose.multi-paxos.yml build
 ```
 
@@ -1056,9 +1056,9 @@ docker compose -f docker-compose.multi-paxos.yml build
 ```bash
 docker compose -f docker-compose.multi-paxos.yml up -d
 sleep 15
-concensus-cli --addr localhost:50051 propose --value "alice"
-concensus-cli --addr localhost:50051 propose --value "bob"
-concensus-cli --addr localhost:50051 decisions
+daccord-cli --addr localhost:50051 propose --value "alice"
+daccord-cli --addr localhost:50051 propose --value "bob"
+daccord-cli --addr localhost:50051 decisions
 ```
 
 Verify output shows both values decided with consistent slots.
@@ -1076,11 +1076,11 @@ Should show one node becoming leader.
 ```bash
 docker compose -f docker-compose.multi-paxos.yml stop node-1
 sleep 2
-concensus-cli --addr localhost:50052 propose --value "after-failover"
-concensus-cli --addr localhost:50052 decisions
+daccord-cli --addr localhost:50052 propose --value "after-failover"
+daccord-cli --addr localhost:50052 decisions
 docker compose -f docker-compose.multi-paxos.yml start node-1
 sleep 5
-concensus-cli --addr localhost:50051 decisions
+daccord-cli --addr localhost:50051 decisions
 ```
 
 - [ ] **Step 8: Shutdown and commit**
@@ -1099,16 +1099,16 @@ After all tasks complete:
 
 ```bash
 # Classic Paxos still works (no feature)
-cargo test -p concensus
-cargo test -p concensus-tests
+cargo test -p daccord
+cargo test -p daccord-tests
 
 # Multi-Paxos works
-cargo test -p concensus --features multi-paxos
-cargo test -p concensus-tests --features multi-paxos --test multi_paxos -- --test-threads=1
+cargo test -p daccord --features multi-paxos
+cargo test -p daccord-tests --features multi-paxos --test multi_paxos -- --test-threads=1
 
 # All existing tests pass with multi-paxos enabled
-cargo test -p concensus-tests --features multi-paxos -- --test-threads=1
+cargo test -p daccord-tests --features multi-paxos -- --test-threads=1
 
 # Docker demo builds and runs
-cd concensus-demo && docker compose -f docker-compose.multi-paxos.yml build
+cd daccord-demo && docker compose -f docker-compose.multi-paxos.yml build
 ```

@@ -2,14 +2,14 @@
 
 **Date:** 2026-03-15
 **Branch:** `multi-paxos`
-**Feature flag:** `multi-paxos` in `concensus/Cargo.toml`
+**Feature flag:** `multi-paxos` in `daccord/Cargo.toml`
 
 ## Setup
 
 3-node cluster running in Docker Compose with TCP transport and Multi-Paxos enabled via `docker-compose.multi-paxos.yml`. Each node exposes its gRPC port (50051, 50052, 50053) for independent access.
 
 ```bash
-cd concensus-demo
+cd daccord-demo
 docker compose -f docker-compose.multi-paxos.yml up --build -d
 ```
 
@@ -87,7 +87,7 @@ Node-1 showed no decisions after restart. This is expected — `MemoryStorage` d
 
 **Symptom:** After killing node-1, node-2 successfully elected itself leader but then panicked:
 ```
-thread 'tokio-rt-worker' panicked at concensus/src/protocol.rs:581:45:
+thread 'tokio-rt-worker' panicked at daccord/src/protocol.rs:581:45:
 called `Option::unwrap()` on a `None` value
 ```
 
@@ -115,7 +115,7 @@ self.start_phase2(slot)
 
 ## Docker Compose Context Path Fix
 
-The `crates/` directory flattening (commit `50a5cc7`) moved workspace members from `crates/X/` to `X/`. The docker-compose files still had `context: ../..` which was correct for the old `crates/concensus-demo/` path but wrong for the new `concensus-demo/` path. Fixed all three compose files to use `context: ..`.
+The `crates/` directory flattening (commit `50a5cc7`) moved workspace members from `crates/X/` to `X/`. The docker-compose files still had `context: ../..` which was correct for the old `crates/daccord-demo/` path but wrong for the new `daccord-demo/` path. Fixed all three compose files to use `context: ..`.
 
 ## Performance Observations
 

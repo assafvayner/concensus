@@ -4,7 +4,7 @@
 
 **Goal:** Build a Docker-based demo framework with a gRPC API and CLI client for running multi-node Paxos consensus clusters over TCP and UDS transports.
 
-**Architecture:** A new workspace crate `concensus-demo` produces two binaries: `concensus-node` (runs a consensus node with a gRPC server) and `concensus-cli` (CLI client for interacting with nodes). Docker Compose files orchestrate 3-node clusters using either TCP or UDS transport.
+**Architecture:** A new workspace crate `daccord-demo` produces two binaries: `daccord-node` (runs a consensus node with a gRPC server) and `daccord-cli` (CLI client for interacting with nodes). Docker Compose files orchestrate 3-node clusters using either TCP or UDS transport.
 
 **Tech Stack:** Rust, tonic (gRPC), prost (protobuf), clap (CLI), tokio, tracing, Docker, Docker Compose, cargo-chef
 
@@ -15,21 +15,21 @@
 ## File Structure
 
 ```
-concensus/
-├── Cargo.toml                                    # MODIFY: add concensus-demo to workspace members
+daccord/
+├── Cargo.toml                                    # MODIFY: add daccord-demo to workspace members
 ├── .dockerignore                                 # CREATE: exclude target/, .git/, etc from build context
 ├── Dockerfile                                    # CREATE: multi-stage cargo-chef build
 ├── docker-compose.tcp.yml                        # CREATE: 3-node TCP cluster
 ├── docker-compose.uds.yml                        # CREATE: 3-node UDS cluster
 ├── crates/
-│   └── concensus-demo/
+│   └── daccord-demo/
 │       ├── Cargo.toml                            # CREATE: two [[bin]] targets, dependencies
 │       ├── build.rs                              # CREATE: tonic-build protobuf codegen
 │       ├── proto/
 │       │   └── consensus.proto                   # CREATE: gRPC service definition
 │       └── src/
-│           ├── node.rs                           # CREATE: concensus-node binary
-│           └── cli.rs                            # CREATE: concensus-cli binary
+│           ├── node.rs                           # CREATE: daccord-node binary
+│           └── cli.rs                            # CREATE: daccord-cli binary
 ```
 
 ---
@@ -39,34 +39,34 @@ concensus/
 ### Task 1: Create crate directory and Cargo.toml
 
 **Files:**
-- Create: `crates/concensus-demo/Cargo.toml`
+- Create: `crates/daccord-demo/Cargo.toml`
 - Modify: `Cargo.toml` (workspace root)
 
 - [ ] **Step 1: Create directory structure**
 
 Run:
 ```bash
-mkdir -p crates/concensus-demo/proto crates/concensus-demo/src
+mkdir -p crates/daccord-demo/proto crates/daccord-demo/src
 ```
 
-- [ ] **Step 2: Create `crates/concensus-demo/Cargo.toml`**
+- [ ] **Step 2: Create `crates/daccord-demo/Cargo.toml`**
 
 ```toml
 [package]
-name = "concensus-demo"
+name = "daccord-demo"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "concensus-node"
+name = "daccord-node"
 path = "src/node.rs"
 
 [[bin]]
-name = "concensus-cli"
+name = "daccord-cli"
 path = "src/cli.rs"
 
 [dependencies]
-concensus = { path = "../concensus", features = ["tcp-transport", "uds-transport", "test-support"] }
+daccord = { path = "../daccord", features = ["tcp-transport", "uds-transport", "test-support"] }
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
@@ -82,35 +82,35 @@ tonic-build = "0.12"
 
 In root `Cargo.toml`, change the `members` line to:
 ```toml
-members = ["crates/concensus", "crates/concensus-tests", "crates/concensus-demo"]
+members = ["crates/daccord", "crates/daccord-tests", "crates/daccord-demo"]
 ```
 
 - [ ] **Step 4: Create placeholder binaries so the crate compiles**
 
-Create `crates/concensus-demo/src/node.rs`:
+Create `crates/daccord-demo/src/node.rs`:
 ```rust
 fn main() {
-    println!("concensus-node placeholder");
+    println!("daccord-node placeholder");
 }
 ```
 
-Create `crates/concensus-demo/src/cli.rs`:
+Create `crates/daccord-demo/src/cli.rs`:
 ```rust
 fn main() {
-    println!("concensus-cli placeholder");
+    println!("daccord-cli placeholder");
 }
 ```
 
 - [ ] **Step 5: Verify the workspace compiles**
 
-Run: `cargo check -p concensus-demo`
+Run: `cargo check -p daccord-demo`
 Expected: success (no errors)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus-demo/ Cargo.toml
-git commit -m "feat(demo): scaffold concensus-demo crate with two binary targets"
+git add crates/daccord-demo/ Cargo.toml
+git commit -m "feat(demo): scaffold daccord-demo crate with two binary targets"
 ```
 
 ---
@@ -118,10 +118,10 @@ git commit -m "feat(demo): scaffold concensus-demo crate with two binary targets
 ### Task 2: Add protobuf definition and build.rs codegen
 
 **Files:**
-- Create: `crates/concensus-demo/proto/consensus.proto`
-- Create: `crates/concensus-demo/build.rs`
+- Create: `crates/daccord-demo/proto/consensus.proto`
+- Create: `crates/daccord-demo/build.rs`
 
-- [ ] **Step 1: Create `crates/concensus-demo/proto/consensus.proto`**
+- [ ] **Step 1: Create `crates/daccord-demo/proto/consensus.proto`**
 
 ```protobuf
 syntax = "proto3";
@@ -159,7 +159,7 @@ message HealthResponse {
 }
 ```
 
-- [ ] **Step 2: Create `crates/concensus-demo/build.rs`**
+- [ ] **Step 2: Create `crates/daccord-demo/build.rs`**
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -170,13 +170,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - [ ] **Step 3: Verify protobuf codegen works**
 
-Run: `cargo check -p concensus-demo`
+Run: `cargo check -p daccord-demo`
 Expected: success. tonic-build generates Rust code from the proto file. The `protoc` compiler must be installed on the system — if this fails with "protoc not found", install it via `brew install protobuf` (macOS) or `apt install protobuf-compiler` (Linux).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/concensus-demo/proto/ crates/concensus-demo/build.rs
+git add crates/daccord-demo/proto/ crates/daccord-demo/build.rs
 git commit -m "feat(demo): add consensus.proto and tonic-build codegen"
 ```
 
@@ -187,11 +187,11 @@ git commit -m "feat(demo): add consensus.proto and tonic-build codegen"
 ### Task 3: Implement env parsing and config
 
 **Files:**
-- Modify: `crates/concensus-demo/src/node.rs`
+- Modify: `crates/daccord-demo/src/node.rs`
 
 - [ ] **Step 1: Write the node binary with env parsing**
 
-Replace `crates/concensus-demo/src/node.rs` with:
+Replace `crates/daccord-demo/src/node.rs` with:
 
 ```rust
 use std::net::SocketAddr;
@@ -201,7 +201,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
-use concensus::{
+use daccord::{
     Decided, DecisionReceiver, MemoryStorage, Node, NodeHandle, NodeId, PeerInfo,
     TcpSender, TcpTransport, TcpReceiver,
     UdsSender, UdsTransport, UdsReceiver,
@@ -499,7 +499,7 @@ async fn main() {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cargo check -p concensus-demo --bin concensus-node`
+Run: `cargo check -p daccord-demo --bin daccord-node`
 Expected: success
 
 Note: if `protoc` is not installed, install it first:
@@ -509,8 +509,8 @@ Note: if `protoc` is not installed, install it first:
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/concensus-demo/src/node.rs
-git commit -m "feat(demo): implement concensus-node binary with gRPC server"
+git add crates/daccord-demo/src/node.rs
+git commit -m "feat(demo): implement daccord-node binary with gRPC server"
 ```
 
 ---
@@ -520,11 +520,11 @@ git commit -m "feat(demo): implement concensus-node binary with gRPC server"
 ### Task 4: Implement the CLI client
 
 **Files:**
-- Modify: `crates/concensus-demo/src/cli.rs`
+- Modify: `crates/daccord-demo/src/cli.rs`
 
 - [ ] **Step 1: Write the CLI client**
 
-Replace `crates/concensus-demo/src/cli.rs` with:
+Replace `crates/daccord-demo/src/cli.rs` with:
 
 ```rust
 use clap::{Parser, Subcommand};
@@ -537,7 +537,7 @@ use consensus_proto::consensus_service_client::ConsensusServiceClient;
 use consensus_proto::{GetDecisionsRequest, HealthRequest, ProposeRequest};
 
 #[derive(Parser)]
-#[command(name = "concensus-cli", about = "CLI client for concensus-node gRPC API")]
+#[command(name = "daccord-cli", about = "CLI client for daccord-node gRPC API")]
 struct Cli {
     /// gRPC server address (e.g. http://localhost:50051)
     #[arg(long)]
@@ -626,19 +626,19 @@ async fn main() {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cargo check -p concensus-demo --bin concensus-cli`
+Run: `cargo check -p daccord-demo --bin daccord-cli`
 Expected: success
 
 - [ ] **Step 3: Verify CLI help output**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --help`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --help`
 Expected: prints usage showing `--addr`, and subcommands `propose`, `decisions`, `health`
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/concensus-demo/src/cli.rs
-git commit -m "feat(demo): implement concensus-cli with propose, decisions, and health commands"
+git add crates/daccord-demo/src/cli.rs
+git commit -m "feat(demo): implement daccord-cli with propose, decisions, and health commands"
 ```
 
 ---
@@ -647,26 +647,26 @@ git commit -m "feat(demo): implement concensus-cli with propose, decisions, and 
 
 ### Task 5: Run linting and formatting
 
-**Files:** All files in `crates/concensus-demo/`
+**Files:** All files in `crates/daccord-demo/`
 
 - [ ] **Step 1: Run cargo fmt**
 
-Run: `cargo fmt -p concensus-demo` (or `cargo +nightly fmt -p concensus-demo` if nightly is installed)
+Run: `cargo fmt -p daccord-demo` (or `cargo +nightly fmt -p daccord-demo` if nightly is installed)
 
 - [ ] **Step 2: Run clippy**
 
-Run: `cargo clippy -p concensus-demo -- -D warnings`
+Run: `cargo clippy -p daccord-demo -- -D warnings`
 Expected: no warnings. Fix any that arise.
 
 - [ ] **Step 3: Build release binaries**
 
-Run: `cargo build --release -p concensus-demo`
-Expected: produces `target/release/concensus-node` and `target/release/concensus-cli`
+Run: `cargo build --release -p daccord-demo`
+Expected: produces `target/release/daccord-node` and `target/release/daccord-cli`
 
 - [ ] **Step 4: Commit any formatting changes**
 
 ```bash
-git add -A crates/concensus-demo/
+git add -A crates/daccord-demo/
 git commit -m "style(demo): apply formatting and fix clippy warnings"
 ```
 
@@ -710,15 +710,15 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p concensus-demo
+RUN cargo chef cook --release --recipe-path recipe.json -p daccord-demo
 COPY . .
-RUN cargo build --release -p concensus-demo
+RUN cargo build --release -p daccord-demo
 
 # Stage 4: Runtime
 FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/concensus-node /usr/local/bin/
-COPY --from=builder /app/target/release/concensus-cli /usr/local/bin/
-ENTRYPOINT ["concensus-node"]
+COPY --from=builder /app/target/release/daccord-node /usr/local/bin/
+COPY --from=builder /app/target/release/daccord-cli /usr/local/bin/
+ENTRYPOINT ["daccord-node"]
 ```
 
 Note: `protobuf-compiler` is installed in the builder stage because `tonic-build` requires `protoc` at build time.
@@ -753,7 +753,7 @@ services:
     ports:
       - "50051:50051"
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -771,7 +771,7 @@ services:
       GRPC_PORT: "50051"
       RUST_LOG: info
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -789,7 +789,7 @@ services:
       GRPC_PORT: "50051"
       RUST_LOG: info
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -834,7 +834,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -854,7 +854,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -874,7 +874,7 @@ services:
     volumes:
       - sockets:/sockets
     healthcheck:
-      test: ["CMD", "concensus-cli", "--addr", "localhost:50051", "health"]
+      test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -908,7 +908,7 @@ git commit -m "feat(demo): add docker-compose.uds.yml for 3-node UDS cluster"
 - [ ] **Step 1: Build the Docker image**
 
 Run: `docker compose -f docker-compose.tcp.yml build`
-Expected: successful multi-stage build producing an image with both `concensus-node` and `concensus-cli`
+Expected: successful multi-stage build producing an image with both `daccord-node` and `daccord-cli`
 
 - [ ] **Step 2: Start the TCP cluster**
 
@@ -919,17 +919,17 @@ Expected: all 3 services show `healthy` status (may take up to 30s for start_per
 
 - [ ] **Step 3: Test health endpoint via CLI**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 health`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 health`
 Expected: prints `ok`
 
 - [ ] **Step 4: Test proposal via CLI**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 propose --value "hello-world"`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 propose --value "hello-world"`
 Expected: prints `proposed`
 
 - [ ] **Step 5: Test decisions via CLI**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 decisions`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 decisions`
 Expected: prints a table with at least one decision showing `hello-world`
 
 - [ ] **Step 6: Check logs for consensus across all nodes**
@@ -959,12 +959,12 @@ Expected: all 3 services show `healthy` status
 
 - [ ] **Step 3: Test proposal via CLI**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 propose --value "hello-uds"`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 propose --value "hello-uds"`
 Expected: prints `proposed`
 
 - [ ] **Step 4: Test decisions via CLI**
 
-Run: `cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 decisions`
+Run: `cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 decisions`
 Expected: prints a table with the `hello-uds` decision
 
 - [ ] **Step 5: Check logs for consensus across all nodes**

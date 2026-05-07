@@ -1,10 +1,10 @@
-# concensus
+# daccord
 
 A consensus library in Rust with pluggable transports and storage. Supports both Multi-Paxos (default) and Raft.
 
 ## Overview
 
-`concensus` implements two consensus algorithms behind a single `Node` API:
+`daccord` implements two consensus algorithms behind a single `Node` API:
 
 - **Multi-Paxos** (default) — leader-based optimization of Classic Paxos with Phase 1 skip on the steady-state leader, exponential-backoff retries, and nack-based conflict resolution.
 - **Raft** — strong-leader consensus with randomized election timeouts, log-replication via `AppendEntries`, persistent term/votedFor/log state, and conflict-index / conflict-term hints for fast follower catch-up.
@@ -42,13 +42,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-concensus = { path = "concensus", features = ["tcp-transport"] }
+daccord = { path = "daccord", features = ["tcp-transport"] }
 ```
 
 Basic 3-node cluster with TCP:
 
 ```rust
-use concensus::{Node, NodeId, MemoryStorage, TcpTransport};
+use daccord::{Node, NodeId, MemoryStorage, TcpTransport};
 
 let bind_addr = "0.0.0.0:9000".parse().unwrap();
 let peers = vec![
@@ -79,7 +79,7 @@ while let Some(decided) = decision_rx.recv().await {
 `Node::new` and `Node::with_id` run Multi-Paxos and require storage that implements `Storage<V>`. To run Raft instead, use `Node::with_raft_config` and provide storage that implements `RaftStorage<V>` (which extends `Storage<V>` with persistent log + current term + votedFor).
 
 ```rust
-use concensus::{Node, NodeId, MemoryStorage, RaftConfig};
+use daccord::{Node, NodeId, MemoryStorage, RaftConfig};
 
 // MemoryStorage implements both Storage and RaftStorage.
 let storage = MemoryStorage::<String>::new();
@@ -138,13 +138,13 @@ Cross-algorithm wire messages are silently dropped, so a Paxos node and a Raft n
 ## Workspace Crates
 
 ```
-concensus/
-├── concensus/          # Core library
-├── concensus-tests/    # Integration tests
-└── concensus-demo/     # Docker demo application
+daccord/
+├── daccord/          # Core library
+├── daccord-tests/    # Integration tests
+└── daccord-demo/     # Docker demo application
 ```
 
-### concensus-tests
+### daccord-tests
 
 Integration test suite exercising multi-node consensus under various conditions:
 
@@ -156,16 +156,16 @@ Test helpers provide cluster creation utilities (`create_cluster`, `create_clust
 Run the tests:
 
 ```bash
-cargo test -p concensus-tests
+cargo test -p daccord-tests
 ```
 
-### concensus-demo
+### daccord-demo
 
 A Docker-based demo that runs a 3-node Paxos cluster with a gRPC API and CLI client.
 
 **Components:**
-- `concensus-node` — consensus node binary with a gRPC server (propose values, query decisions, health checks)
-- `concensus-cli` — CLI client for interacting with nodes
+- `daccord-node` — consensus node binary with a gRPC server (propose values, query decisions, health checks)
+- `daccord-cli` — CLI client for interacting with nodes
 
 **Transport options:**
 - TCP (`docker-compose.tcp.yml`) — nodes communicate over a Docker bridge network
@@ -178,7 +178,7 @@ A Docker-based demo that runs a 3-node Paxos cluster with a gRPC API and CLI cli
 #### Quick Start
 
 ```bash
-cd concensus-demo
+cd daccord-demo
 
 # Start a 3-node TCP cluster
 docker compose -f docker-compose.tcp.yml up --build -d
@@ -187,17 +187,17 @@ docker compose -f docker-compose.tcp.yml up --build -d
 docker compose -f docker-compose.tcp.yml ps
 
 # Propose values
-cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 propose --value "alice"
-cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 propose --value "bob"
+cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 propose --value "alice"
+cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 propose --value "bob"
 
 # View decided values
-cargo run -p concensus-demo --bin concensus-cli -- --addr localhost:50051 decisions
+cargo run -p daccord-demo --bin daccord-cli -- --addr localhost:50051 decisions
 
 # Shut down
 docker compose -f docker-compose.tcp.yml down
 ```
 
-See [`concensus-demo/DEMO.md`](concensus-demo/DEMO.md) for the full guide including prerequisites, environment variables, scaling, and cleanup.
+See [`daccord-demo/DEMO.md`](daccord-demo/DEMO.md) for the full guide including prerequisites, environment variables, scaling, and cleanup.
 
 ## Development
 
@@ -212,7 +212,7 @@ cargo clippy -- -D warnings
 cargo test --workspace
 
 # Test with all features
-cargo test -p concensus --all-features
+cargo test -p daccord --all-features
 ```
 
 ## License

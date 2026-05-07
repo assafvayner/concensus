@@ -1,0 +1,25 @@
+[package]
+name = "daccord"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+channel-transport = []
+test-support = []
+tcp-transport = ["tokio/net", "tokio/io-util"]
+uds-transport = ["tokio/net", "tokio/io-util"]
+multi-paxos = []
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+rand = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
+proptest = "1.4"

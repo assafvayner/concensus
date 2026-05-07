@@ -1,7 +1,7 @@
 [workspace]
 members = [
-  "concensus",
-  "concensus-tests",
-  "concensus-demo",
+  "daccord",
+  "daccord-tests",
+  "daccord-demo",
 ]
 resolver = "2"

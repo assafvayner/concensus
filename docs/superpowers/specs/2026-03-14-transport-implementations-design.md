@@ -2,7 +2,7 @@
 
 ## Overview
 
-Add two `MessageSender`/`MessageReceiver` implementations to the `concensus` crate behind feature flags: an in-memory channel transport for testing and a TCP transport for real networked deployments. This also requires refactoring the core `Node` API to use a single receiver per node (rather than one per peer) and restructuring `Message<V>` to include sender identity.
+Add two `MessageSender`/`MessageReceiver` implementations to the `daccord` crate behind feature flags: an in-memory channel transport for testing and a TCP transport for real networked deployments. This also requires refactoring the core `Node` API to use a single receiver per node (rather than one per peer) and restructuring `Message<V>` to include sender identity.
 
 ## Prerequisites: Core API Changes
 
@@ -82,7 +82,7 @@ For the single-node (no peers) case, the receiver is never polled — the separa
 The existing `transport.rs` stays in place as the module root. Submodules are added in a `transport/` directory alongside it (Rust 2018+ path-based module system — `transport.rs` acts as the module root for `transport/` submodules). `transport.rs` gains `pub mod channel;` and `pub mod tcp;` declarations behind feature gates.
 
 ```
-crates/concensus/src/
+crates/daccord/src/
 ├── transport.rs           # MessageSender, MessageReceiver traits + submodule declarations
 ├── transport/
 │   ├── channel.rs         # #[cfg(feature = "channel-transport")]
@@ -160,7 +160,7 @@ enum ReceiverInner {
 **Usage for a 3-node cluster:**
 
 ```rust
-use concensus::transport::channel::{channel, unbounded_channel};
+use daccord::transport::channel::{channel, unbounded_channel};
 
 // Bounded — with backpressure
 let (sender_to_a, receiver_a) = channel(64);

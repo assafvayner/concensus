@@ -1,0 +1,39 @@
+x-node: &node-base
+  build:
+    context: ..
+    dockerfile: daccord-demo/Dockerfile
+  environment: &node-env
+    TRANSPORT: uds
+    PEERS: "node-1=/sockets/node-1.sock,node-2=/sockets/node-2.sock,node-3=/sockets/node-3.sock"
+    GRPC_PORT: "50051"
+    RUST_LOG: info
+  volumes:
+    - sockets:/sockets
+  healthcheck:
+    test: ["CMD", "daccord-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - consensus-net
+
+services:
+  node-1:
+    <<: *node-base
+    hostname: node-1
+    ports:
+      - "50051:50051"
+  node-2:
+    <<: *node-base
+    hostname: node-2
+  node-3:
+    <<: *node-base
+    hostname: node-3
+
+volumes:
+  sockets:
+
+networks:
+  consensus-net:
+    driver: bridge

@@ -4,27 +4,27 @@
 
 A Docker-based framework for running multi-node consensus clusters using TCP and UDS transports. Primarily a demo/exploration tool with a gRPC API for interaction and a CLI client for issuing commands.
 
-## New Crate: `crates/concensus-demo`
+## New Crate: `crates/daccord-demo`
 
 Two binaries in one crate:
-- `concensus-node` — runs a consensus node with a gRPC server
-- `concensus-cli` — CLI client that connects to a node's gRPC server
+- `daccord-node` — runs a consensus node with a gRPC server
+- `daccord-cli` — CLI client that connects to a node's gRPC server
 
 Both transports (`tcp` / `uds`) configured via environment variables.
 
 ### Dependencies
 
-- `concensus` (with `tcp-transport`, `uds-transport`, and `test-support` features)
+- `daccord` (with `tcp-transport`, `uds-transport`, and `test-support` features)
 - `tonic` — gRPC server and client
 - `prost` — protobuf message types
 - `tonic-build` — build.rs protobuf codegen
 - `tokio` (full runtime, including `signal` for graceful shutdown)
 - `tracing` + `tracing-subscriber` — structured JSON logging
-- `clap` — CLI argument parsing for `concensus-cli`
+- `clap` — CLI argument parsing for `daccord-cli`
 
 ### Protobuf Definition
 
-`crates/concensus-demo/proto/consensus.proto`:
+`crates/daccord-demo/proto/consensus.proto`:
 
 ```protobuf
 syntax = "proto3";
@@ -75,7 +75,7 @@ message HealthResponse {
 
 ### NodeId Strategy
 
-All nodes use `Node::with_id()` (from `test-support` feature) with incarnation fixed to `0`. This ensures that `NodeId`s are deterministic and match between peers — each node constructs peer `NodeId`s as `NodeId::new(peer_name, 0)`, which will match the actual `NodeId` the remote node created for itself. The `test-support` feature is required in the demo's `concensus` dependency.
+All nodes use `Node::with_id()` (from `test-support` feature) with incarnation fixed to `0`. This ensures that `NodeId`s are deterministic and match between peers — each node constructs peer `NodeId`s as `NodeId::new(peer_name, 0)`, which will match the actual `NodeId` the remote node created for itself. The `test-support` feature is required in the demo's `daccord` dependency.
 
 ### Startup Flow (node binary)
 
@@ -114,14 +114,14 @@ All nodes use `Node::with_id()` (from `test-support` feature) with incarnation f
 
 - Returns `HealthResponse { status: "ok" }`
 
-## CLI Client (`concensus-cli`)
+## CLI Client (`daccord-cli`)
 
 Subcommand-based CLI using `clap`:
 
 ```
-concensus-cli --addr <host:port> propose --value <string>
-concensus-cli --addr <host:port> decisions
-concensus-cli --addr <host:port> health
+daccord-cli --addr <host:port> propose --value <string>
+daccord-cli --addr <host:port> decisions
+daccord-cli --addr <host:port> health
 ```
 
 ### Subcommands
@@ -161,15 +161,15 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p concensus-demo
+RUN cargo chef cook --release --recipe-path recipe.json -p daccord-demo
 COPY . .
-RUN cargo build --release -p concensus-demo
+RUN cargo build --release -p daccord-demo
 
 # Stage 4: Runtime
 FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/concensus-node /usr/local/bin/
-COPY --from=builder /app/target/release/concensus-cli /usr/local/bin/
-ENTRYPOINT ["concensus-node"]
+COPY --from=builder /app/target/release/daccord-node /usr/local/bin/
+COPY --from=builder /app/target/release/daccord-cli /usr/local/bin/
+ENTRYPOINT ["daccord-node"]
 ```
 
 Containers run as root (default for debian:bookworm-slim). Acceptable for a demo tool.
@@ -181,7 +181,7 @@ Containers run as root (default for debian:bookworm-slim). Acceptable for a demo
 - Each node binds consensus transport on `0.0.0.0:9000`, peers reference each other by container hostname
 - `node-1` exposes gRPC port `50051` to host for CLI access
 - Default 3 nodes; configurable by adding/removing service definitions
-- Health checks using `concensus-cli health` against each node's gRPC port
+- Health checks using `daccord-cli health` against each node's gRPC port
 
 ### `docker-compose.uds.yml` — 3-node UDS cluster
 
@@ -189,7 +189,7 @@ Containers run as root (default for debian:bookworm-slim). Acceptable for a demo
 - Shared named volume mounted at `/sockets` in all containers
 - Each node binds at `/sockets/node-X.sock`, peers reference socket paths
 - `node-1` exposes gRPC port `50051` to host (gRPC always over TCP, UDS is inter-node consensus transport only)
-- Health checks using `concensus-cli health` against each node's gRPC port
+- Health checks using `daccord-cli health` against each node's gRPC port
 
 ### Startup Race Conditions
 
@@ -197,7 +197,7 @@ When containers start simultaneously, a node may try to connect to a peer that h
 
 ### Workspace Configuration
 
-The root `Cargo.toml` must be updated to add `"crates/concensus-demo"` to the workspace members list.
+The root `Cargo.toml` must be updated to add `"crates/daccord-demo"` to the workspace members list.
 
 ## Logging & Observability
 
@@ -227,34 +227,34 @@ docker compose -f docker-compose.uds.yml up --build
 docker compose -f docker-compose.tcp.yml logs -f
 
 # Propose a value via CLI (run locally or via docker exec)
-concensus-cli --addr localhost:50051 propose --value "hello"
+daccord-cli --addr localhost:50051 propose --value "hello"
 
 # View all decisions
-concensus-cli --addr localhost:50051 decisions
+daccord-cli --addr localhost:50051 decisions
 
 # Health check
-concensus-cli --addr localhost:50051 health
+daccord-cli --addr localhost:50051 health
 ```
 
 ## Project Layout
 
 ```
-concensus/
-├── Cargo.toml                          # workspace: add concensus-demo member
+daccord/
+├── Cargo.toml                          # workspace: add daccord-demo member
 ├── Dockerfile                          # multi-stage cargo-chef build
 ├── docker-compose.tcp.yml              # 3-node TCP cluster
 ├── docker-compose.uds.yml              # 3-node UDS cluster (shared volume)
 ├── crates/
-│   ├── concensus/                      # existing library, unchanged
-│   ├── concensus-tests/                # existing tests, unchanged
-│   └── concensus-demo/
+│   ├── daccord/                      # existing library, unchanged
+│   ├── daccord-tests/                # existing tests, unchanged
+│   └── daccord-demo/
 │       ├── Cargo.toml                  # two [[bin]] targets
 │       ├── build.rs                    # tonic-build protobuf codegen
 │       ├── proto/
 │       │   └── consensus.proto         # gRPC service definition
 │       └── src/
-│           ├── node.rs                 # concensus-node binary: main, env parsing, gRPC server
-│           └── cli.rs                  # concensus-cli binary: clap arg parsing, gRPC client calls
+│           ├── node.rs                 # daccord-node binary: main, env parsing, gRPC server
+│           └── cli.rs                  # daccord-cli binary: clap arg parsing, gRPC client calls
 ```
 
 ### `node.rs` Structure

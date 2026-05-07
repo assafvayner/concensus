@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expand the concensus-tests simulation suite to cover cluster sizes, transport filter combinations, storage recovery, graceful shutdown, and Paxos safety invariants that the current tests don't exercise.
+**Goal:** Expand the daccord-tests simulation suite to cover cluster sizes, transport filter combinations, storage recovery, graceful shutdown, and Paxos safety invariants that the current tests don't exercise.
 
-**Architecture:** All new tests live in `crates/concensus-tests/tests/`. New test files are organized by concern: larger cluster sizes, combined transport filters, persistence/recovery, shutdown behavior, and Paxos invariant fuzzing. Shared helpers are added to the existing `helpers/mod.rs` and `helpers/transport_filters.rs`. No changes to the concensus library itself.
+**Architecture:** All new tests live in `crates/daccord-tests/tests/`. New test files are organized by concern: larger cluster sizes, combined transport filters, persistence/recovery, shutdown behavior, and Paxos invariant fuzzing. Shared helpers are added to the existing `helpers/mod.rs` and `helpers/transport_filters.rs`. No changes to the daccord library itself.
 
-**Tech Stack:** Rust, tokio (multi-thread runtime), concensus crate with `channel-transport` + `test-support` features, existing transport filter wrappers (Lossy, Delayed, Reordering).
+**Tech Stack:** Rust, tokio (multi-thread runtime), daccord crate with `channel-transport` + `test-support` features, existing transport filter wrappers (Lossy, Delayed, Reordering).
 
 ---
 
@@ -39,8 +39,8 @@
 ## Task 1: Cluster tests for 4-node, 5-node, and 7-node clusters
 
 **Files:**
-- Modify: `crates/concensus-tests/tests/helpers/mod.rs`
-- Create: `crates/concensus-tests/tests/larger_clusters.rs`
+- Modify: `crates/daccord-tests/tests/helpers/mod.rs`
+- Create: `crates/daccord-tests/tests/larger_clusters.rs`
 
 No new cluster helper function is needed — `create_cluster(n)` and `create_lossy_cluster(n, rate)` already accept arbitrary `n`. This task just verifies they work at larger sizes. A `create_cluster_with_dead_nodes(n, dead_count)` helper is needed to generalize the existing `create_cluster_with_dead_node`.
 
@@ -53,7 +53,7 @@ A 4-node cluster has quorum = 3 (same as a 3-node cluster: `4/2 + 1 = 3`). This 
 
 - [ ] **Step 1: Create `larger_clusters.rs` with 4-node basic consensus tests**
 
-Create file `crates/concensus-tests/tests/larger_clusters.rs`:
+Create file `crates/daccord-tests/tests/larger_clusters.rs`:
 
 ```rust
 mod helpers;
@@ -128,7 +128,7 @@ async fn four_node_proposals_from_different_nodes() {
 
 - [ ] **Step 2: Run 4-node tests to verify they pass**
 
-Run: `cargo test -p concensus-tests --test larger_clusters -- four_node -v`
+Run: `cargo test -p daccord-tests --test larger_clusters -- four_node -v`
 
 - [ ] **Step 3: Write 4-node fault tolerance tests**
 
@@ -309,15 +309,15 @@ Add to `helpers/mod.rs` — a generalization of the existing `create_cluster_wit
 
 - [ ] **Step 9: Run all tests, commit**
 
-Run: `cargo test -p concensus-tests --test larger_clusters -v`
-Run: `cargo test -p concensus-tests --test cluster -v` (existing tests still pass)
+Run: `cargo test -p daccord-tests --test larger_clusters -v`
+Run: `cargo test -p daccord-tests --test cluster -v` (existing tests still pass)
 
 ---
 
 ## Task 2: Combined transport filter cluster helpers
 
 **Files:**
-- Modify: `crates/concensus-tests/tests/helpers/mod.rs` — add `create_delayed_cluster` and `create_reordering_cluster` helpers
+- Modify: `crates/daccord-tests/tests/helpers/mod.rs` — add `create_delayed_cluster` and `create_reordering_cluster` helpers
 
 - [ ] **Step 1: Add `create_delayed_cluster` helper**
 
@@ -363,7 +363,7 @@ pub fn create_lossy_delayed_cluster(
 
 - [ ] **Step 4: Run existing tests to verify helpers compile**
 
-Run: `cargo test -p concensus-tests --test cluster`
+Run: `cargo test -p daccord-tests --test cluster`
 
 - [ ] **Step 5: Commit**
 
@@ -372,7 +372,7 @@ Run: `cargo test -p concensus-tests --test cluster`
 ## Task 3: Delayed and reordering cluster tests
 
 **Files:**
-- Create: `crates/concensus-tests/tests/delayed_cluster.rs`
+- Create: `crates/daccord-tests/tests/delayed_cluster.rs`
 
 - [ ] **Step 1: Write delayed single-value test**
 
@@ -431,15 +431,15 @@ async fn lossy_10pct_delayed_0_30ms_multiple_proposals() {
 
 - [ ] **Step 5: Run all tests, commit**
 
-Run: `cargo test -p concensus-tests --test delayed_cluster --test-threads=1 -v`
+Run: `cargo test -p daccord-tests --test delayed_cluster --test-threads=1 -v`
 
 ---
 
 ## Task 4: Storage recovery tests
 
 **Files:**
-- Create: `crates/concensus-tests/tests/recovery.rs`
-- Modify: `crates/concensus-tests/tests/helpers/mod.rs` — add shared-storage cluster helper
+- Create: `crates/daccord-tests/tests/recovery.rs`
+- Modify: `crates/daccord-tests/tests/helpers/mod.rs` — add shared-storage cluster helper
 
 This tests that a node can be stopped after deciding some values, then restarted with the same storage, and continue participating in consensus correctly. The key behavior: `initialize_from_decisions` loads prior decisions into `decided_slots` and advances `next_slot`, so the restarted node won't re-propose for already-decided slots.
 
@@ -500,14 +500,14 @@ async fn recovered_node_skips_decided_slots() {
 
 - [ ] **Step 5: Run tests, commit**
 
-Run: `cargo test -p concensus-tests --test recovery -v`
+Run: `cargo test -p daccord-tests --test recovery -v`
 
 ---
 
 ## Task 5: Graceful shutdown and error condition tests
 
 **Files:**
-- Create: `crates/concensus-tests/tests/lifecycle.rs`
+- Create: `crates/daccord-tests/tests/lifecycle.rs`
 
 - [ ] **Step 1: Write graceful shutdown test — dropping handles stops node**
 
@@ -578,15 +578,15 @@ async fn single_node_shuts_down_on_handle_drop() {
 
 - [ ] **Step 4: Run tests, commit**
 
-Run: `cargo test -p concensus-tests --test lifecycle -v`
+Run: `cargo test -p daccord-tests --test lifecycle -v`
 
 ---
 
 ## Task 6: Paxos safety invariant fuzzing
 
 **Files:**
-- Create: `crates/concensus-tests/tests/safety_invariants.rs`
-- Modify: `crates/concensus-tests/tests/helpers/mod.rs` — add `assert_safety_invariant` helper
+- Create: `crates/daccord-tests/tests/safety_invariants.rs`
+- Modify: `crates/daccord-tests/tests/helpers/mod.rs` — add `assert_safety_invariant` helper
 
 This is the most important task. It verifies the core Paxos guarantee: **no two nodes ever decide different values for the same slot**, even under adversarial network conditions with concurrent proposers.
 
@@ -788,14 +788,14 @@ async fn no_duplicate_slots_per_node() {
 
 - [ ] **Step 8: Run all safety tests, commit**
 
-Run: `cargo test -p concensus-tests --test safety_invariants --test-threads=1 -v`
+Run: `cargo test -p daccord-tests --test safety_invariants --test-threads=1 -v`
 
 ---
 
 ## Task 7: Large batch and stress tests
 
 **Files:**
-- Create: `crates/concensus-tests/tests/stress.rs`
+- Create: `crates/daccord-tests/tests/stress.rs`
 
 - [ ] **Step 1: Write 100-proposal lossless stress test**
 
@@ -855,15 +855,15 @@ async fn five_node_fifty_proposals_lossy() {
 
 - [ ] **Step 4: Run stress tests, commit**
 
-Run: `cargo test -p concensus-tests --test stress --test-threads=1 -v`
+Run: `cargo test -p daccord-tests --test stress --test-threads=1 -v`
 
 ---
 
 ## Task 8: Complex value type tests
 
 **Files:**
-- Create: `crates/concensus-tests/tests/complex_values.rs`
-- Modify: `crates/concensus-tests/tests/helpers/mod.rs` — add generic cluster helper
+- Create: `crates/daccord-tests/tests/complex_values.rs`
+- Modify: `crates/daccord-tests/tests/helpers/mod.rs` — add generic cluster helper
 
 All existing tests use `String` as the consensus value type. This doesn't exercise serde with structured data, nor does it verify that the library works with realistic application payloads. The `Node` generic bound is `V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static`, so any struct meeting those bounds should work — but we've never tested it.
 
@@ -876,7 +876,7 @@ mod helpers;
 
 use std::collections::{HashMap, HashSet};
 use serde::{Serialize, Deserialize};
-use concensus::{
+use daccord::{
     channel, ChannelReceiver, ChannelSender, Decided, DecisionReceiver,
     MemoryStorage, Node, NodeHandle, NodeId, PeerInfo,
 };
@@ -922,7 +922,7 @@ where
 pub struct ClusterNodeTyped<V> {
     pub handle: NodeHandle<V>,
     pub decisions: DecisionReceiver<V>,
-    pub run_handle: JoinHandle<Result<(), concensus::NodeError>>,
+    pub run_handle: JoinHandle<Result<(), daccord::NodeError>>,
     pub id: NodeId,
 }
 ```
@@ -1017,7 +1017,7 @@ async fn structured_value_large_payload() {
 
 - [ ] **Step 7: Run tests, commit**
 
-Run: `cargo test -p concensus-tests --test complex_values -v`
+Run: `cargo test -p daccord-tests --test complex_values -v`
 
 ---
 
@@ -1027,22 +1027,22 @@ After all tasks are complete:
 
 ```bash
 # All existing tests still pass
-cargo test -p concensus --all-features
+cargo test -p daccord --all-features
 
 # All cluster tests pass
-cargo test -p concensus-tests --test cluster
+cargo test -p daccord-tests --test cluster
 
 # All adversarial tests pass (serial to avoid runtime contention)
-cargo test -p concensus-tests --test adversarial_cluster --test-threads=1
+cargo test -p daccord-tests --test adversarial_cluster --test-threads=1
 
 # New tests pass
-cargo test -p concensus-tests --test larger_clusters --test-threads=1
-cargo test -p concensus-tests --test delayed_cluster --test-threads=1
-cargo test -p concensus-tests --test recovery --test-threads=1
-cargo test -p concensus-tests --test lifecycle
-cargo test -p concensus-tests --test safety_invariants --test-threads=1
-cargo test -p concensus-tests --test stress --test-threads=1
-cargo test -p concensus-tests --test complex_values
+cargo test -p daccord-tests --test larger_clusters --test-threads=1
+cargo test -p daccord-tests --test delayed_cluster --test-threads=1
+cargo test -p daccord-tests --test recovery --test-threads=1
+cargo test -p daccord-tests --test lifecycle
+cargo test -p daccord-tests --test safety_invariants --test-threads=1
+cargo test -p daccord-tests --test stress --test-threads=1
+cargo test -p daccord-tests --test complex_values
 ```
 
 ## New test count estimate

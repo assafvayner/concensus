@@ -16,15 +16,15 @@
 
 | File | Action | Responsibility |
 |---|---|---|
-| `crates/concensus/Cargo.toml` | Modify | Add feature flags, optional deps |
-| `crates/concensus/src/message.rs` | Modify | Rename `Message` → `MessageVariant`, add `Message` wrapper struct |
-| `crates/concensus/src/protocol.rs` | Modify | Change `Message` → `MessageVariant` in all signatures and match arms |
-| `crates/concensus/src/config.rs` | Modify | Replace `PeerConfig<S,R>` with `PeerInfo<S>`, remove `MessageReceiver` import |
-| `crates/concensus/src/node.rs` | Modify | Single receiver API, new event loop, `send_outgoing` wraps with sender |
-| `crates/concensus/src/transport.rs` | Modify | Add feature-gated `pub mod channel;` and `pub mod tcp;` |
-| `crates/concensus/src/transport/channel.rs` | Create | `ChannelSender`, `ChannelReceiver`, `channel()`, `unbounded_channel()` |
-| `crates/concensus/src/transport/tcp.rs` | Create | `TcpSender`, `TcpReceiver`, `TcpTransport` |
-| `crates/concensus/src/lib.rs` | Modify | Update re-exports: `PeerInfo`, feature-gated transport types |
+| `crates/daccord/Cargo.toml` | Modify | Add feature flags, optional deps |
+| `crates/daccord/src/message.rs` | Modify | Rename `Message` → `MessageVariant`, add `Message` wrapper struct |
+| `crates/daccord/src/protocol.rs` | Modify | Change `Message` → `MessageVariant` in all signatures and match arms |
+| `crates/daccord/src/config.rs` | Modify | Replace `PeerConfig<S,R>` with `PeerInfo<S>`, remove `MessageReceiver` import |
+| `crates/daccord/src/node.rs` | Modify | Single receiver API, new event loop, `send_outgoing` wraps with sender |
+| `crates/daccord/src/transport.rs` | Modify | Add feature-gated `pub mod channel;` and `pub mod tcp;` |
+| `crates/daccord/src/transport/channel.rs` | Create | `ChannelSender`, `ChannelReceiver`, `channel()`, `unbounded_channel()` |
+| `crates/daccord/src/transport/tcp.rs` | Create | `TcpSender`, `TcpReceiver`, `TcpTransport` |
+| `crates/daccord/src/lib.rs` | Modify | Update re-exports: `PeerInfo`, feature-gated transport types |
 
 ---
 
@@ -33,8 +33,8 @@
 ### Task 1: Message → MessageVariant Rename
 
 **Files:**
-- Modify: `crates/concensus/src/message.rs`
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/message.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 This is a mechanical rename. `Message<V>` enum becomes `MessageVariant<V>`. A new `Message<V>` struct wraps it with `sender: NodeId`. All protocol code uses `MessageVariant<V>`. Tests in message.rs update to use `MessageVariant` for the enum, and add tests for the new `Message` wrapper.
 
@@ -82,13 +82,13 @@ In `protocol.rs`:
 
 - [ ] **Step 3: Run tests to verify all pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: All 54 tests pass (existing behavior unchanged, just renamed)
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/concensus/src/message.rs crates/concensus/src/protocol.rs
+git add crates/daccord/src/message.rs crates/daccord/src/protocol.rs
 git commit -m "refactor: rename Message to MessageVariant, add Message wrapper with sender"
 ```
 
@@ -97,9 +97,9 @@ git commit -m "refactor: rename Message to MessageVariant, add Message wrapper w
 ### Task 2: PeerConfig → PeerInfo, Single Receiver Node API
 
 **Files:**
-- Modify: `crates/concensus/src/config.rs`
-- Modify: `crates/concensus/src/node.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Modify: `crates/daccord/src/config.rs`
+- Modify: `crates/daccord/src/node.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Replace PeerConfig with PeerInfo in config.rs**
 
@@ -357,13 +357,13 @@ Remove `PeerConfig` from re-exports.
 
 - [ ] **Step 7: Run tests**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: All 54 tests pass
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/concensus/src/
+git add crates/daccord/src/
 git commit -m "refactor: single receiver per node, PeerConfig→PeerInfo, Message wraps MessageVariant"
 ```
 
@@ -374,11 +374,11 @@ git commit -m "refactor: single receiver per node, PeerConfig→PeerInfo, Messag
 ### Task 3: Feature Flags in Cargo.toml
 
 **Files:**
-- Modify: `crates/concensus/Cargo.toml`
+- Modify: `crates/daccord/Cargo.toml`
 
 - [ ] **Step 1: Add feature flags**
 
-Add to `crates/concensus/Cargo.toml`:
+Add to `crates/daccord/Cargo.toml`:
 ```toml
 [features]
 channel-transport = []
@@ -387,13 +387,13 @@ tcp-transport = ["tokio/net", "tokio/io-util"]
 
 - [ ] **Step 2: Verify compilation**
 
-Run: `cargo check -p concensus`
+Run: `cargo check -p daccord`
 Expected: success
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/concensus/Cargo.toml
+git add crates/daccord/Cargo.toml
 git commit -m "feat: add feature flags for channel-transport and tcp-transport"
 ```
 
@@ -402,13 +402,13 @@ git commit -m "feat: add feature flags for channel-transport and tcp-transport"
 ### Task 4: Channel Transport Implementation
 
 **Files:**
-- Create: `crates/concensus/src/transport/channel.rs`
-- Modify: `crates/concensus/src/transport.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/transport/channel.rs`
+- Modify: `crates/daccord/src/transport.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Add submodule declaration to transport.rs**
 
-Add to `crates/concensus/src/transport.rs` (after existing trait definitions):
+Add to `crates/daccord/src/transport.rs` (after existing trait definitions):
 ```rust
 #[cfg(feature = "channel-transport")]
 pub mod channel;
@@ -416,11 +416,11 @@ pub mod channel;
 
 - [ ] **Step 2: Create transport directory**
 
-Run: `mkdir -p crates/concensus/src/transport`
+Run: `mkdir -p crates/daccord/src/transport`
 
 - [ ] **Step 3: Write channel.rs with tests**
 
-Create `crates/concensus/src/transport/channel.rs`:
+Create `crates/daccord/src/transport/channel.rs`:
 
 ```rust
 use async_trait::async_trait;
@@ -557,7 +557,7 @@ mod tests {
 
 - [ ] **Step 4: Add feature-gated re-export to lib.rs**
 
-Add to `crates/concensus/src/lib.rs`:
+Add to `crates/daccord/src/lib.rs`:
 ```rust
 #[cfg(feature = "channel-transport")]
 pub use transport::channel::{self, channel, unbounded_channel, ChannelSender, ChannelReceiver};
@@ -565,13 +565,13 @@ pub use transport::channel::{self, channel, unbounded_channel, ChannelSender, Ch
 
 - [ ] **Step 5: Run tests with feature enabled**
 
-Run: `cargo test -p concensus --features channel-transport`
+Run: `cargo test -p daccord --features channel-transport`
 Expected: All tests pass (54 existing + 5 new channel tests = 59)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/transport.rs crates/concensus/src/transport/ crates/concensus/src/lib.rs
+git add crates/daccord/src/transport.rs crates/daccord/src/transport/ crates/daccord/src/lib.rs
 git commit -m "feat: add in-memory channel transport (bounded + unbounded)"
 ```
 
@@ -582,13 +582,13 @@ git commit -m "feat: add in-memory channel transport (bounded + unbounded)"
 ### Task 5: TCP Transport Implementation
 
 **Files:**
-- Create: `crates/concensus/src/transport/tcp.rs`
-- Modify: `crates/concensus/src/transport.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/transport/tcp.rs`
+- Modify: `crates/daccord/src/transport.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Add tcp submodule declaration to transport.rs**
 
-Add to `crates/concensus/src/transport.rs`:
+Add to `crates/daccord/src/transport.rs`:
 ```rust
 #[cfg(feature = "tcp-transport")]
 pub mod tcp;
@@ -596,7 +596,7 @@ pub mod tcp;
 
 - [ ] **Step 2: Implement TcpSender**
 
-Create `crates/concensus/src/transport/tcp.rs` with TcpSender:
+Create `crates/daccord/src/transport/tcp.rs` with TcpSender:
 
 ```rust
 use std::net::SocketAddr;
@@ -939,13 +939,13 @@ mod tests {
 
 - [ ] **Step 6: Add feature-gated re-export and tcp submodule declaration**
 
-Add to `crates/concensus/src/transport.rs`:
+Add to `crates/daccord/src/transport.rs`:
 ```rust
 #[cfg(feature = "tcp-transport")]
 pub mod tcp;
 ```
 
-Add to `crates/concensus/src/lib.rs`:
+Add to `crates/daccord/src/lib.rs`:
 ```rust
 #[cfg(feature = "tcp-transport")]
 pub use transport::tcp::{TcpSender, TcpReceiver, TcpTransport};
@@ -953,18 +953,18 @@ pub use transport::tcp::{TcpSender, TcpReceiver, TcpTransport};
 
 - [ ] **Step 7: Run tests with tcp feature**
 
-Run: `cargo test -p concensus --features tcp-transport`
+Run: `cargo test -p daccord --features tcp-transport`
 Expected: All tests pass (54 existing + TCP tests)
 
 - [ ] **Step 8: Run all tests with all features**
 
-Run: `cargo test -p concensus --all-features`
+Run: `cargo test -p daccord --all-features`
 Expected: All tests pass
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/concensus/src/transport/ crates/concensus/src/transport.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/transport/ crates/daccord/src/transport.rs crates/daccord/src/lib.rs
 git commit -m "feat: add TCP transport with length-prefixed framing and reconnection"
 ```
 
@@ -977,19 +977,19 @@ git commit -m "feat: add TCP transport with length-prefixed framing and reconnec
 
 - [ ] **Step 1: Run clippy with all features**
 
-Run: `cargo clippy -p concensus --all-features -- -D warnings`
+Run: `cargo clippy -p daccord --all-features -- -D warnings`
 Expected: no warnings
 
 - [ ] **Step 2: Fix any clippy issues**
 
 - [ ] **Step 3: Run full test suite with all features**
 
-Run: `cargo test -p concensus --all-features`
+Run: `cargo test -p daccord --all-features`
 Expected: All tests pass
 
 - [ ] **Step 4: Run cargo doc**
 
-Run: `cargo doc -p concensus --all-features --no-deps`
+Run: `cargo doc -p daccord --all-features --no-deps`
 Expected: success
 
 - [ ] **Step 5: Commit cleanup**

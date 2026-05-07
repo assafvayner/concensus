@@ -4,7 +4,7 @@
 
 **Goal:** Implement a modular Rust library for the Paxos consensus algorithm with pluggable transport and storage.
 
-**Architecture:** Cargo workspace with one crate (`concensus`). Types build bottom-up: error types -> config/identity -> transport traits -> storage trait -> protocol messages -> protocol state machine -> node + event loop. Each module is one focused file. The protocol state machine is purely internal; the public API is `Node`, `NodeHandle`, `DecisionReceiver`, and the transport/storage traits.
+**Architecture:** Cargo workspace with one crate (`daccord`). Types build bottom-up: error types -> config/identity -> transport traits -> storage trait -> protocol messages -> protocol state machine -> node + event loop. Each module is one focused file. The protocol state machine is purely internal; the public API is `Node`, `NodeHandle`, `DecisionReceiver`, and the transport/storage traits.
 
 **Tech Stack:** Rust, tokio (async runtime), serde/serde_json (serialization), bytes (transport), async-trait, thiserror (errors), tracing (observability)
 
@@ -17,15 +17,15 @@
 | File | Responsibility |
 |---|---|
 | `Cargo.toml` (root) | Workspace definition |
-| `crates/concensus/Cargo.toml` | Crate manifest with dependencies |
-| `crates/concensus/src/lib.rs` | Re-exports public API |
-| `crates/concensus/src/error.rs` | `ProposeError`, `NodeError`, `StorageError`, `TransportError` |
-| `crates/concensus/src/config.rs` | `NodeId`, `PeerConfig` |
-| `crates/concensus/src/transport.rs` | `MessageSender`, `MessageReceiver` traits |
-| `crates/concensus/src/storage.rs` | `Storage` trait, `MemoryStorage` |
-| `crates/concensus/src/message.rs` | `Message<V>`, `ProposalNumber` (pub(crate)) |
-| `crates/concensus/src/protocol.rs` | `ProtocolState<V>`, `PaxosInstance<V>`, `Outgoing<V>`, `SendTarget` (internal state machine) |
-| `crates/concensus/src/node.rs` | `Node<V,S,R>`, `NodeHandle<V>`, `DecisionReceiver<V>`, `Decided<V>`, event loop |
+| `crates/daccord/Cargo.toml` | Crate manifest with dependencies |
+| `crates/daccord/src/lib.rs` | Re-exports public API |
+| `crates/daccord/src/error.rs` | `ProposeError`, `NodeError`, `StorageError`, `TransportError` |
+| `crates/daccord/src/config.rs` | `NodeId`, `PeerConfig` |
+| `crates/daccord/src/transport.rs` | `MessageSender`, `MessageReceiver` traits |
+| `crates/daccord/src/storage.rs` | `Storage` trait, `MemoryStorage` |
+| `crates/daccord/src/message.rs` | `Message<V>`, `ProposalNumber` (pub(crate)) |
+| `crates/daccord/src/protocol.rs` | `ProtocolState<V>`, `PaxosInstance<V>`, `Outgoing<V>`, `SendTarget` (internal state machine) |
+| `crates/daccord/src/node.rs` | `Node<V,S,R>`, `NodeHandle<V>`, `DecisionReceiver<V>`, `Decided<V>`, event loop |
 
 ---
 
@@ -35,14 +35,14 @@
 
 **Files:**
 - Create: `Cargo.toml` (workspace root)
-- Create: `crates/concensus/Cargo.toml`
-- Create: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/Cargo.toml`
+- Create: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Create workspace root Cargo.toml**
 
 ```toml
 [workspace]
-members = ["crates/concensus"]
+members = ["crates/daccord"]
 resolver = "2"
 ```
 
@@ -50,7 +50,7 @@ resolver = "2"
 
 ```toml
 [package]
-name = "concensus"
+name = "daccord"
 version = "0.1.0"
 edition = "2021"
 
@@ -73,7 +73,7 @@ Note: `tokio/time` added beyond spec for retry timers in the event loop. `rand` 
 - [ ] **Step 3: Create empty lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 ```
 
 - [ ] **Step 4: Verify workspace compiles**
@@ -85,7 +85,7 @@ Expected: success, no errors
 
 ```bash
 git add Cargo.toml crates/
-git commit -m "feat: scaffold cargo workspace with concensus crate"
+git commit -m "feat: scaffold cargo workspace with daccord crate"
 ```
 
 ---
@@ -93,13 +93,13 @@ git commit -m "feat: scaffold cargo workspace with concensus crate"
 ### Task 2: Error Types
 
 **Files:**
-- Create: `crates/concensus/src/error.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/error.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for error types**
 
 ```rust
-// crates/concensus/src/error.rs
+// crates/daccord/src/error.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,13 +146,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — types not defined yet
 
 - [ ] **Step 3: Implement error types**
 
 ```rust
-// crates/concensus/src/error.rs
+// crates/daccord/src/error.rs
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -194,19 +194,19 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod error;
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all 5 tests pass
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/error.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/error.rs crates/daccord/src/lib.rs
 git commit -m "feat: add error types with thiserror"
 ```
 
@@ -215,13 +215,13 @@ git commit -m "feat: add error types with thiserror"
 ### Task 3: NodeId and Config
 
 **Files:**
-- Create: `crates/concensus/src/config.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/config.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for NodeId**
 
 ```rust
-// crates/concensus/src/config.rs
+// crates/daccord/src/config.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,13 +278,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `NodeId` not defined
 
 - [ ] **Step 3: Implement NodeId**
 
 ```rust
-// crates/concensus/src/config.rs
+// crates/daccord/src/config.rs
 use std::fmt;
 use std::sync::Arc;
 
@@ -326,20 +326,20 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass (error + config)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/config.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/config.rs crates/daccord/src/lib.rs
 git commit -m "feat: add NodeId with name and incarnation timestamp"
 ```
 
@@ -348,13 +348,13 @@ git commit -m "feat: add NodeId with name and incarnation timestamp"
 ### Task 4: Transport Traits
 
 **Files:**
-- Create: `crates/concensus/src/transport.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/transport.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for transport traits**
 
 ```rust
-// crates/concensus/src/transport.rs
+// crates/daccord/src/transport.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,13 +407,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — traits not defined
 
 - [ ] **Step 3: Implement transport traits**
 
 ```rust
-// crates/concensus/src/transport.rs
+// crates/daccord/src/transport.rs
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -436,7 +436,7 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 pub mod transport;
@@ -444,13 +444,13 @@ pub mod transport;
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/transport.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/transport.rs crates/daccord/src/lib.rs
 git commit -m "feat: add MessageSender and MessageReceiver transport traits"
 ```
 
@@ -459,13 +459,13 @@ git commit -m "feat: add MessageSender and MessageReceiver transport traits"
 ### Task 5: Storage Trait and MemoryStorage
 
 **Files:**
-- Create: `crates/concensus/src/storage.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/storage.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for MemoryStorage**
 
 ```rust
-// crates/concensus/src/storage.rs
+// crates/daccord/src/storage.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,13 +505,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — types not defined
 
 - [ ] **Step 3: Implement Storage trait and MemoryStorage**
 
 ```rust
-// crates/concensus/src/storage.rs
+// crates/daccord/src/storage.rs
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -572,7 +572,7 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 pub mod storage;
@@ -581,13 +581,13 @@ pub mod transport;
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/storage.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/storage.rs crates/daccord/src/lib.rs
 git commit -m "feat: add Storage trait and MemoryStorage implementation"
 ```
 
@@ -596,7 +596,7 @@ git commit -m "feat: add Storage trait and MemoryStorage implementation"
 ### Task 6: PeerConfig
 
 **Files:**
-- Modify: `crates/concensus/src/config.rs`
+- Modify: `crates/daccord/src/config.rs`
 
 - [ ] **Step 1: Write test for PeerConfig**
 
@@ -633,12 +633,12 @@ Add to the existing `config.rs` tests:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `PeerConfig` not defined
 
 - [ ] **Step 3: Implement PeerConfig**
 
-Add to `crates/concensus/src/config.rs`:
+Add to `crates/daccord/src/config.rs`:
 
 ```rust
 use crate::transport::{MessageSender, MessageReceiver};
@@ -652,13 +652,13 @@ pub struct PeerConfig<S: MessageSender, R: MessageReceiver> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/config.rs
+git add crates/daccord/src/config.rs
 git commit -m "feat: add PeerConfig struct"
 ```
 
@@ -669,13 +669,13 @@ git commit -m "feat: add PeerConfig struct"
 ### Task 7: Protocol Messages
 
 **Files:**
-- Create: `crates/concensus/src/message.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/message.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for message serialization**
 
 ```rust
-// crates/concensus/src/message.rs
+// crates/daccord/src/message.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,13 +786,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `Message` not defined
 
 - [ ] **Step 3: Implement protocol messages**
 
 ```rust
-// crates/concensus/src/message.rs
+// crates/daccord/src/message.rs
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -858,7 +858,7 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 pub(crate) mod message;
@@ -868,13 +868,13 @@ pub mod transport;
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/message.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/message.rs crates/daccord/src/lib.rs
 git commit -m "feat: add Paxos protocol message types with JSON serialization"
 ```
 
@@ -883,8 +883,8 @@ git commit -m "feat: add Paxos protocol message types with JSON serialization"
 ### Task 8: Protocol State Machine — Core Types and Acceptor Phase 1
 
 **Files:**
-- Create: `crates/concensus/src/protocol.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/protocol.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 This is the core of the library. `ProtocolState` manages all Paxos instances. It is a pure state machine — given inputs (messages, proposals), it produces outputs (`Outgoing` messages, decisions). It does NOT do I/O.
 
@@ -893,7 +893,7 @@ This is the core of the library. `ProtocolState` manages all Paxos instances. It
 - [ ] **Step 1: Write tests for acceptor behavior (Phase 1)**
 
 ```rust
-// crates/concensus/src/protocol.rs
+// crates/daccord/src/protocol.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,13 +974,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `ProtocolState` not defined
 
 - [ ] **Step 3: Implement core types and acceptor Phase 1**
 
 ```rust
-// crates/concensus/src/protocol.rs
+// crates/daccord/src/protocol.rs
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -1196,7 +1196,7 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 pub(crate) mod message;
@@ -1207,13 +1207,13 @@ pub mod transport;
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: acceptor Phase 1 tests pass (duplicate_promise test will need propose, so it uses the stub — adjust: move that test to Task 10)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/protocol.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/protocol.rs crates/daccord/src/lib.rs
 git commit -m "feat: add protocol state machine with Outgoing/SendTarget types and Phase 1 acceptor"
 ```
 
@@ -1222,7 +1222,7 @@ git commit -m "feat: add protocol state machine with Outgoing/SendTarget types a
 ### Task 9: Acceptor Phase 2 (Accept/Accepted)
 
 **Files:**
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 - [ ] **Step 1: Write tests for acceptor Phase 2**
 
@@ -1316,7 +1316,7 @@ Add to `protocol.rs` tests:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `handle_accept` returns empty vec
 
 - [ ] **Step 3: Implement acceptor Phase 2**
@@ -1361,13 +1361,13 @@ Replace `handle_accept` stub in `protocol.rs`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all acceptor tests pass
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/protocol.rs
+git add crates/daccord/src/protocol.rs
 git commit -m "feat: add Phase 2 acceptor logic (Accept/NackAccept)"
 ```
 
@@ -1376,7 +1376,7 @@ git commit -m "feat: add Phase 2 acceptor logic (Accept/NackAccept)"
 ### Task 10: Proposer Logic (Phase 1 + Phase 2 + Self-vote)
 
 **Files:**
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 - [ ] **Step 1: Write tests for proposer behavior**
 
@@ -1523,7 +1523,7 @@ Add to `protocol.rs` tests:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `propose` is a stub returning `(0, vec![])`
 
 - [ ] **Step 3: Implement proposer logic**
@@ -1651,13 +1651,13 @@ Replace `handle_promise` stub:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all proposer tests pass
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/protocol.rs
+git add crates/daccord/src/protocol.rs
 git commit -m "feat: add proposer logic with Phase 1, Phase 2, self-vote, and value selection"
 ```
 
@@ -1666,7 +1666,7 @@ git commit -m "feat: add proposer logic with Phase 1, Phase 2, self-vote, and va
 ### Task 11: Decision Handling and Accepted Quorum
 
 **Files:**
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 - [ ] **Step 1: Write tests for accepted quorum and decide handling**
 
@@ -1807,7 +1807,7 @@ git commit -m "feat: add proposer logic with Phase 1, Phase 2, self-vote, and va
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `handle_accepted` and `handle_decide` are stubs
 
 - [ ] **Step 3: Implement handle_accepted and handle_decide**
@@ -1899,13 +1899,13 @@ In this case, re-proposing the same value is harmless (it will just get decided 
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/protocol.rs
+git add crates/daccord/src/protocol.rs
 git commit -m "feat: add accepted quorum detection, decide handling, and instance GC"
 ```
 
@@ -1914,7 +1914,7 @@ git commit -m "feat: add accepted quorum detection, decide handling, and instanc
 ### Task 12: Nack Handling and Retry Support
 
 **Files:**
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 - [ ] **Step 1: Write tests for nack handling**
 
@@ -2064,7 +2064,7 @@ git commit -m "feat: add accepted quorum detection, decide handling, and instanc
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL
 
 - [ ] **Step 3: Implement nack handling and retry support**
@@ -2150,13 +2150,13 @@ Replace `handle_nack` stub and add retry methods:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/protocol.rs
+git add crates/daccord/src/protocol.rs
 git commit -m "feat: add nack handling with exponential backoff and retry support"
 ```
 
@@ -2167,13 +2167,13 @@ git commit -m "feat: add nack handling with exponential backoff and retry suppor
 ### Task 13: Node, NodeHandle, and Decided Types
 
 **Files:**
-- Create: `crates/concensus/src/node.rs`
-- Modify: `crates/concensus/src/lib.rs`
+- Create: `crates/daccord/src/node.rs`
+- Modify: `crates/daccord/src/lib.rs`
 
 - [ ] **Step 1: Write tests for Node construction and NodeHandle**
 
 ```rust
-// crates/concensus/src/node.rs
+// crates/daccord/src/node.rs
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2233,13 +2233,13 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: FAIL — `Node` not defined
 
 - [ ] **Step 3: Implement Node, NodeHandle, Decided, DecisionReceiver**
 
 ```rust
-// crates/concensus/src/node.rs
+// crates/daccord/src/node.rs
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2380,7 +2380,7 @@ mod tests { /* ... as above ... */ }
 - [ ] **Step 4: Wire into lib.rs with public re-exports**
 
 ```rust
-// crates/concensus/src/lib.rs
+// crates/daccord/src/lib.rs
 pub mod config;
 pub mod error;
 pub(crate) mod message;
@@ -2399,13 +2399,13 @@ pub use transport::{MessageReceiver, MessageSender};
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass (run() is todo but not called in these tests)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/concensus/src/node.rs crates/concensus/src/lib.rs
+git add crates/daccord/src/node.rs crates/daccord/src/lib.rs
 git commit -m "feat: add Node, NodeHandle, Decided types and public API re-exports"
 ```
 
@@ -2414,7 +2414,7 @@ git commit -m "feat: add Node, NodeHandle, Decided types and public API re-expor
 ### Task 14: Event Loop
 
 **Files:**
-- Modify: `crates/concensus/src/node.rs`
+- Modify: `crates/daccord/src/node.rs`
 
 The event loop spawns a task per peer receiver feeding into a shared channel. For the zero-peer (single-node) case, we use an `Option` to avoid polling a closed `incoming_rx`.
 
@@ -2454,7 +2454,7 @@ The event loop spawns a task per peer receiver feeding into a shared channel. Fo
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p concensus single_node_consensus`
+Run: `cargo test -p daccord single_node_consensus`
 Expected: FAIL — `run()` is `todo!()`
 
 - [ ] **Step 3: Implement Node::run() event loop**
@@ -2650,13 +2650,13 @@ Replace the `run` method:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p concensus single_node_consensus`
+Run: `cargo test -p daccord single_node_consensus`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/concensus/src/node.rs
+git add crates/daccord/src/node.rs
 git commit -m "feat: implement Node::run() event loop with peer tasks and retry timer"
 ```
 
@@ -2665,7 +2665,7 @@ git commit -m "feat: implement Node::run() event loop with peer tasks and retry 
 ### Task 15: Multi-Node Integration Test
 
 **Files:**
-- Modify: `crates/concensus/src/node.rs` (add test)
+- Modify: `crates/daccord/src/node.rs` (add test)
 
 - [ ] **Step 1: Write a 3-node integration test**
 
@@ -2749,13 +2749,13 @@ git commit -m "feat: implement Node::run() event loop with peer tasks and retry 
 
 - [ ] **Step 2: Run test to verify it passes**
 
-Run: `cargo test -p concensus three_node_consensus`
+Run: `cargo test -p daccord three_node_consensus`
 Expected: PASS — all 3 nodes agree on "hello"
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/concensus/src/node.rs
+git add crates/daccord/src/node.rs
 git commit -m "feat: add 3-node integration test with in-memory channel transport"
 ```
 
@@ -2764,8 +2764,8 @@ git commit -m "feat: add 3-node integration test with in-memory channel transpor
 ### Task 16: Tracing Instrumentation
 
 **Files:**
-- Modify: `crates/concensus/src/node.rs`
-- Modify: `crates/concensus/src/protocol.rs`
+- Modify: `crates/daccord/src/node.rs`
+- Modify: `crates/daccord/src/protocol.rs`
 
 - [ ] **Step 1: Add tracing to event loop**
 
@@ -2784,13 +2784,13 @@ Key instrumentation points:
 
 - [ ] **Step 3: Run all tests**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/concensus/src/node.rs crates/concensus/src/protocol.rs
+git add crates/daccord/src/node.rs crates/daccord/src/protocol.rs
 git commit -m "feat: add tracing instrumentation to event loop and protocol"
 ```
 
@@ -2803,19 +2803,19 @@ git commit -m "feat: add tracing instrumentation to event loop and protocol"
 
 - [ ] **Step 1: Run cargo clippy**
 
-Run: `cargo clippy -p concensus -- -D warnings`
+Run: `cargo clippy -p daccord -- -D warnings`
 Expected: no warnings
 
 - [ ] **Step 2: Fix any clippy issues**
 
 - [ ] **Step 3: Run full test suite**
 
-Run: `cargo test -p concensus`
+Run: `cargo test -p daccord`
 Expected: all tests pass
 
 - [ ] **Step 4: Run cargo doc**
 
-Run: `cargo doc -p concensus --no-deps`
+Run: `cargo doc -p daccord --no-deps`
 Expected: success
 
 - [ ] **Step 5: Commit any cleanup**

@@ -1,4 +1,4 @@
-# concensus
+# daccord
 
 A paxos implementation in rust.
 

@@ -15,10 +15,10 @@ A Rust library implementing the Paxos consensus algorithm. The library provides 
 Cargo workspace with a single published crate. A non-published testing crate will be added later.
 
 ```
-concensus/
+daccord/
 ├── Cargo.toml              # workspace root
 ├── crates/
-│   └── concensus/
+│   └── daccord/
 │       ├── Cargo.toml
 │       └── src/
 │           ├── lib.rs       # re-exports public API

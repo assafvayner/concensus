@@ -106,7 +106,7 @@ Heartbeat { term: u64 }
 
 ### Feature flag
 
-`concensus/Cargo.toml`:
+`daccord/Cargo.toml`:
 ```toml
 [features]
 multi-paxos = []
@@ -144,13 +144,13 @@ Transports, storage, config, error types, public API (`Node`, `NodeHandle`, `Dec
 
 ### Feature gating in test crate
 
-`concensus-tests/Cargo.toml`:
+`daccord-tests/Cargo.toml`:
 ```toml
 [features]
-multi-paxos = ["concensus/multi-paxos"]
+multi-paxos = ["daccord/multi-paxos"]
 
 [dev-dependencies]
-concensus = { path = "../concensus", features = ["channel-transport", "test-support"] }
+daccord = { path = "../daccord", features = ["channel-transport", "test-support"] }
 ```
 
 ### Existing tests with multi-paxos
@@ -161,7 +161,7 @@ Create a feature-gated test file (or use `cfg` within existing test files) that 
 
 ### New multi-paxos-specific tests
 
-File: `concensus-tests/tests/multi_paxos.rs` (only compiled with `multi-paxos` feature)
+File: `daccord-tests/tests/multi_paxos.rs` (only compiled with `multi-paxos` feature)
 
 1. **Leader emerges on first proposal** — 3-node cluster, propose from node 0, verify it becomes leader
 2. **Leader fast path** — propose 10 sequential values from the leader, verify all decide (confirm Phase 1 is skipped after first)
@@ -176,14 +176,14 @@ File: `concensus-tests/tests/multi_paxos.rs` (only compiled with `multi-paxos` f
 
 ### Docker Compose demo with multi-paxos
 
-The existing `concensus-demo` crate runs a 3-node cluster with gRPC CLI. It should work with multi-paxos enabled to validate the optimization in a realistic deployment.
+The existing `daccord-demo` crate runs a 3-node cluster with gRPC CLI. It should work with multi-paxos enabled to validate the optimization in a realistic deployment.
 
 **Changes to demo crate:**
 
-- `concensus-demo/Cargo.toml`: Add `multi-paxos` feature that forwards to `concensus/multi-paxos`:
+- `daccord-demo/Cargo.toml`: Add `multi-paxos` feature that forwards to `daccord/multi-paxos`:
   ```toml
   [features]
-  multi-paxos = ["concensus/multi-paxos"]
+  multi-paxos = ["daccord/multi-paxos"]
   ```
 - Add a new `docker-compose.multi-paxos.yml` (or parameterize the existing ones) that builds the demo with `--features multi-paxos`. The simplest approach: a new compose file that sets a build arg, with the Dockerfile updated to accept an optional `FEATURES` arg passed to `cargo build --release --features "$FEATURES"`.
 
@@ -196,14 +196,14 @@ The existing `concensus-demo` crate runs a 3-node cluster with gRPC CLI. It shou
 
 2. **Wait for healthy, then propose values:**
    ```bash
-   concensus-cli --addr localhost:50051 propose --value "alice"
-   concensus-cli --addr localhost:50051 propose --value "bob"
-   concensus-cli --addr localhost:50051 propose --value "charlie"
+   daccord-cli --addr localhost:50051 propose --value "alice"
+   daccord-cli --addr localhost:50051 propose --value "bob"
+   daccord-cli --addr localhost:50051 propose --value "charlie"
    ```
 
 3. **Verify decisions are consistent across nodes:**
    ```bash
-   concensus-cli --addr localhost:50051 decisions
+   daccord-cli --addr localhost:50051 decisions
    ```
 
 4. **Verify leader election occurred** by checking logs for leader state transitions:
@@ -215,15 +215,15 @@ The existing `concensus-demo` crate runs a 3-node cluster with gRPC CLI. It shou
    ```bash
    docker compose -f docker-compose.multi-paxos.yml stop node-1
    # Propose via node-2 (port 50052 if exposed, or via docker exec)
-   docker exec concensus-node-2-1 concensus-cli --addr localhost:50051 propose --value "after-failover"
-   docker exec concensus-node-2-1 concensus-cli --addr localhost:50051 decisions
+   docker exec daccord-node-2-1 daccord-cli --addr localhost:50051 propose --value "after-failover"
+   docker exec daccord-node-2-1 daccord-cli --addr localhost:50051 decisions
    ```
 
 6. **Restart killed node, verify it catches up:**
    ```bash
    docker compose -f docker-compose.multi-paxos.yml start node-1
    sleep 5
-   concensus-cli --addr localhost:50051 decisions
+   daccord-cli --addr localhost:50051 decisions
    ```
 
 7. **Shutdown:**

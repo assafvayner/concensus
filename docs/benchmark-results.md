@@ -56,8 +56,8 @@ For **throughput-oriented workloads** where many proposals are in flight simulta
 
 ```bash
 # Classic Paxos
-cargo test -p concensus-tests --test benchmark -- --nocapture --test-threads=1
+cargo test -p daccord-tests --test benchmark -- --nocapture --test-threads=1
 
 # Multi-Paxos
-cargo test -p concensus-tests --features multi-paxos --test benchmark -- --nocapture --test-threads=1
+cargo test -p daccord-tests --features multi-paxos --test benchmark -- --nocapture --test-threads=1
 ```
