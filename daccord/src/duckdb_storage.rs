@@ -284,10 +284,17 @@ where
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(load)?;
-            Ok(match row {
-                (Some(name), Some(inc)) => Some(NodeId::new(name, inc)),
-                _ => None,
-            })
+            // Partial state would be a Raft safety hazard: if we forgot a
+            // vote we already cast in the current term, we could grant a
+            // second vote and split the cluster. Fail-stop instead.
+            match row {
+                (Some(name), Some(inc)) => Ok(Some(NodeId::new(name, inc))),
+                (None, None) => Ok(None),
+                (Some(_), None) | (None, Some(_)) => Err(StorageError::Load(
+                    "raft_meta.voted_for_name and voted_for_incarnation are inconsistent"
+                        .into(),
+                )),
+            }
         })
         .await
     }
@@ -381,5 +388,92 @@ where
             .map_err(load)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_load_err(err: StorageError) {
+        match err {
+            StorageError::Load(_) => {}
+            other => panic!("expected StorageError::Load, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn paxos_load_decisions_returns_err_on_malformed_json() {
+        let storage = DuckdbPaxosStorage::<String>::open_in_memory().unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO paxos_decisions (slot, value) VALUES (?, ?)",
+                params![0u64, "{not valid json"],
+            )
+            .unwrap();
+        }
+        assert_load_err(storage.load_decisions().await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn raft_load_decisions_returns_err_on_malformed_json() {
+        let storage = DuckdbRaftStorage::<String>::open_in_memory().unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO raft_decisions (slot, value) VALUES (?, ?)",
+                params![0u64, "{not valid json"],
+            )
+            .unwrap();
+        }
+        assert_load_err(storage.load_decisions().await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn raft_load_log_returns_err_on_malformed_json() {
+        let storage = DuckdbRaftStorage::<String>::open_in_memory().unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO raft_log (log_index, term, value) VALUES (?, ?, ?)",
+                params![0u64, 1u64, "{not valid json"],
+            )
+            .unwrap();
+        }
+        assert_load_err(storage.load_log().await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn raft_load_voted_for_returns_err_on_partial_state() {
+        // name set, incarnation NULL
+        {
+            let storage = DuckdbRaftStorage::<String>::open_in_memory().unwrap();
+            {
+                let conn = storage.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE raft_meta SET voted_for_name = ?, voted_for_incarnation = NULL \
+                     WHERE id = 0",
+                    params!["a"],
+                )
+                .unwrap();
+            }
+            assert_load_err(storage.load_voted_for().await.unwrap_err());
+        }
+
+        // incarnation set, name NULL
+        {
+            let storage = DuckdbRaftStorage::<String>::open_in_memory().unwrap();
+            {
+                let conn = storage.conn.lock().unwrap();
+                conn.execute(
+                    "UPDATE raft_meta SET voted_for_name = NULL, voted_for_incarnation = ? \
+                     WHERE id = 0",
+                    params![5u64],
+                )
+                .unwrap();
+            }
+            assert_load_err(storage.load_voted_for().await.unwrap_err());
+        }
     }
 }
