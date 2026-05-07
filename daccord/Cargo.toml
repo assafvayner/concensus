@@ -11,6 +11,7 @@ uds-transport = ["tokio/net", "tokio/io-util"]
 multi-paxos = []
 duckdb = ["dep:duckdb"]
 duckdb-bundled = ["duckdb", "duckdb/bundled"]
+redb = ["dep:redb"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
@@ -22,6 +23,7 @@ thiserror = "2"
 tracing = "0.1"
 rand = "0.10"
 duckdb = { version = "1", optional = true }
+redb = { version = "4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
