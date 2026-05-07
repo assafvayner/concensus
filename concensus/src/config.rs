@@ -102,6 +102,11 @@ impl Default for PaxosConfig {
 }
 
 /// Configuration specific to the Raft algorithm.
+///
+/// `election_timeout_min` must be `<= election_timeout_max`; otherwise the
+/// timeout sampler degenerates to a fixed value, defeating the randomization
+/// that prevents split-vote storms. Validate with [`RaftConfig::validate`]
+/// before constructing a [`Node::raft`](crate::Node::raft).
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
     /// How often a leader sends heartbeats to followers.
@@ -110,6 +115,17 @@ pub struct RaftConfig {
     pub election_timeout_min: Duration,
     /// Upper bound of the randomized election timeout (inclusive).
     pub election_timeout_max: Duration,
+}
+
+impl RaftConfig {
+    /// Returns `Err` with a description if the config is internally inconsistent.
+    /// Currently checks `election_timeout_min <= election_timeout_max`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.election_timeout_min > self.election_timeout_max {
+            return Err("election_timeout_min must be <= election_timeout_max");
+        }
+        Ok(())
+    }
 }
 
 impl Default for RaftConfig {

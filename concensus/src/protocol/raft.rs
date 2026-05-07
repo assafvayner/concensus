@@ -112,6 +112,9 @@ where
         config: RaftConfig,
         storage: Box<dyn RaftStorage<V> + Send + Sync>,
     ) -> Self {
+        if let Err(e) = config.validate() {
+            panic!("invalid RaftConfig: {e}");
+        }
         let election_deadline = Instant::now() + sample_election_timeout(&config);
         Self {
             node_id,
@@ -244,6 +247,12 @@ where
             self.role = Role::Follower;
             self.leader = None;
         }
+
+        // Re-apply any committed-but-undelivered slots: a crash between
+        // save_commit_index and save_decision leaves commit_index ahead of
+        // max_decided. The Node's process_decisions will drain these from
+        // pending_decisions on the next event-loop iteration.
+        self.apply_committed_entries();
     }
 
     /// Load persisted state from owned storage and seed in-memory state via
@@ -431,6 +440,10 @@ where
         self.leader = Some(self.node_id.clone());
         self.next_index.clear();
         self.match_index.clear();
+        if let Some(last) = self.log.len().checked_sub(1) {
+            self.match_index
+                .insert(self.node_id.clone(), Some(last as u64));
+        }
 
         // Drain any proposals buffered while we had no leader; treat each as a fresh
         // proposal now that we are the leader.
@@ -586,7 +599,10 @@ where
         if !prev_ok {
             let (conflict_term, conflict_index) = match prev_log_index {
                 Some(idx) if (idx as usize) >= self.log.len() => {
-                    // Log is shorter than the leader expects. Hint: resume from our log's end.
+                    // Log is shorter than the leader expects. Hint: resume
+                    // from our log's end. For an empty log this is 0 — the
+                    // next-free-slot convention; the leader rewinds to slot
+                    // 0 (prev = None) and the follower accepts in one round.
                     (None, Some(self.log.len() as u64))
                 }
                 Some(idx) => {
@@ -858,6 +874,9 @@ where
             Some(a) => a + 1,
             None => 0,
         };
+        if start > target {
+            return;
+        }
         for idx in start..=target {
             let entry = &self.log[idx as usize];
             self.pending_decisions.push(Decision {
@@ -2312,7 +2331,7 @@ mod tests {
         // commit_index back below an already-delivered decision.
         use crate::message::LogEntry;
         let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
-        let log = (0..5)
+        let log: Vec<LogEntry<String>> = (0..5)
             .map(|i| LogEntry {
                 term: 1,
                 value: format!("v{i}"),
@@ -2329,9 +2348,13 @@ mod tests {
             Some(4),
         );
         assert_eq!(p.commit_index, Some(4));
-        // last_applied is the decisions floor; on the next event-loop tick,
-        // apply_committed_entries will deliver slots 3 and 4 (at-least-once).
-        assert_eq!(p.last_applied, Some(2));
+        // restore_state applies the (max_decided, commit_index] gap into
+        // pending_decisions so the Node redelivers slots 3 and 4 on its next
+        // process_decisions pass. last_applied advances to commit_index.
+        assert_eq!(p.last_applied, Some(4));
+        let pending = p.take_decisions();
+        let slots: Vec<u64> = pending.iter().map(|d| d.slot).collect();
+        assert_eq!(slots, vec![3, 4]);
     }
 
     #[test]

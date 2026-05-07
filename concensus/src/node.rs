@@ -383,8 +383,14 @@ where
         let mut retry_interval = tokio::time::interval(std::time::Duration::from_millis(50));
         retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Track whether the receiver is still usable. On a transport error we
+        // either bail with NoQuorum (when we still need replies to make
+        // progress) or stop polling it — re-polling a closed receiver returns
+        // synchronously and would busy-loop the select!.
+        let mut receiver_alive = has_peers;
+
         loop {
-            if has_peers {
+            if receiver_alive {
                 tokio::select! {
                     proposal = self.proposal_rx.recv() => {
                         match proposal {
@@ -405,6 +411,7 @@ where
                                 if 1 < quorum && !self.protocol.is_idle() {
                                     return Err(NodeError::NoQuorum);
                                 }
+                                receiver_alive = false;
                             }
                         }
                     }
@@ -413,9 +420,9 @@ where
                     }
                 }
             } else {
-                // No peers — single-node cluster. Still run `on_tick` so Raft can
-                // complete an initial election and send leader heartbeats; Paxos
-                // uses ticks for its leader-side timers as well.
+                // No (or no-longer-usable) receiver. Still run `on_tick` so
+                // Raft can complete an initial election and send leader
+                // heartbeats; Paxos uses ticks for its leader-side timers.
                 tokio::select! {
                     proposal = self.proposal_rx.recv() => {
                         match proposal {
