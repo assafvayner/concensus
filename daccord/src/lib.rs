@@ -40,8 +40,11 @@
 //! | `tcp-transport` | TCP transport with length-prefixed framing and reconnection |
 //! | `uds-transport` | Unix domain socket transport (same framing as TCP) |
 //! | `test-support` | Enables [`Node::paxos_with_id`] / [`Node::raft_with_id`] for deterministic node identity in tests |
+//! | `duckdb` | Bundled DuckDB-backed implementations of [`PaxosStorage`] and [`RaftStorage`] (disabled by default) |
 
 pub mod config;
+#[cfg(feature = "duckdb")]
+pub mod duckdb_storage;
 pub mod error;
 pub(crate) mod message;
 pub mod node;
@@ -50,6 +53,8 @@ pub mod storage;
 pub mod transport;
 
 pub use config::{NodeId, PaxosConfig, PeerInfo, RaftConfig};
+#[cfg(feature = "duckdb")]
+pub use duckdb_storage::{DuckdbPaxosStorage, DuckdbRaftStorage};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use message::raft::LogEntry;
 pub use node::{Decided, DecisionReceiver, Node, NodeAlgorithm, NodeHandle, NodeRole, NodeState};
