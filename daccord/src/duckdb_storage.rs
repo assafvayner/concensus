@@ -1,7 +1,8 @@
 //! DuckDB-backed persistent storage for Paxos and Raft.
 //!
-//! Available behind the `duckdb` cargo feature. The DuckDB library is bundled
-//! (statically compiled) so no system `libduckdb` is required.
+//! Available behind the `duckdb` cargo feature, which links against a system
+//! `libduckdb`. Enable `duckdb-bundled` instead to statically compile DuckDB
+//! into the binary (no system library required).
 //!
 //! [`DuckdbPaxosStorage`] and [`DuckdbRaftStorage`] use disjoint sets of
 //! tables (`paxos_*` and `raft_*` respectively) and can therefore share the
