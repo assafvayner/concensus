@@ -51,6 +51,7 @@ struct Harness {
     persisted_voted_for: Vec<Option<NodeId>>,
     persisted_log: Vec<Vec<LogEntry<u32>>>,
     persisted_decisions: Vec<Vec<(u64, u32)>>,
+    persisted_commit_index: Vec<Option<u64>>,
 }
 
 impl Harness {
@@ -83,6 +84,7 @@ impl Harness {
             persisted_voted_for: vec![None; NUM_NODES],
             persisted_log: vec![Vec::new(); NUM_NODES],
             persisted_decisions: vec![Vec::new(); NUM_NODES],
+            persisted_commit_index: vec![None; NUM_NODES],
         }
     }
 
@@ -105,6 +107,9 @@ impl Harness {
             for entry in &intent.log_snapshot[idx as usize..] {
                 self.persisted_log[node].push(entry.clone());
             }
+        }
+        if let Some(ci) = intent.commit_index {
+            self.persisted_commit_index[node] = ci;
         }
     }
 
@@ -187,6 +192,7 @@ impl Harness {
                     self.persisted_voted_for[n].clone(),
                     self.persisted_log[n].clone(),
                     self.persisted_decisions[n].clone(),
+                    self.persisted_commit_index[n],
                 );
             }
         }

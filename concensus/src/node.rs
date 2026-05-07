@@ -56,8 +56,19 @@ pub type DecisionReceiver<V> = mpsc::Receiver<Decided<V>>;
 
 /// A value that has reached consensus, paired with its slot number.
 ///
-/// All nodes in a healthy cluster will produce the same `Decided` value for each
-/// slot. Slots are assigned sequentially starting from 0.
+/// All nodes in a healthy cluster will produce the same `Decided` value for
+/// each slot. Slots are assigned sequentially starting from 0.
+///
+/// # Idempotency
+///
+/// Consumers must treat `Decided` delivery as **at-least-once** and dedupe by
+/// slot. The same `Decided { slot, value }` may be delivered more than once
+/// across a node restart: when a node crashes between persisting a log entry
+/// and persisting the corresponding decision, recovery sees the entry as
+/// uncommitted, and the next leader's heartbeat re-applies it. The slot and
+/// value will be identical to the prior delivery — the cluster never disagrees
+/// about a slot's value — but a consumer that performs side effects on each
+/// `Decided` must keep its own `last_processed_slot` watermark.
 #[derive(Clone, Debug)]
 pub struct Decided<V> {
     /// The slot number this value was decided in.

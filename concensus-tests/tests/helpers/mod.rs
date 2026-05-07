@@ -160,6 +160,18 @@ where
     async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
         self.inner.lock().await.load_log().await
     }
+
+    async fn save_commit_index(&mut self, commit_index: Option<u64>) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .await
+            .save_commit_index(commit_index)
+            .await
+    }
+
+    async fn load_commit_index(&self) -> Result<Option<u64>, StorageError> {
+        self.inner.lock().await.load_commit_index().await
+    }
 }
 
 // ---------------------------------------------------------------------------

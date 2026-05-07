@@ -38,6 +38,22 @@ pub(crate) enum RaftMessage<V> {
         conflict_term: Option<u64>,
         conflict_index: Option<u64>,
     },
-    /// Follower -> leader: forward a client proposal originally received locally.
-    Forward { value: V },
+    /// Follower -> leader: forward a client proposal originally received
+    /// locally. `hops` is a TTL that increments at each chain-forward
+    /// (follower→follower→leader); recipients drop forwards exceeding
+    /// [`MAX_FORWARD_HOPS`] to bound the chain length.
+    ///
+    /// Older payloads without `hops` deserialize with a default of 0 thanks
+    /// to `#[serde(default)]`.
+    Forward {
+        value: V,
+        #[serde(default)]
+        hops: u8,
+    },
 }
+
+/// Maximum number of hops a `Forward` message is allowed to traverse before
+/// being dropped. Three covers the worst-case chain on a typical 3–5 node
+/// cluster (originator → intermediary → leader). Cluster diameters above
+/// that should bump this constant.
+pub(crate) const MAX_FORWARD_HOPS: u8 = 3;

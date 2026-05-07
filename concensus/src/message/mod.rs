@@ -8,7 +8,7 @@ use crate::config::NodeId;
 
 pub(crate) use paxos::{PaxosMessage, ProposalNumber};
 #[allow(unused_imports)]
-pub(crate) use raft::{LogEntry, RaftMessage};
+pub(crate) use raft::{LogEntry, RaftMessage, MAX_FORWARD_HOPS};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) enum WireVariant<V> {

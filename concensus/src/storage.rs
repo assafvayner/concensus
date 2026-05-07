@@ -76,6 +76,18 @@ where
 
     /// Load the entire log.
     async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError>;
+
+    /// Persist the highest committed log index, or clear it if `commit_index`
+    /// is `None`. Persistence is not strictly required by the Raft paper
+    /// (commit_index is volatile per Figure 2), but persisting it closes a
+    /// recovery window where a crash between [`append_log`](Self::append_log)
+    /// and [`save_decision`](Self::save_decision) would leave a committed
+    /// entry's slot looking uncommitted on the next start, allowing a future
+    /// leader's heartbeat to re-deliver the same `Decided` value.
+    async fn save_commit_index(&mut self, commit_index: Option<u64>) -> Result<(), StorageError>;
+
+    /// Load the persisted commit_index, or `None` if none was ever saved.
+    async fn load_commit_index(&self) -> Result<Option<u64>, StorageError>;
 }
 
 /// In-memory [`PaxosStorage`] implementation backed by a `HashMap`.
@@ -130,6 +142,7 @@ pub struct RaftMemoryStorage<V> {
     term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry<V>>,
+    commit_index: Option<u64>,
 }
 
 impl<V> RaftMemoryStorage<V> {
@@ -140,6 +153,7 @@ impl<V> RaftMemoryStorage<V> {
             term: 0,
             voted_for: None,
             log: Vec::new(),
+            commit_index: None,
         }
     }
 }
@@ -201,6 +215,15 @@ where
 
     async fn load_log(&self) -> Result<Vec<LogEntry<V>>, StorageError> {
         Ok(self.log.clone())
+    }
+
+    async fn save_commit_index(&mut self, commit_index: Option<u64>) -> Result<(), StorageError> {
+        self.commit_index = commit_index;
+        Ok(())
+    }
+
+    async fn load_commit_index(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self.commit_index)
     }
 }
 
@@ -297,6 +320,16 @@ mod tests {
         let log = s.load_log().await.unwrap();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].value, "a");
+    }
+
+    #[tokio::test]
+    async fn raft_storage_commit_index_roundtrip() {
+        let mut s = RaftMemoryStorage::<String>::new();
+        assert!(s.load_commit_index().await.unwrap().is_none());
+        s.save_commit_index(Some(7)).await.unwrap();
+        assert_eq!(s.load_commit_index().await.unwrap(), Some(7));
+        s.save_commit_index(None).await.unwrap();
+        assert!(s.load_commit_index().await.unwrap().is_none());
     }
 
     #[tokio::test]

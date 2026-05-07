@@ -6,7 +6,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::{NodeId, RaftConfig};
 use crate::error::StorageError;
-use crate::message::{LogEntry, RaftMessage};
+use crate::message::{LogEntry, RaftMessage, MAX_FORWARD_HOPS};
 use crate::protocol::{ConsensusProtocol, Decision, Outgoing, SendTarget};
 use crate::storage::RaftStorage;
 
@@ -29,6 +29,9 @@ pub(crate) struct PersistIntent<V> {
     pub truncate_from: Option<u64>,
     pub append_from: Option<u64>,
     pub log_snapshot: Vec<LogEntry<V>>,
+    /// `Some(value)` when commit_index has changed and needs to be persisted.
+    /// The inner `Option<u64>` is the value to write (may itself be `None`).
+    pub commit_index: Option<Option<u64>>,
 }
 
 /// Raft peers begin in term 0 as followers; single-node clusters complete a
@@ -70,9 +73,17 @@ pub(crate) struct RaftProtocol<V> {
     pub(crate) pending_persist_voted_for: bool,
     pub(crate) pending_persist_log_from: Option<u64>,
     pub(crate) pending_truncate_from: Option<u64>,
+    pub(crate) pending_persist_commit_index: bool,
 
     // Buffered proposals from before a leader is known (drained on AppendEntries).
     pub(crate) pending_proposals: Vec<V>,
+
+    // Proposals surfaced via `take_lost_proposals`. We populate this when a
+    // follower's election timer fires while pending_proposals is non-empty —
+    // the buffered values' presumed leader is gone, and the Node should
+    // re-attempt routing through `propose` (which will forward to whichever
+    // leader we next learn about, or buffer again if we still don't know).
+    pub(crate) lost_proposals: Vec<V>,
 
     // Owned storage backend. Persists term, voted_for, log entries, and decisions.
     storage: Box<dyn RaftStorage<V> + Send + Sync>,
@@ -123,7 +134,9 @@ where
             pending_persist_voted_for: false,
             pending_persist_log_from: None,
             pending_truncate_from: None,
+            pending_persist_commit_index: false,
             pending_proposals: Vec::new(),
+            lost_proposals: Vec::new(),
             storage,
         }
     }
@@ -153,36 +166,60 @@ where
     /// Restore persistent state at startup from explicit values. Used by the
     /// async [`recover`](Self::recover) wrapper after it loads through owned
     /// storage, and directly by property tests that simulate restarts from
-    /// arbitrary external state. The committed prefix of the log is exactly
-    /// the set of decided slots, so `commit_index` and `last_applied` are set
-    /// to the highest decided slot (or `None` if there are no decisions).
+    /// arbitrary external state.
+    ///
+    /// `commit_index` is set to `max(persisted_commit_index, max_decided_slot)`.
+    /// Persisted commit_index closes the recovery window where a crash between
+    /// log persistence and decision persistence would have rolled commit_index
+    /// back; `max_decided_slot` is the safety floor for older storage backends
+    /// that don't yet persist commit_index. `last_applied` is set to
+    /// `max_decided_slot`, so the slots between `max_decided_slot+1` and
+    /// `commit_index` are re-applied on the next event-loop iteration —
+    /// consumers see at-least-once delivery (see `Decided` doc).
     ///
     /// Role normally resets to Follower: a freshly-started node cannot assume
     /// it is still leader, and the election timeout will trigger a fresh
-    /// election if needed. For a single-node cluster, resume as Leader only when
-    /// durable state shows this node already won an election in the loaded term
-    /// (`term > 0` and `voted_for == self`); otherwise stay Follower at `term`
-    /// until the event loop runs an election.
+    /// election if needed. For a single-node cluster, resume as Leader only
+    /// when durable state shows this node already won an election in the
+    /// loaded term (`term > 0` and `voted_for == self`); otherwise stay
+    /// Follower at `term` until the event loop runs an election.
     pub(crate) fn restore_state(
         &mut self,
         term: u64,
         voted_for: Option<NodeId>,
         log: Vec<LogEntry<V>>,
         decisions: Vec<(u64, V)>,
+        persisted_commit_index: Option<u64>,
     ) {
         self.current_term = term;
         self.voted_for = voted_for;
         self.log = log;
         let max_decided = decisions.iter().map(|(s, _)| *s).max();
-        self.commit_index = max_decided;
+        self.commit_index = match (persisted_commit_index, max_decided) {
+            (Some(p), Some(d)) => Some(p.max(d)),
+            (Some(p), None) => Some(p),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        };
+        // Cap commit_index at the last log entry — a persisted value past the
+        // end of the log would crash `apply_committed_entries`. This shouldn't
+        // happen under normal operation (commit_index is only persisted after
+        // the corresponding log append is flushed) but a corrupted backing
+        // store should not panic the protocol.
+        if let Some(c) = self.commit_index {
+            let last = self.log.len().checked_sub(1).map(|i| i as u64);
+            self.commit_index = last.map(|l| c.min(l));
+        }
         self.last_applied = max_decided;
         self.election_deadline = Instant::now() + sample_election_timeout(&self.config);
         self.pending_persist_term = false;
         self.pending_persist_voted_for = false;
         self.pending_persist_log_from = None;
         self.pending_truncate_from = None;
+        self.pending_persist_commit_index = false;
         self.pending_decisions.clear();
         self.pending_proposals.clear();
+        self.lost_proposals.clear();
         self.votes_received.clear();
         self.next_index.clear();
         self.match_index.clear();
@@ -193,6 +230,12 @@ where
             if resume_leader {
                 self.role = Role::Leader;
                 self.leader = Some(self.node_id.clone());
+                // Seed match_index[self] so a future call to try_advance_commit
+                // (e.g. after a refactor) correctly observes the local replica.
+                if let Some(last) = self.log.len().checked_sub(1) {
+                    self.match_index
+                        .insert(self.node_id.clone(), Some(last as u64));
+                }
             } else {
                 self.role = Role::Follower;
                 self.leader = None;
@@ -211,14 +254,17 @@ where
         let voted_for = self.storage.load_voted_for().await?;
         let log = self.storage.load_log().await?;
         let decisions = self.storage.load_decisions().await?;
-        self.restore_state(term, voted_for, log, decisions);
+        let commit_index = self.storage.load_commit_index().await?;
+        self.restore_state(term, voted_for, log, decisions, commit_index);
         Ok(())
     }
 
     /// Drain the pending persistence intent and write it through owned
-    /// storage. Order matters: term -> voted_for -> truncate -> append.
-    /// Truncating before appending guarantees we never briefly persist
-    /// entries that conflict with what's about to be truncated.
+    /// storage. Order matters: term -> voted_for -> truncate -> append ->
+    /// commit_index. Truncating before appending guarantees we never briefly
+    /// persist entries that conflict with what's about to be truncated.
+    /// Persisting commit_index last guarantees the entries it points at are
+    /// already durable.
     pub(crate) async fn flush_persist(&mut self) -> Result<(), StorageError> {
         let intent = self.drain_persist_intent();
         if let Some(term) = intent.term {
@@ -233,6 +279,9 @@ where
         if let Some(idx) = intent.append_from {
             let to_append = &intent.log_snapshot[idx as usize..];
             self.storage.append_log(to_append).await?;
+        }
+        if let Some(ci) = intent.commit_index {
+            self.storage.save_commit_index(ci).await?;
         }
         Ok(())
     }
@@ -264,8 +313,14 @@ where
         };
         let truncate_from = self.pending_truncate_from.take();
         let append_from = self.pending_persist_log_from.take();
+        let commit_index = if self.pending_persist_commit_index {
+            Some(self.commit_index)
+        } else {
+            None
+        };
         self.pending_persist_term = false;
         self.pending_persist_voted_for = false;
+        self.pending_persist_commit_index = false;
         let log_snapshot = if append_from.is_some() {
             self.log.clone()
         } else {
@@ -277,6 +332,7 @@ where
             truncate_from,
             append_from,
             log_snapshot,
+            commit_index,
         }
     }
 
@@ -322,9 +378,22 @@ where
         self.leader = leader;
         self.votes_received.clear();
         self.election_deadline = Instant::now() + sample_election_timeout(&self.config);
+        // Clear leader-side persistence intent. Any uncommitted entries this
+        // node appended as a candidate/leader stay in `self.log`; if a new
+        // leader's AppendEntries conflicts they'll be truncated, otherwise
+        // they'll be re-flagged for persistence by the conflict-loop in
+        // `handle_append_entries`. Carrying the intent across a role change
+        // would persist entries we may immediately truncate.
+        self.pending_persist_log_from = None;
     }
 
     fn start_election(&mut self) -> Vec<Outgoing<RaftMessage<V>>> {
+        // Was this a re-election (we were already a Candidate)? If so, the
+        // previous election didn't reach quorum — drain buffered proposals
+        // to lost_proposals so the Node can re-route them. The first
+        // Follower→Candidate transition keeps proposals buffered so they can
+        // still land in our own log if we win immediately.
+        let was_candidate = matches!(self.role, Role::Candidate);
         self.current_term += 1;
         self.role = Role::Candidate;
         self.voted_for = Some(self.node_id.clone());
@@ -336,7 +405,14 @@ where
         self.pending_persist_voted_for = true;
         tracing::debug!(term = self.current_term, "starting Raft election");
         if self.votes_received.len() >= self.quorum() {
+            // Immediate-quorum fast-path (e.g., single-node cluster):
+            // become_leader will consume pending_proposals into the log, so
+            // don't surface them as lost.
             return self.become_leader();
+        }
+        if was_candidate {
+            self.lost_proposals
+                .extend(std::mem::take(&mut self.pending_proposals));
         }
         vec![Outgoing {
             target: SendTarget::Broadcast,
@@ -468,6 +544,30 @@ where
                 },
             }];
         }
+        // Reject same-term AppendEntries when we ourselves are Leader of this
+        // term. Per Election Safety (§5.4.1), at most one node can be leader
+        // in any term, so this branch is only reachable on a protocol
+        // violation (or a buggy/malicious peer). Without this guard we would
+        // fall through, set `role = Follower`, and potentially truncate our
+        // own log — which a leader is paper-bound never to do.
+        if term == self.current_term && matches!(self.role, Role::Leader) {
+            tracing::warn!(
+                term,
+                peer = %leader,
+                self_id = %self.node_id,
+                "AppendEntries from another leader in same term — Election Safety violation; rejecting"
+            );
+            return vec![Outgoing {
+                target: SendTarget::Peer(leader),
+                message: RaftMessage::AppendEntriesResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: None,
+                    conflict_term: None,
+                    conflict_index: None,
+                },
+            }];
+        }
         // Recognize the leader for the current term and reset election timer.
         self.role = Role::Follower;
         self.leader = Some(leader.clone());
@@ -497,7 +597,12 @@ where
                         .map(|i| i as u64);
                     (Some(conflict_term_val), first)
                 }
-                None => (None, Some(0)),
+                // Unreachable in practice: `prev_ok` is unconditionally true
+                // when `prev_log_index = None` (see the match a few lines up),
+                // so this arm of the `if !prev_ok` block can't fire. Kept for
+                // exhaustiveness; the hint mirrors what we'd want if the
+                // upstream check ever changed.
+                None => (None, Some(self.log.len() as u64)),
             };
             return vec![Outgoing {
                 target: SendTarget::Peer(leader),
@@ -539,30 +644,49 @@ where
             }
         }
 
-        // Update commit_index from leader_commit, capped at our last index.
-        if let Some(lc) = leader_commit {
-            let last_idx = self.log.len().saturating_sub(1) as u64;
-            let new_ci = lc.min(last_idx);
-            if !self.log.is_empty() && self.commit_index.is_none_or(|c| new_ci > c) {
-                self.commit_index = Some(new_ci);
-                self.apply_committed_entries();
-            }
-        }
-
-        // Report only the index this RPC actually verified — `prev_log_index`
-        // plus the entries we just placed. The follower's local log may extend
-        // beyond that with an unverified stale suffix from a prior leader; if
-        // we reported `self.log.len() - 1` here, an empty heartbeat that
-        // matched only at `prev_log_index` would let the leader treat that
-        // stale suffix as replicated, inflating `match_index`/`next_index` and
-        // letting `try_advance_commit` rely on a quorum that hasn't actually
-        // matched. The standard suffix is left in place — a future non-empty
-        // AppendEntries that conflicts will truncate it via the loop above.
+        // The last index this RPC actually verified — `prev_log_index` plus
+        // the entries we just placed. The follower's local log may extend
+        // beyond that with a stale suffix from a prior leader (e.g., when the
+        // current RPC is an empty heartbeat that only verifies up to
+        // `prev_log_index`). We proactively truncate that suffix below;
+        // capping commit_index at this verified index defends against
+        // committing entries the cluster never agreed on.
         let match_idx = match (prev_log_index, new_entries_len) {
             (Some(p), n) => Some(p + n as u64),
             (None, 0) => None,
             (None, n) => Some(n as u64 - 1),
         };
+
+        // Truncate any unverified suffix past the last verified index. This
+        // simplifies recovery (the in-memory log no longer carries entries a
+        // future leader hasn't endorsed) and means `match_idx` and
+        // `self.log.len() - 1` agree after this point. When `match_idx ==
+        // None` (no `prev_log_index` and no entries) we leave the log as-is —
+        // nothing was verified, so we have no basis to truncate.
+        if let Some(last) = match_idx {
+            let cutoff = (last + 1) as usize;
+            if self.log.len() > cutoff {
+                self.log.truncate(cutoff);
+                let cutoff_u64 = cutoff as u64;
+                self.pending_truncate_from = Some(match self.pending_truncate_from {
+                    Some(prev) => prev.min(cutoff_u64),
+                    None => cutoff_u64,
+                });
+            }
+        }
+
+        // Update commit_index from leader_commit, capped at the last verified
+        // index. Skip entirely when nothing was verified (None case).
+        if let (Some(lc), Some(last)) = (leader_commit, match_idx) {
+            let new_ci = lc.min(last);
+            if self.commit_index.is_none_or(|c| new_ci > c) {
+                self.commit_index = Some(new_ci);
+                self.pending_persist_commit_index = true;
+                self.apply_committed_entries();
+            }
+        }
+
+        // Report only the verified prefix as match_index.
         let response = Outgoing {
             target: SendTarget::Peer(leader.clone()),
             message: RaftMessage::AppendEntriesResponse {
@@ -575,9 +699,11 @@ where
         };
         let mut all = vec![response];
         for value in std::mem::take(&mut self.pending_proposals) {
+            // hops resets to 0 — these proposals were buffered locally and
+            // are now being forwarded fresh, not relayed.
             all.push(Outgoing {
                 target: SendTarget::Peer(leader.clone()),
-                message: RaftMessage::Forward { value },
+                message: RaftMessage::Forward { value, hops: 0 },
             });
         }
         all
@@ -624,6 +750,21 @@ where
         }
         if success {
             if let Some(mi) = match_index {
+                // Clamp at our own log length. A leader never overwrites or
+                // truncates its own log (Figure 2), so any honest peer's
+                // match_index for our current term must be < self.log.len().
+                // A buggy or malicious peer reporting a larger value would
+                // crash `try_advance_commit` on indexing without this guard.
+                let log_len = self.log.len() as u64;
+                if log_len == 0 || mi >= log_len {
+                    tracing::warn!(
+                        peer = %from,
+                        reported = mi,
+                        log_len,
+                        "AppendEntriesResponse reports match_index past leader's log; ignoring"
+                    );
+                    return Vec::new();
+                }
                 self.match_index.insert(from.clone(), Some(mi));
                 self.next_index.insert(from, mi + 1);
                 self.try_advance_commit();
@@ -687,9 +828,22 @@ where
         }
         let candidate = indexes[q - 1];
         if let Some(c) = candidate {
-            let entry_term = self.log[c as usize].term;
+            // Defensive: a buggy peer could report a match_index past the
+            // leader's own log. The response handler clamps, but guard here
+            // too — `try_advance_commit` is also reachable from `propose`
+            // and `become_leader` for the leader's own match_index.
+            let Some(entry) = self.log.get(c as usize) else {
+                tracing::warn!(
+                    candidate = c,
+                    log_len = self.log.len(),
+                    "try_advance_commit: candidate index past end of log; ignoring"
+                );
+                return;
+            };
+            let entry_term = entry.term;
             if entry_term == self.current_term && self.commit_index.is_none_or(|cur| c > cur) {
                 self.commit_index = Some(c);
+                self.pending_persist_commit_index = true;
                 self.apply_committed_entries();
             }
         }
@@ -750,7 +904,7 @@ where
         if let Some(leader) = self.leader.clone() {
             return vec![Outgoing {
                 target: SendTarget::Peer(leader),
-                message: RaftMessage::Forward { value },
+                message: RaftMessage::Forward { value, hops: 0 },
             }];
         }
         self.pending_proposals.push(value);
@@ -811,22 +965,39 @@ where
                 conflict_term,
                 conflict_index,
             ),
-            RaftMessage::Forward { value } => {
+            RaftMessage::Forward { value, hops } => {
                 if matches!(self.role, Role::Leader) {
-                    // Treat as a fresh proposal.
+                    // Chain ends here — treat as a fresh proposal.
                     <RaftProtocol<V> as ConsensusProtocol<V>>::propose(self, value)
                 } else if self.leader.as_ref().is_some_and(|l| *l != from) {
-                    // Chain-forward to whoever we currently believe is the leader.
-                    // The sender's view was stale; ours may still be wrong, but as
-                    // long as some node in the chain has accurate state the value
-                    // reaches a real leader. Refusing to forward back to `from`
-                    // prevents two-node ping-pong loops when both peers disagree
-                    // about who is leader.
-                    <RaftProtocol<V> as ConsensusProtocol<V>>::propose(self, value)
+                    // Chain-forward to whoever we currently believe is the
+                    // leader. The `from != leader` check breaks 2-node
+                    // ping-pong loops; the hops TTL bounds 3+ node loops.
+                    let next_hops = hops.saturating_add(1);
+                    if next_hops >= MAX_FORWARD_HOPS {
+                        tracing::warn!(
+                            hops,
+                            self_id = %self.node_id,
+                            sender = %from,
+                            "dropping Forward — exceeded MAX_FORWARD_HOPS"
+                        );
+                        return Vec::new();
+                    }
+                    let leader = self.leader.clone().unwrap();
+                    vec![Outgoing {
+                        target: SendTarget::Peer(leader),
+                        message: RaftMessage::Forward {
+                            value,
+                            hops: next_hops,
+                        },
+                    }]
                 } else {
-                    // No usable leader to forward to (unknown, or it's the sender).
-                    // Buffer so the value drains to whichever leader we next learn
-                    // about (via `handle_append_entries` or `become_leader`).
+                    // No usable leader to forward to (unknown, or it's the
+                    // sender). Buffer so the value drains to whichever leader
+                    // we next learn about (via `handle_append_entries` or
+                    // `become_leader`). The hops counter is dropped — the
+                    // buffered value is logically a fresh proposal from this
+                    // node's perspective and will be re-forwarded with hops=0.
                     self.pending_proposals.push(value);
                     Vec::new()
                 }
@@ -862,7 +1033,7 @@ where
     }
 
     fn take_lost_proposals(&mut self) -> Vec<V> {
-        Vec::new()
+        std::mem::take(&mut self.lost_proposals)
     }
 
     // A Leader is never idle — it sends periodic heartbeats. Only Followers and
@@ -870,6 +1041,7 @@ where
     fn is_idle(&self) -> bool {
         self.log.is_empty()
             && self.pending_proposals.is_empty()
+            && self.lost_proposals.is_empty()
             && matches!(self.role, Role::Follower | Role::Candidate)
     }
 }
@@ -1374,9 +1546,10 @@ mod tests {
             Some(2),
             "match_index should reflect only the verified prefix, not the stale suffix"
         );
-        // Suffix is intentionally retained — a future non-empty AE will truncate it
-        // via the conflict path. Don't assert truncation here.
-        assert_eq!(p.log.len(), 6);
+        // M1: stale suffix is proactively truncated on successful AppendEntries
+        // to keep the log == verified prefix. Prior behavior was to retain the
+        // suffix and rely on a future conflict to truncate it.
+        assert_eq!(p.log.len(), 3);
     }
 
     #[test]
@@ -1733,6 +1906,502 @@ mod tests {
     }
 
     #[test]
+    fn empty_heartbeat_does_not_commit_unverified_stale_suffix() {
+        // Regression: a heartbeat with `leader_commit > prev_log_index` must
+        // not advance commit_index over a stale suffix the new leader hasn't
+        // verified. Prior code capped at `self.log.len() - 1`, allowing the
+        // follower to commit entries from a deposed leader's term.
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = raft::<String>(NodeId::new("f", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        // Stale suffix from a deposed leader: indices 0..=4 with terms 1,1,1,2,2.
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "c".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "d".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "e".into(),
+            },
+        ];
+        // New leader L2 in term 5 sends a heartbeat verifying only up to index 2,
+        // but reports leader_commit=3 (a value committed via a different quorum).
+        let _ = p.handle_message(
+            NodeId::new("L2", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("L2", 1),
+                prev_log_index: Some(2),
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: Some(3),
+            },
+        );
+        // commit_index must be capped at the verified index (2), NOT at
+        // leader_commit (3) — index 3 in our log is the stale `T2:d`, which
+        // L2 did not commit.
+        assert_eq!(p.commit_index, Some(2));
+    }
+
+    #[test]
+    fn empty_heartbeat_with_no_prev_does_not_commit() {
+        // When prev_log_index is None and entries is empty, nothing is
+        // verified — commit_index must not advance even if the local log is
+        // non-empty (stale suffix case at the very start of the log).
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = raft::<String>(NodeId::new("f", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![LogEntry {
+            term: 2,
+            value: "stale".into(),
+        }];
+        let _ = p.handle_message(
+            NodeId::new("L2", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("L2", 1),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: Some(0),
+            },
+        );
+        assert_eq!(p.commit_index, None);
+    }
+
+    #[test]
+    fn successful_heartbeat_truncates_unverified_stale_suffix() {
+        // M1: a successful AppendEntries (including an empty heartbeat) should
+        // truncate any stale suffix beyond the verified prefix, so the log
+        // matches the leader's view exactly.
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = raft::<String>(NodeId::new("f", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        // 5 entries; only the first 3 are confirmable by the new leader.
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "c".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-d".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-e".into(),
+            },
+        ];
+        let _ = p.handle_message(
+            NodeId::new("L2", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("L2", 1),
+                prev_log_index: Some(2),
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        assert_eq!(p.log.len(), 3, "stale suffix should be truncated");
+        assert_eq!(p.pending_truncate_from, Some(3));
+    }
+
+    #[test]
+    fn successful_appendentries_truncates_suffix_past_new_entries() {
+        // M1: when AE includes new entries that overlap an existing suffix,
+        // any extra suffix beyond the new entries is also truncated.
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = raft::<String>(NodeId::new("f", 1), 3, RaftConfig::default());
+        p.current_term = 5;
+        p.log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "c".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-d".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-e".into(),
+            },
+            LogEntry {
+                term: 2,
+                value: "stale-f".into(),
+            },
+        ];
+        let _ = p.handle_message(
+            NodeId::new("L2", 1),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: NodeId::new("L2", 1),
+                prev_log_index: Some(2),
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 5,
+                    value: "new-d".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        // Verified through index 3 (prev=2 + 1 new entry); indices 4, 5 truncated.
+        assert_eq!(p.log.len(), 4);
+        assert_eq!(p.log[3].term, 5);
+        assert_eq!(p.log[3].value, "new-d");
+    }
+
+    #[test]
+    fn leader_ignores_match_index_past_own_log() {
+        // M2: a peer reporting match_index >= self.log.len() must not crash
+        // try_advance_commit. The leader simply ignores the response.
+        use crate::message::RaftMessage;
+        let me = NodeId::new("a", 1);
+        let b = NodeId::new("b", 1);
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 1;
+        p.leader = Some(me.clone());
+        // No log entries, but peer claims match_index = u64::MAX.
+        let out = p.handle_message(
+            b,
+            RaftMessage::AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: Some(u64::MAX),
+                conflict_term: None,
+                conflict_index: None,
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(p.commit_index, None);
+        assert!(p.match_index.values().all(|v| *v != Some(u64::MAX)));
+    }
+
+    #[test]
+    fn leader_rejects_same_term_appendentries_from_other_leader() {
+        // M4: an AppendEntries arriving in the same term while we are also
+        // Leader is an Election Safety violation. Reject without truncating.
+        use crate::message::{LogEntry, RaftMessage};
+        let me = NodeId::new("a", 1);
+        let other = NodeId::new("rogue", 1);
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 5;
+        p.leader = Some(me.clone());
+        p.log = vec![LogEntry {
+            term: 5,
+            value: "ours".into(),
+        }];
+        let out = p.handle_message(
+            other.clone(),
+            RaftMessage::AppendEntries {
+                term: 5,
+                leader: other.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 5,
+                    value: "theirs".into(),
+                }],
+                leader_commit: None,
+            },
+        );
+        // Still leader, log untouched.
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.log.len(), 1);
+        assert_eq!(p.log[0].value, "ours");
+        // Response is a rejection.
+        match &out[0].message {
+            RaftMessage::AppendEntriesResponse {
+                success: false,
+                term: 5,
+                ..
+            } => {}
+            other => panic!("expected rejection, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn re_election_drains_pending_proposals_to_lost() {
+        // L3: when a candidate's election times out without quorum, buffered
+        // proposals are surfaced to lost_proposals so the Node can re-route.
+        let mut p = raft::<String>(NodeId::new("a", 1), 5, RaftConfig::default());
+        let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "x".into());
+        let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "y".into());
+        assert_eq!(p.pending_proposals.len(), 2);
+        // First election: Follower → Candidate. Pending proposals retained.
+        p.election_deadline = Instant::now() - Duration::from_millis(1);
+        let _ = p.on_tick(Instant::now());
+        assert!(matches!(p.role, Role::Candidate));
+        assert_eq!(p.pending_proposals.len(), 2);
+        // Second election (still no quorum): Candidate → Candidate.
+        // Pending proposals drained to lost_proposals.
+        p.election_deadline = Instant::now() - Duration::from_millis(1);
+        let _ = p.on_tick(Instant::now());
+        assert!(matches!(p.role, Role::Candidate));
+        assert!(p.pending_proposals.is_empty());
+        let lost = <RaftProtocol<String> as ConsensusProtocol<String>>::take_lost_proposals(&mut p);
+        assert_eq!(lost, vec!["x".to_string(), "y".to_string()]);
+        // Subsequent take returns empty.
+        assert!(
+            <RaftProtocol<String> as ConsensusProtocol<String>>::take_lost_proposals(&mut p)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn forward_chain_drops_after_max_hops() {
+        // L4: a Forward arriving with hops near the cap is dropped instead of
+        // re-forwarded indefinitely.
+        use crate::message::{RaftMessage, MAX_FORWARD_HOPS};
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("c", 1);
+        // Establish that we know c is the leader.
+        let _ = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        // A Forward that would chain to MAX_FORWARD_HOPS or higher must be dropped.
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::Forward {
+                value: "ttl".into(),
+                hops: MAX_FORWARD_HOPS - 1,
+            },
+        );
+        assert!(out.is_empty(), "Forward at TTL should be dropped");
+        assert!(p.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn forward_chain_increments_hops_below_max() {
+        // L4: a Forward below the hop cap is re-forwarded with hops + 1.
+        use crate::message::RaftMessage;
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        let leader = NodeId::new("c", 1);
+        let _ = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: None,
+            },
+        );
+        let out = p.handle_message(
+            NodeId::new("b", 1),
+            RaftMessage::Forward {
+                value: "relay".into(),
+                hops: 1,
+            },
+        );
+        let forwarded = out.iter().find_map(|o| match (&o.target, &o.message) {
+            (SendTarget::Peer(t), RaftMessage::Forward { value, hops }) if t == &leader => {
+                Some((value.clone(), *hops))
+            }
+            _ => None,
+        });
+        assert_eq!(forwarded, Some(("relay".into(), 2)));
+    }
+
+    #[test]
+    fn forward_serde_roundtrip_with_hops() {
+        // L4: serialized Forward includes hops; older payloads without hops
+        // deserialize to hops=0 thanks to #[serde(default)].
+        use crate::message::{RaftMessage, WireVariant};
+        let msg: WireVariant<String> = WireVariant::Raft(RaftMessage::Forward {
+            value: "v".into(),
+            hops: 2,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"hops\":2"));
+        let decoded: WireVariant<String> = serde_json::from_str(&json).unwrap();
+        match decoded {
+            WireVariant::Raft(RaftMessage::Forward { value, hops }) => {
+                assert_eq!(value, "v");
+                assert_eq!(hops, 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // Legacy payload without hops field.
+        let legacy = "{\"Raft\":{\"Forward\":{\"value\":\"old\"}}}";
+        let decoded: WireVariant<String> = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            WireVariant::Raft(RaftMessage::Forward { value, hops }) => {
+                assert_eq!(value, "old");
+                assert_eq!(hops, 0);
+            }
+            _ => panic!("legacy decode failed"),
+        }
+    }
+
+    #[test]
+    fn commit_index_persists_when_advanced() {
+        // M3: every commit_index advance flags pending_persist_commit_index;
+        // drain_persist_intent surfaces it for flush_persist to write through.
+        use crate::message::{LogEntry, RaftMessage};
+        let mut p = raft::<String>(NodeId::new("f", 1), 3, RaftConfig::default());
+        p.current_term = 1;
+        let leader = NodeId::new("L", 1);
+        let _ = p.handle_message(
+            leader.clone(),
+            RaftMessage::AppendEntries {
+                term: 1,
+                leader: leader.clone(),
+                prev_log_index: None,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    value: "v0".into(),
+                }],
+                leader_commit: Some(0),
+            },
+        );
+        assert_eq!(p.commit_index, Some(0));
+        let intent = p.drain_persist_intent();
+        assert_eq!(intent.commit_index, Some(Some(0)));
+        // Idempotent — a second drain returns no commit_index intent.
+        let intent2 = p.drain_persist_intent();
+        assert_eq!(intent2.commit_index, None);
+    }
+
+    #[test]
+    fn restore_state_uses_max_of_persisted_and_decisions() {
+        // M3: recovery reconciles persisted commit_index with the highest
+        // decided slot, taking the max so a crash mid-write doesn't roll
+        // commit_index back below an already-delivered decision.
+        use crate::message::LogEntry;
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        let log = (0..5)
+            .map(|i| LogEntry {
+                term: 1,
+                value: format!("v{i}"),
+            })
+            .collect();
+        p.restore_state(
+            1,
+            None,
+            log,
+            // Decisions cover slots 0..=2.
+            vec![(0, "v0".into()), (1, "v1".into()), (2, "v2".into())],
+            // But commit_index was persisted as 4 — so two extra slots were
+            // committed by the cluster but not yet saved to decisions.
+            Some(4),
+        );
+        assert_eq!(p.commit_index, Some(4));
+        // last_applied is the decisions floor; on the next event-loop tick,
+        // apply_committed_entries will deliver slots 3 and 4 (at-least-once).
+        assert_eq!(p.last_applied, Some(2));
+    }
+
+    #[test]
+    fn restore_state_caps_persisted_commit_index_at_log_end() {
+        // M3 defense: a corrupted backing store reporting commit_index past
+        // the end of the log must not panic apply_committed_entries.
+        use crate::message::LogEntry;
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.restore_state(
+            1,
+            None,
+            vec![LogEntry {
+                term: 1,
+                value: "only".into(),
+            }],
+            vec![],
+            Some(99),
+        );
+        assert_eq!(p.commit_index, Some(0));
+    }
+
+    #[test]
+    fn single_node_resume_seeds_match_index_for_self() {
+        // L5: a single-node cluster resuming as leader after restart must
+        // seed match_index[self] so try_advance_commit operates correctly.
+        use crate::message::LogEntry;
+        let me = NodeId::new("solo", 1);
+        let mut p = raft::<String>(me.clone(), 1, RaftConfig::default());
+        let log = vec![
+            LogEntry {
+                term: 1,
+                value: "a".into(),
+            },
+            LogEntry {
+                term: 1,
+                value: "b".into(),
+            },
+        ];
+        p.restore_state(1, Some(me.clone()), log, vec![(0, "a".into())], None);
+        assert!(matches!(p.role, Role::Leader));
+        assert_eq!(p.match_index.get(&me).copied(), Some(Some(1)));
+    }
+
+    #[test]
+    fn become_follower_clears_pending_persist_log_from() {
+        // L2: a leader that stepped down (e.g., via term-bump) must not carry
+        // its leader-side persistence intent into follower state. The
+        // entries themselves stay in self.log; if a new leader's AE
+        // conflicts they get truncated, otherwise re-flagged when verified.
+        use crate::message::LogEntry;
+        let me = NodeId::new("a", 1);
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
+        p.role = Role::Leader;
+        p.current_term = 3;
+        p.leader = Some(me.clone());
+        p.log.push(LogEntry {
+            term: 3,
+            value: "x".into(),
+        });
+        p.pending_persist_log_from = Some(0);
+        // Step down via a higher-term message.
+        p.become_follower(5, None);
+        assert!(matches!(p.role, Role::Follower));
+        assert!(
+            p.pending_persist_log_from.is_none(),
+            "leader-side persistence intent should be cleared on step-down"
+        );
+    }
+
+    #[test]
     fn follower_reports_conflict_index_on_log_gap() {
         use crate::message::RaftMessage;
         let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
@@ -1956,6 +2625,7 @@ mod tests {
                 },
             ],
             vec![(0, "x".into())],
+            None,
         );
         assert_eq!(p.current_term, 7);
         assert_eq!(p.voted_for, Some(NodeId::new("b", 1)));
@@ -1983,6 +2653,7 @@ mod tests {
                 value: "x".into(),
             }],
             vec![],
+            None,
         );
         assert_eq!(p.current_term, 2);
         assert!(p.voted_for.is_none());
@@ -2014,9 +2685,10 @@ mod tests {
             <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
         assert_eq!(out.len(), 1);
         match (&out[0].target, &out[0].message) {
-            (SendTarget::Peer(t), RaftMessage::Forward { value }) => {
+            (SendTarget::Peer(t), RaftMessage::Forward { value, hops }) => {
                 assert_eq!(t, &leader);
                 assert_eq!(value, "hello");
+                assert_eq!(*hops, 0);
             }
             (_, msg) => panic!("expected Forward to leader, got message {:?}", msg),
         }
@@ -2046,6 +2718,7 @@ mod tests {
             NodeId::new("b", 1),
             RaftMessage::Forward {
                 value: "from-b".into(),
+                hops: 0,
             },
         );
         assert_eq!(p.log.len(), 1);
@@ -2073,9 +2746,9 @@ mod tests {
         );
         assert!(p.pending_proposals.is_empty());
         // Out should contain the AER + a Forward
-        let has_forward = out
-            .iter()
-            .any(|o| matches!(&o.message, RaftMessage::Forward { value } if value == "buffered"));
+        let has_forward = out.iter().any(|o| {
+            matches!(&o.message, RaftMessage::Forward { value, hops: 0 } if value == "buffered")
+        });
         assert!(has_forward, "expected buffered proposal to be forwarded");
     }
 
@@ -2086,7 +2759,10 @@ mod tests {
         // p.role is Follower, p.leader is None
         let out = p.handle_message(
             NodeId::new("b", 1),
-            RaftMessage::Forward { value: "x".into() },
+            RaftMessage::Forward {
+                value: "x".into(),
+                hops: 0,
+            },
         );
         assert!(out.is_empty());
         assert!(p.log.is_empty());
@@ -2115,12 +2791,13 @@ mod tests {
             NodeId::new("b", 1),
             RaftMessage::Forward {
                 value: "relay".into(),
+                hops: 0,
             },
         );
         assert!(p.pending_proposals.is_empty());
         let forward_to_leader = out.iter().any(|o| {
             matches!(&o.target, SendTarget::Peer(t) if t == &leader)
-                && matches!(&o.message, RaftMessage::Forward { value } if value == "relay")
+                && matches!(&o.message, RaftMessage::Forward { value, hops: 1 } if value == "relay")
         });
         assert!(forward_to_leader, "expected chain-forward to known leader");
     }
@@ -2148,6 +2825,7 @@ mod tests {
             b.clone(),
             RaftMessage::Forward {
                 value: "loop-guard".into(),
+                hops: 0,
             },
         );
         assert!(out.is_empty());
@@ -2352,6 +3030,7 @@ mod tests {
             None,
             log,
             vec![(0, "v0".into()), (1, "v1".into()), (2, "v2".into())],
+            None,
         );
         assert_eq!(p.commit_index, Some(2));
         assert_eq!(p.last_applied, Some(2));
@@ -2483,7 +3162,7 @@ mod tests {
     fn single_node_recover_from_empty_storage_starts_as_follower() {
         let me = NodeId::new("solo", 1);
         let mut p = raft::<String>(me.clone(), 1, RaftConfig::default());
-        p.restore_state(0, None, Vec::new(), Vec::new());
+        p.restore_state(0, None, Vec::new(), Vec::new(), None);
         assert!(matches!(p.role, Role::Follower));
         assert_eq!(p.current_term, 0);
         assert!(p.voted_for.is_none());
@@ -2502,7 +3181,7 @@ mod tests {
             term: 1,
             value: "x".into(),
         }];
-        p.restore_state(1, Some(me.clone()), log, vec![(0, "x".into())]);
+        p.restore_state(1, Some(me.clone()), log, vec![(0, "x".into())], None);
         assert!(matches!(p.role, Role::Leader));
         assert_eq!(p.current_term, 1);
         assert_eq!(p.commit_index, Some(0));
@@ -2519,7 +3198,7 @@ mod tests {
         let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.leader = Some(me.clone());
-        p.restore_state(5, Some(me.clone()), Vec::new(), Vec::new());
+        p.restore_state(5, Some(me.clone()), Vec::new(), Vec::new(), None);
         assert!(matches!(p.role, Role::Follower));
         assert_eq!(p.leader, None);
         assert_eq!(p.current_term, 5);
@@ -2554,12 +3233,13 @@ mod tests {
             NodeId::new("c", 1),
             RaftMessage::Forward {
                 value: "delayed".into(),
+                hops: 0,
             },
         );
         assert!(p.log.is_empty());
         let forward_to_b = out.iter().any(|o| {
             matches!(&o.target, SendTarget::Peer(t) if t == &new_leader)
-                && matches!(&o.message, RaftMessage::Forward { value } if value == "delayed")
+                && matches!(&o.message, RaftMessage::Forward { value, hops: 1 } if value == "delayed")
         });
         assert!(forward_to_b, "expected chain-forward to new leader");
     }
