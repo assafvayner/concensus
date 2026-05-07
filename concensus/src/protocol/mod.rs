@@ -10,6 +10,7 @@ use std::time::Instant;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::NodeId;
+use crate::error::StorageError;
 use crate::message::{PaxosMessage, RaftMessage, WireVariant};
 
 pub(crate) use paxos::PaxosProtocol;
@@ -121,10 +122,30 @@ where
         }
     }
 
-    pub(crate) fn take_decisions(&mut self) -> Vec<Decision<V>> {
+    /// Load persisted state through the variant's owned storage and seed
+    /// in-memory state. Called once at the top of `Node::run`.
+    pub(crate) async fn recover(&mut self) -> Result<(), StorageError> {
         match self {
-            Self::Paxos(p) => <PaxosProtocol<V> as ConsensusProtocol<V>>::take_decisions(p),
-            Self::Raft(r) => <RaftProtocol<V> as ConsensusProtocol<V>>::take_decisions(r),
+            Self::Paxos(p) => p.recover().await,
+            Self::Raft(r) => r.recover().await,
+        }
+    }
+
+    /// Persist any pending state (Raft term/voted_for/log) through owned
+    /// storage. No-op for Paxos.
+    pub(crate) async fn flush_persist(&mut self) -> Result<(), StorageError> {
+        match self {
+            Self::Paxos(p) => p.flush_persist().await,
+            Self::Raft(r) => r.flush_persist().await,
+        }
+    }
+
+    /// Drain the in-memory pending decisions, persisting each through owned
+    /// storage before returning the list to the caller.
+    pub(crate) async fn drain_decisions(&mut self) -> Result<Vec<Decision<V>>, StorageError> {
+        match self {
+            Self::Paxos(p) => p.drain_decisions().await,
+            Self::Raft(r) => r.drain_decisions().await,
         }
     }
 

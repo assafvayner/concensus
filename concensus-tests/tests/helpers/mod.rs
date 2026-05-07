@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use concensus::{
     channel, unbounded_channel, ChannelReceiver, ChannelSender, Decided, DecisionReceiver,
-    LogEntry, Node, NodeHandle, NodeId, PaxosMemoryStorage, PaxosStorage, PeerInfo,
+    LogEntry, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, PaxosStorage, PeerInfo,
     RaftMemoryStorage, RaftStorage, StorageError,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -217,7 +217,13 @@ fn create_cluster_inner(n: usize, unbounded: bool, dead_count: usize) -> Vec<Clu
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = if is_dead {
             tokio::spawn(async move {
@@ -274,7 +280,13 @@ where
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<V>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 
@@ -363,7 +375,7 @@ fn create_raft_lossy_cluster_inner(
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             config.clone(),
             peers,
@@ -412,7 +424,7 @@ pub fn create_raft_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<Cl
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             cfg.clone(),
             peers,
@@ -461,7 +473,7 @@ pub fn create_raft_reordering_cluster(
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             cfg.clone(),
             peers,
@@ -516,7 +528,7 @@ pub fn create_raft_lossy_delayed_cluster(
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             cfg.clone(),
             peers,
@@ -575,7 +587,7 @@ pub fn create_raft_cluster_with_edge_filters(n: usize) -> (Vec<ClusterNode>, Edg
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             cfg.clone(),
             peers,
@@ -619,7 +631,7 @@ fn create_raft_cluster_inner(n: usize, config: concensus::RaftConfig) -> Vec<Clu
             })
             .collect();
         let recv = rx_for.remove(me).unwrap();
-        let (node, handle, decisions) = Node::with_raft_config_and_id(
+        let (node, handle, decisions) = Node::raft_with_id(
             me.clone(),
             config.clone(),
             peers,
@@ -669,7 +681,13 @@ pub fn create_lossy_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNode> {
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 
@@ -716,7 +734,13 @@ pub fn create_lossy_unbounded_cluster(n: usize, drop_rate: f64) -> Vec<ClusterNo
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 
@@ -770,7 +794,13 @@ pub fn create_delayed_cluster(n: usize, min_ms: u64, max_ms: u64) -> Vec<Cluster
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 
@@ -821,7 +851,13 @@ pub fn create_reordering_cluster(n: usize, window_ms: u64, batch_size: usize) ->
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 
@@ -881,7 +917,13 @@ pub fn create_lossy_delayed_cluster(
         let receiver = receivers.remove(0);
         let storage = PaxosMemoryStorage::<String>::new();
 
-        let (node, handle, decisions) = Node::with_id(ids[i].clone(), peers, receiver, storage);
+        let (node, handle, decisions) = Node::paxos_with_id(
+            ids[i].clone(),
+            PaxosConfig::default(),
+            peers,
+            receiver,
+            storage,
+        );
 
         let run_handle = tokio::spawn(node.run());
 

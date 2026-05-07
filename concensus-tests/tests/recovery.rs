@@ -1,6 +1,8 @@
 mod helpers;
 
-use concensus::{channel, ChannelSender, Decided, Node, NodeId, PaxosMemoryStorage, PeerInfo};
+use concensus::{
+    channel, ChannelSender, Decided, Node, NodeId, PaxosConfig, PaxosMemoryStorage, PeerInfo,
+};
 use helpers::SharedMemoryStorage;
 use tokio::time::{timeout, Duration};
 
@@ -50,15 +52,23 @@ fn build_cluster(
         },
     ];
 
-    let (node0, handle0, dec0) = Node::with_id(ids[0].clone(), peers_for_0, rx0, storage0);
-    let (node1, handle1, dec1) = Node::with_id(
+    let (node0, handle0, dec0) = Node::paxos_with_id(
+        ids[0].clone(),
+        PaxosConfig::default(),
+        peers_for_0,
+        rx0,
+        storage0,
+    );
+    let (node1, handle1, dec1) = Node::paxos_with_id(
         ids[1].clone(),
+        PaxosConfig::default(),
         peers_for_1,
         rx1,
         PaxosMemoryStorage::<String>::new(),
     );
-    let (node2, handle2, dec2) = Node::with_id(
+    let (node2, handle2, dec2) = Node::paxos_with_id(
         ids[2].clone(),
+        PaxosConfig::default(),
         peers_for_2,
         rx2,
         PaxosMemoryStorage::<String>::new(),

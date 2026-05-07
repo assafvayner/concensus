@@ -37,7 +37,7 @@ pub trait MessageSender: Send + 'static {
 
 /// Receives serialized Paxos messages from any peer in the cluster.
 ///
-/// A single `MessageReceiver` is passed to [`Node::new`](crate::Node::new)
+/// A single `MessageReceiver` is passed to [`Node::paxos`](crate::Node::paxos)
 /// and polled in the event loop to process incoming protocol messages.
 ///
 /// Implementations must be `Send + 'static`.

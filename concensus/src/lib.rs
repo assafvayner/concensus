@@ -39,7 +39,7 @@
 //! | `channel-transport` | In-memory bounded/unbounded channel transport for testing |
 //! | `tcp-transport` | TCP transport with length-prefixed framing and reconnection |
 //! | `uds-transport` | Unix domain socket transport (same framing as TCP) |
-//! | `test-support` | Enables [`Node::with_id`] for deterministic node identity in tests |
+//! | `test-support` | Enables [`Node::paxos_with_id`] / [`Node::raft_with_id`] for deterministic node identity in tests |
 
 pub mod config;
 pub mod error;
@@ -52,7 +52,7 @@ pub mod transport;
 pub use config::{NodeId, PaxosConfig, PeerInfo, RaftConfig};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use message::raft::LogEntry;
-pub use node::{Decided, DecisionReceiver, Node, NodeHandle, NodeRole, NodeState};
+pub use node::{Decided, DecisionReceiver, Node, NodeAlgorithm, NodeHandle, NodeRole, NodeState};
 pub use storage::{PaxosMemoryStorage, PaxosStorage, RaftMemoryStorage, RaftStorage};
 pub use transport::{MessageReceiver, MessageSender};
 

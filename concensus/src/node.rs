@@ -13,21 +13,6 @@ use crate::protocol::{Outgoing, PaxosProtocol, ProtocolImpl, SendTarget};
 use crate::storage::{PaxosStorage, RaftStorage};
 use crate::transport::{MessageReceiver, MessageSender};
 
-/// Internal tagged storage. Exactly one variant is populated for the lifetime
-/// of a `Node`, matching the active consensus algorithm. Keeping the two paths
-/// disjoint at the type level lets each algorithm own its own persistence
-/// surface without a shared adapter.
-///
-/// Kept tag-only (no helper async fns) because dispatching through an
-/// intermediate `async fn` would force the captured `&Self` to be `Sync`,
-/// which would in turn require `Sync` on the storage trait objects. Inlining
-/// the match at each call site lets the trait method's own `+ Send` future
-/// satisfy `Send` without dragging in `Sync` on the trait.
-enum NodeStorage<V> {
-    Paxos(Box<dyn PaxosStorage<V> + Send>),
-    Raft(Box<dyn RaftStorage<V> + Send>),
-}
-
 /// Public mirror of the internal Raft role. Used by the test-support
 /// observability hook [`Node::peek_state`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +20,14 @@ pub enum NodeRole {
     Follower,
     Candidate,
     Leader,
+}
+
+/// Identifies which consensus algorithm a [`Node`] is running. Reported by
+/// [`Node::peek_state`] as part of [`NodeState`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeAlgorithm {
+    Paxos,
+    Raft,
 }
 
 /// Snapshot of a node's protocol state, for tests and observability.
@@ -45,7 +38,7 @@ pub enum NodeRole {
 #[derive(Clone, Debug)]
 pub struct NodeState {
     pub node_id: NodeId,
-    pub algorithm: crate::config::ConsensusAlgorithm,
+    pub algorithm: NodeAlgorithm,
     pub role: Option<NodeRole>,
     pub term: u64,
     pub leader: Option<NodeId>,
@@ -58,7 +51,7 @@ pub struct NodeState {
 /// Channel receiver for consensus decisions.
 ///
 /// Yields [`Decided`] values in the order they are finalized by the Paxos protocol.
-/// Obtain one from [`Node::new`] or [`Node::with_id`].
+/// Obtain one from [`Node::paxos`] / [`Node::raft`].
 pub type DecisionReceiver<V> = mpsc::Receiver<Decided<V>>;
 
 /// A value that has reached consensus, paired with its slot number.
@@ -90,7 +83,8 @@ const DECISION_CHANNEL_CAPACITY: usize = 1024;
 ///
 /// # Lifecycle
 ///
-/// 1. **Construct** via [`Node::new`] (production) or [`Node::with_id`] (testing).
+/// 1. **Construct** via [`Node::paxos`] / [`Node::raft`] (production) or
+///    [`Node::paxos_with_id`] / [`Node::raft_with_id`] (testing).
 ///    This returns `(Node, NodeHandle, DecisionReceiver)`.
 /// 2. **Spawn** the node's event loop with [`Node::run`] on a tokio task.
 /// 3. **Propose** values through the [`NodeHandle`].
@@ -106,7 +100,7 @@ const DECISION_CHANNEL_CAPACITY: usize = 1024;
 /// #     peers: Vec<PeerInfo<S>>, receiver: R,
 /// # ) -> Result<(), Box<dyn std::error::Error>> {
 /// let storage = PaxosMemoryStorage::<String>::new();
-/// let (node, handle, mut decisions) = Node::new("my-node", peers, receiver, storage);
+/// let (node, handle, mut decisions) = Node::paxos("my-node", PaxosConfig::default(), peers, receiver, storage);
 ///
 /// // Run the event loop
 /// tokio::spawn(async move {
@@ -136,7 +130,6 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
-    storage: NodeStorage<V>,
     protocol: ProtocolImpl<V>,
     proposal_rx: mpsc::Receiver<V>,
     decision_tx: mpsc::Sender<Decided<V>>,
@@ -144,7 +137,7 @@ pub struct Node<V, S: MessageSender, R: MessageReceiver> {
 
 /// A cloneable handle for submitting proposals to a running [`Node`].
 ///
-/// Obtain a `NodeHandle` from [`Node::new`] or [`Node::with_id`]. Cloning is
+/// Obtain a `NodeHandle` from [`Node::paxos`] / [`Node::raft`]. Cloning is
 /// cheap (wraps a tokio mpsc sender) and allows multiple producers to submit
 /// proposals concurrently.
 ///
@@ -167,35 +160,18 @@ where
     S: MessageSender,
     R: MessageReceiver,
 {
-    /// Creates a new consensus node with an auto-generated [`NodeId`].
+    /// Creates a Multi-Paxos consensus node with an auto-generated [`NodeId`].
     ///
     /// The node ID is formed from the given `name` and the current UNIX timestamp
     /// as the incarnation number, ensuring uniqueness across restarts.
+    /// `config` is plumbed through to the underlying Paxos protocol; pass
+    /// [`PaxosConfig::default`](crate::PaxosConfig::default) for defaults.
     ///
     /// Returns `(node, handle, decision_rx)`:
     /// - `node` — call [`Node::run`] to start the event loop
     /// - `handle` — use [`NodeHandle::propose`] to submit values
     /// - `decision_rx` — receives [`Decided`] values as consensus is reached
-    pub fn new(
-        name: impl Into<Arc<str>>,
-        peers: Vec<PeerInfo<S>>,
-        receiver: R,
-        storage: impl PaxosStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
-        let incarnation = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        let node_id = NodeId::new(name, incarnation);
-        Self::with_id_inner(node_id, peers, receiver, storage)
-    }
-
-    /// Creates a new consensus node configured for Multi-Paxos with the supplied
-    /// [`PaxosConfig`].
-    ///
-    /// The config's `heartbeat_interval` is plumbed through to the underlying
-    /// Paxos protocol; defaults match [`PaxosConfig::default`].
-    pub fn with_paxos_config(
+    pub fn paxos(
         name: impl Into<Arc<str>>,
         config: crate::config::PaxosConfig,
         peers: Vec<PeerInfo<S>>,
@@ -207,11 +183,39 @@ where
             .expect("system clock before UNIX epoch")
             .as_secs();
         let node_id = NodeId::new(name, incarnation);
+        Self::paxos_with_id_inner(node_id, config, peers, receiver, storage)
+    }
+
+    /// Creates a Multi-Paxos consensus node with an explicit [`NodeId`].
+    ///
+    /// Useful in tests where peers need matching deterministic identities; in
+    /// production prefer [`Node::paxos`].
+    ///
+    /// Requires the `test-support` feature flag (always available in `#[cfg(test)]`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn paxos_with_id(
+        node_id: NodeId,
+        config: crate::config::PaxosConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl PaxosStorage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
+        Self::paxos_with_id_inner(node_id, config, peers, receiver, storage)
+    }
+
+    fn paxos_with_id_inner(
+        node_id: NodeId,
+        config: crate::config::PaxosConfig,
+        peers: Vec<PeerInfo<S>>,
+        receiver: R,
+        storage: impl PaxosStorage<V> + 'static,
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
         let protocol = ProtocolImpl::Paxos(PaxosProtocol::new_with_config(
             node_id.clone(),
             total_nodes,
             config,
+            Box::new(storage),
         ));
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
@@ -220,7 +224,6 @@ where
             node_id,
             peers,
             receiver: Some(receiver),
-            storage: NodeStorage::Paxos(Box::new(storage)),
             protocol,
             proposal_rx,
             decision_tx,
@@ -229,54 +232,13 @@ where
         (node, NodeHandle { proposal_tx }, decision_rx)
     }
 
-    /// Creates a new consensus node with an explicit [`NodeId`].
-    ///
-    /// This is useful in tests where you need deterministic, matching node
-    /// identities across peers. In production, prefer [`Node::new`] which
-    /// generates the incarnation automatically.
-    ///
-    /// Requires the `test-support` feature flag (always available in `#[cfg(test)]`).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_id(
-        node_id: NodeId,
-        peers: Vec<PeerInfo<S>>,
-        receiver: R,
-        storage: impl PaxosStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
-        Self::with_id_inner(node_id, peers, receiver, storage)
-    }
-
-    fn with_id_inner(
-        node_id: NodeId,
-        peers: Vec<PeerInfo<S>>,
-        receiver: R,
-        storage: impl PaxosStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
-        let total_nodes = peers.len() + 1;
-        let protocol = ProtocolImpl::Paxos(PaxosProtocol::new(node_id.clone(), total_nodes));
-        let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
-        let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
-
-        let node = Self {
-            node_id,
-            peers,
-            receiver: Some(receiver),
-            storage: NodeStorage::Paxos(Box::new(storage)),
-            protocol,
-            proposal_rx,
-            decision_tx,
-        };
-
-        (node, NodeHandle { proposal_tx }, decision_rx)
-    }
-
-    /// Creates a consensus node configured for Raft.
+    /// Creates a Raft consensus node with an auto-generated [`NodeId`].
     ///
     /// Requires storage that implements [`RaftStorage`](crate::RaftStorage) so
     /// the node can persist `currentTerm`, `votedFor`, and the replicated log.
     /// [`RaftMemoryStorage`](crate::RaftMemoryStorage) satisfies this in
     /// tests; production deployments should provide a durable backing store.
-    pub fn with_raft_config(
+    pub fn raft(
         name: impl Into<Arc<str>>,
         config: crate::config::RaftConfig,
         peers: Vec<PeerInfo<S>>,
@@ -291,14 +253,14 @@ where
             .expect("system clock before UNIX epoch")
             .as_secs();
         let node_id = NodeId::new(name, incarnation);
-        Self::with_raft_id_inner(node_id, config, peers, receiver, storage)
+        Self::raft_with_id_inner(node_id, config, peers, receiver, storage)
     }
 
-    /// Creates a consensus node configured for Raft with an explicit [`NodeId`].
+    /// Creates a Raft consensus node with an explicit [`NodeId`].
     ///
     /// Useful in tests for deterministic IDs.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn with_raft_config_and_id(
+    pub fn raft_with_id(
         node_id: NodeId,
         config: crate::config::RaftConfig,
         peers: Vec<PeerInfo<S>>,
@@ -308,10 +270,10 @@ where
     where
         V: Sync,
     {
-        Self::with_raft_id_inner(node_id, config, peers, receiver, storage)
+        Self::raft_with_id_inner(node_id, config, peers, receiver, storage)
     }
 
-    fn with_raft_id_inner(
+    fn raft_with_id_inner(
         node_id: NodeId,
         config: crate::config::RaftConfig,
         peers: Vec<PeerInfo<S>>,
@@ -326,6 +288,7 @@ where
             node_id.clone(),
             total_nodes,
             config,
+            Box::new(storage),
         ));
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
@@ -333,7 +296,6 @@ where
             node_id,
             peers,
             receiver: Some(receiver),
-            storage: NodeStorage::Raft(Box::new(storage)),
             protocol,
             proposal_rx,
             decision_tx,
@@ -351,10 +313,8 @@ where
     pub fn peek_state(&self) -> NodeState {
         let snap = self.protocol.peek_state();
         let algorithm = match &self.protocol {
-            crate::protocol::ProtocolImpl::Paxos(_) => {
-                crate::config::ConsensusAlgorithm::MultiPaxos
-            }
-            crate::protocol::ProtocolImpl::Raft(_) => crate::config::ConsensusAlgorithm::Raft,
+            crate::protocol::ProtocolImpl::Paxos(_) => NodeAlgorithm::Paxos,
+            crate::protocol::ProtocolImpl::Raft(_) => NodeAlgorithm::Raft,
         };
         NodeState {
             node_id: self.node_id.clone(),
@@ -391,26 +351,7 @@ where
     pub async fn run(mut self) -> Result<(), NodeError> {
         tracing::info!(node_id = %self.node_id, "node starting");
 
-        match (&mut self.protocol, &mut self.storage) {
-            (crate::protocol::ProtocolImpl::Paxos(p), NodeStorage::Paxos(s)) => {
-                let decisions = s.load_decisions().await.map_err(NodeError::Storage)?;
-                p.initialize_from_decisions(decisions);
-            }
-            (crate::protocol::ProtocolImpl::Paxos(p), NodeStorage::Raft(s)) => {
-                let decisions = s.load_decisions().await.map_err(NodeError::Storage)?;
-                p.initialize_from_decisions(decisions);
-            }
-            (crate::protocol::ProtocolImpl::Raft(raft), NodeStorage::Raft(rs)) => {
-                let decisions = rs.load_decisions().await.map_err(NodeError::Storage)?;
-                let term = rs.load_term().await.map_err(NodeError::Storage)?;
-                let voted_for = rs.load_voted_for().await.map_err(NodeError::Storage)?;
-                let log = rs.load_log().await.map_err(NodeError::Storage)?;
-                raft.recover(term, voted_for, log, decisions);
-            }
-            (crate::protocol::ProtocolImpl::Raft(_), NodeStorage::Paxos(_)) => {
-                debug_assert!(false, "Raft protocol paired with Paxos storage");
-            }
-        }
+        self.protocol.recover().await.map_err(NodeError::Storage)?;
 
         // Build senders list
         let mut senders: Vec<(NodeId, S)> = Vec::new();
@@ -488,7 +429,10 @@ where
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
         let outgoing = self.protocol.propose(value);
-        self.flush_raft_persist().await?;
+        self.protocol
+            .flush_persist()
+            .await
+            .map_err(NodeError::Storage)?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
         Ok(())
@@ -503,7 +447,10 @@ where
             Ok(msg) => {
                 let from = msg.sender;
                 let outgoing = self.protocol.handle_wire_message(from, msg.variant);
-                self.flush_raft_persist().await?;
+                self.protocol
+                    .flush_persist()
+                    .await
+                    .map_err(NodeError::Storage)?;
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                 self.process_decisions().await?;
 
@@ -511,7 +458,10 @@ where
                 let lost = self.protocol.take_lost_proposals();
                 for value in lost {
                     let outgoing = self.protocol.propose(value);
-                    self.flush_raft_persist().await?;
+                    self.protocol
+                        .flush_persist()
+                        .await
+                        .map_err(NodeError::Storage)?;
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
                     self.process_decisions().await?;
                 }
@@ -525,54 +475,12 @@ where
 
     async fn handle_retries(&mut self, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
         let outgoing = self.protocol.on_tick(Instant::now());
-        self.flush_raft_persist().await?;
+        self.protocol
+            .flush_persist()
+            .await
+            .map_err(NodeError::Storage)?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
         self.process_decisions().await?;
-        Ok(())
-    }
-
-    /// Drains any pending Raft persistence intent from the protocol and
-    /// writes it through `RaftStorage` before any outgoing wire message is
-    /// sent. No-op for Paxos nodes.
-    ///
-    /// Order matters: term -> voted_for -> truncate -> append. Truncating
-    /// before appending guarantees we never briefly persist entries that
-    /// conflict with what's about to be truncated.
-    async fn flush_raft_persist(&mut self) -> Result<(), NodeError> {
-        let proto = match &mut self.protocol {
-            crate::protocol::ProtocolImpl::Raft(p) => p,
-            _ => return Ok(()),
-        };
-        let raft_storage = match &mut self.storage {
-            NodeStorage::Raft(s) => s,
-            NodeStorage::Paxos(_) => return Ok(()),
-        };
-        let intent = proto.drain_persist_intent();
-        if let Some(term) = intent.term {
-            raft_storage
-                .save_term(term)
-                .await
-                .map_err(NodeError::Storage)?;
-        }
-        if let Some(vf) = intent.voted_for {
-            raft_storage
-                .save_voted_for(vf)
-                .await
-                .map_err(NodeError::Storage)?;
-        }
-        if let Some(idx) = intent.truncate_from {
-            raft_storage
-                .truncate_log_from(idx)
-                .await
-                .map_err(NodeError::Storage)?;
-        }
-        if let Some(idx) = intent.append_from {
-            let to_append = &intent.log_snapshot[idx as usize..];
-            raft_storage
-                .append_log(to_append)
-                .await
-                .map_err(NodeError::Storage)?;
-        }
         Ok(())
     }
 
@@ -609,19 +517,12 @@ where
     }
 
     async fn process_decisions(&mut self) -> Result<(), NodeError> {
-        let decisions = self.protocol.take_decisions();
+        let decisions = self
+            .protocol
+            .drain_decisions()
+            .await
+            .map_err(NodeError::Storage)?;
         for decision in &decisions {
-            match &mut self.storage {
-                NodeStorage::Paxos(s) => s
-                    .save_decision(decision.slot, decision.value.clone())
-                    .await
-                    .map_err(NodeError::Storage)?,
-                NodeStorage::Raft(s) => s
-                    .save_decision(decision.slot, decision.value.clone())
-                    .await
-                    .map_err(NodeError::Storage)?,
-            }
-
             tracing::info!(slot = decision.slot, "value decided");
 
             if self
@@ -692,9 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn node_new_returns_node_handle_and_receiver() {
-        let (_node, _handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::new(
+    fn node_paxos_returns_node_handle_and_receiver() {
+        use crate::config::PaxosConfig;
+        let (_node, _handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "test-node",
+            PaxosConfig::default(),
             vec![],
             DummyReceiver,
             PaxosMemoryStorage::new(),
@@ -702,9 +605,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_paxos_config_works() {
+    async fn paxos_constructor_works() {
         use crate::config::PaxosConfig;
-        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::with_paxos_config(
+        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "test",
             PaxosConfig::default(),
             vec![],
@@ -714,9 +617,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_raft_config_works() {
+    async fn raft_constructor_works() {
         use crate::config::RaftConfig;
-        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::with_raft_config(
+        let (_node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::raft(
             "test",
             RaftConfig::default(),
             vec![],
@@ -727,8 +630,10 @@ mod tests {
 
     #[tokio::test]
     async fn node_handle_is_cloneable() {
-        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::new(
+        use crate::config::PaxosConfig;
+        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "test-node",
+            PaxosConfig::default(),
             vec![],
             DummyReceiver,
             PaxosMemoryStorage::new(),
@@ -738,8 +643,10 @@ mod tests {
 
     #[tokio::test]
     async fn propose_returns_channel_full_when_full() {
-        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::new(
+        use crate::config::PaxosConfig;
+        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "test-node",
+            PaxosConfig::default(),
             vec![],
             DummyReceiver,
             PaxosMemoryStorage::new(),
@@ -755,8 +662,10 @@ mod tests {
 
     #[tokio::test]
     async fn single_node_consensus() {
-        let (node, handle, mut decision_rx) = Node::<String, DummySender, DummyReceiver>::new(
+        use crate::config::PaxosConfig;
+        let (node, handle, mut decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "solo",
+            PaxosConfig::default(),
             vec![],
             DummyReceiver,
             PaxosMemoryStorage::new(),
@@ -807,8 +716,9 @@ mod tests {
         let id_b = NodeId::new("b", 1000);
         let id_c = NodeId::new("c", 1000);
 
-        let (node_a, handle_a, mut rx_a) = Node::with_id(
+        let (node_a, handle_a, mut rx_a) = Node::paxos_with_id(
             id_a.clone(),
+            crate::config::PaxosConfig::default(),
             vec![
                 PeerInfo {
                     id: id_b.clone(),
@@ -822,8 +732,9 @@ mod tests {
             ChannelReceiver(a_rx),
             PaxosMemoryStorage::<String>::new(),
         );
-        let (node_b, _handle_b, mut rx_b) = Node::with_id(
+        let (node_b, _handle_b, mut rx_b) = Node::paxos_with_id(
             id_b.clone(),
+            crate::config::PaxosConfig::default(),
             vec![
                 PeerInfo {
                     id: id_a.clone(),
@@ -837,8 +748,9 @@ mod tests {
             ChannelReceiver(b_rx),
             PaxosMemoryStorage::<String>::new(),
         );
-        let (node_c, _handle_c, mut rx_c) = Node::with_id(
+        let (node_c, _handle_c, mut rx_c) = Node::paxos_with_id(
             id_c.clone(),
+            crate::config::PaxosConfig::default(),
             vec![
                 PeerInfo {
                     id: id_a.clone(),
@@ -926,8 +838,9 @@ mod tests {
         // and hit the cross-algorithm rejection arm.
         let id = NodeId::new("paxos-node", 1);
         let peer_id = NodeId::new("dummy-peer", 1);
-        let (node, handle, mut decisions) = Node::<String, DummySender, OneShot>::with_id(
+        let (node, handle, mut decisions) = Node::<String, DummySender, OneShot>::paxos_with_id(
             id,
+            crate::config::PaxosConfig::default(),
             vec![PeerInfo {
                 id: peer_id,
                 sender: DummySender,
@@ -957,7 +870,7 @@ mod tests {
     fn node_state_is_constructible() {
         let s = NodeState {
             node_id: NodeId::new("a", 1),
-            algorithm: crate::config::ConsensusAlgorithm::Raft,
+            algorithm: NodeAlgorithm::Raft,
             role: Some(NodeRole::Follower),
             term: 3,
             leader: None,
@@ -974,17 +887,16 @@ mod tests {
     async fn node_peek_state_returns_snapshot() {
         use crate::config::RaftConfig;
         let id = NodeId::new("solo", 1);
-        let (node, _handle, _rx) =
-            Node::<String, DummySender, DummyReceiver>::with_raft_config_and_id(
-                id.clone(),
-                RaftConfig::default(),
-                vec![],
-                DummyReceiver,
-                RaftMemoryStorage::new(),
-            );
+        let (node, _handle, _rx) = Node::<String, DummySender, DummyReceiver>::raft_with_id(
+            id.clone(),
+            RaftConfig::default(),
+            vec![],
+            DummyReceiver,
+            RaftMemoryStorage::new(),
+        );
         let s = node.peek_state();
         assert_eq!(s.node_id, id);
-        assert_eq!(s.algorithm, crate::config::ConsensusAlgorithm::Raft);
+        assert_eq!(s.algorithm, NodeAlgorithm::Raft);
         // Before `run()`, Raft is a follower at term 0 (paper-aligned bootstrap).
         assert_eq!(s.term, 0);
         assert!(matches!(s.role, Some(NodeRole::Follower)));

@@ -5,8 +5,10 @@ use rand::RngExt;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::{NodeId, RaftConfig};
+use crate::error::StorageError;
 use crate::message::{LogEntry, RaftMessage};
 use crate::protocol::{ConsensusProtocol, Decision, Outgoing, SendTarget};
+use crate::storage::RaftStorage;
 
 /// Role in the Raft state machine.
 #[derive(Debug, Clone)]
@@ -71,6 +73,9 @@ pub(crate) struct RaftProtocol<V> {
 
     // Buffered proposals from before a leader is known (drained on AppendEntries).
     pub(crate) pending_proposals: Vec<V>,
+
+    // Owned storage backend. Persists term, voted_for, log entries, and decisions.
+    storage: Box<dyn RaftStorage<V> + Send + Sync>,
 }
 
 /// Inner snapshot used by `ConsensusProtocol::peek_state`. Mirrors `NodeState`
@@ -90,7 +95,12 @@ impl<V> RaftProtocol<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
 {
-    pub(crate) fn new(node_id: NodeId, total_nodes: usize, config: RaftConfig) -> Self {
+    pub(crate) fn new(
+        node_id: NodeId,
+        total_nodes: usize,
+        config: RaftConfig,
+        storage: Box<dyn RaftStorage<V> + Send + Sync>,
+    ) -> Self {
         let election_deadline = Instant::now() + sample_election_timeout(&config);
         Self {
             node_id,
@@ -114,6 +124,7 @@ where
             pending_persist_log_from: None,
             pending_truncate_from: None,
             pending_proposals: Vec::new(),
+            storage,
         }
     }
 
@@ -139,12 +150,12 @@ where
         }
     }
 
-    /// Restore persistent state at startup. Called by the Node before entering
-    /// the event loop with `term`, `voted_for`, `log`, and decisions all loaded
-    /// through `RaftStorage`. The committed prefix of
-    /// the log is exactly the set of decided slots, so `commit_index` and
-    /// `last_applied` are set to the highest decided slot (or `None` if there
-    /// are no decisions).
+    /// Restore persistent state at startup from explicit values. Used by the
+    /// async [`recover`](Self::recover) wrapper after it loads through owned
+    /// storage, and directly by property tests that simulate restarts from
+    /// arbitrary external state. The committed prefix of the log is exactly
+    /// the set of decided slots, so `commit_index` and `last_applied` are set
+    /// to the highest decided slot (or `None` if there are no decisions).
     ///
     /// Role normally resets to Follower: a freshly-started node cannot assume
     /// it is still leader, and the election timeout will trigger a fresh
@@ -152,7 +163,7 @@ where
     /// durable state shows this node already won an election in the loaded term
     /// (`term > 0` and `voted_for == self`); otherwise stay Follower at `term`
     /// until the event loop runs an election.
-    pub(crate) fn recover(
+    pub(crate) fn restore_state(
         &mut self,
         term: u64,
         voted_for: Option<NodeId>,
@@ -192,10 +203,54 @@ where
         }
     }
 
-    /// Drain the pending persistence intent — the Node will write it through
-    /// `RaftStorage` before sending any outgoing wire message. Clears the
-    /// underlying flags so subsequent calls return empty intents until new
-    /// state changes occur.
+    /// Load persisted state from owned storage and seed in-memory state via
+    /// [`restore_state`](Self::restore_state). Called once at startup before
+    /// the event loop begins.
+    pub(crate) async fn recover(&mut self) -> Result<(), StorageError> {
+        let term = self.storage.load_term().await?;
+        let voted_for = self.storage.load_voted_for().await?;
+        let log = self.storage.load_log().await?;
+        let decisions = self.storage.load_decisions().await?;
+        self.restore_state(term, voted_for, log, decisions);
+        Ok(())
+    }
+
+    /// Drain the pending persistence intent and write it through owned
+    /// storage. Order matters: term -> voted_for -> truncate -> append.
+    /// Truncating before appending guarantees we never briefly persist
+    /// entries that conflict with what's about to be truncated.
+    pub(crate) async fn flush_persist(&mut self) -> Result<(), StorageError> {
+        let intent = self.drain_persist_intent();
+        if let Some(term) = intent.term {
+            self.storage.save_term(term).await?;
+        }
+        if let Some(vf) = intent.voted_for {
+            self.storage.save_voted_for(vf).await?;
+        }
+        if let Some(idx) = intent.truncate_from {
+            self.storage.truncate_log_from(idx).await?;
+        }
+        if let Some(idx) = intent.append_from {
+            let to_append = &intent.log_snapshot[idx as usize..];
+            self.storage.append_log(to_append).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain the in-memory pending decisions, persisting each through owned
+    /// storage before returning the list to the caller.
+    pub(crate) async fn drain_decisions(&mut self) -> Result<Vec<Decision<V>>, StorageError> {
+        let decisions = self.take_decisions();
+        for d in &decisions {
+            self.storage.save_decision(d.slot, d.value.clone()).await?;
+        }
+        Ok(decisions)
+    }
+
+    /// Drain the pending persistence intent — used internally by
+    /// [`flush_persist`](Self::flush_persist) and exposed for property tests
+    /// that manage persistence externally. Clears the underlying flags so
+    /// subsequent calls return empty intents until new state changes occur.
     pub(crate) fn drain_persist_intent(&mut self) -> PersistIntent<V> {
         let term = if self.pending_persist_term {
             Some(self.current_term)
@@ -823,10 +878,29 @@ where
 mod tests {
     use super::*;
     use crate::config::{NodeId, RaftConfig};
+    use crate::storage::RaftMemoryStorage;
+
+    fn raft<V>(node_id: NodeId, total_nodes: usize, config: RaftConfig) -> RaftProtocol<V>
+    where
+        V: serde::Serialize
+            + serde::de::DeserializeOwned
+            + Clone
+            + Send
+            + Sync
+            + PartialEq
+            + 'static,
+    {
+        RaftProtocol::new(
+            node_id,
+            total_nodes,
+            config,
+            Box::new(RaftMemoryStorage::<V>::new()),
+        )
+    }
 
     #[test]
     fn new_raft_protocol_starts_as_follower() {
-        let proto = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let proto = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         assert!(matches!(proto.role, Role::Follower));
         assert_eq!(proto.current_term, 0);
         assert!(proto.voted_for.is_none());
@@ -834,26 +908,26 @@ mod tests {
 
     #[test]
     fn is_idle_when_log_empty() {
-        let proto = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let proto = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         assert!(proto.is_idle());
     }
 
     #[test]
     fn quorum_for_three_nodes() {
-        let proto = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let proto = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         assert_eq!(proto.quorum(), 2);
     }
 
     #[test]
     fn quorum_for_five_nodes() {
-        let proto = RaftProtocol::<String>::new(NodeId::new("a", 1), 5, RaftConfig::default());
+        let proto = raft::<String>(NodeId::new("a", 1), 5, RaftConfig::default());
         assert_eq!(proto.quorum(), 3);
     }
 
     #[test]
     fn election_timeout_starts_election() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.election_deadline = Instant::now() - Duration::from_millis(10);
         let out = p.on_tick(Instant::now());
         assert!(matches!(p.role, Role::Candidate));
@@ -872,7 +946,7 @@ mod tests {
     #[test]
     fn request_vote_grants_when_term_higher() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let candidate = NodeId::new("b", 1);
         let out = p.handle_message(
             candidate.clone(),
@@ -902,7 +976,7 @@ mod tests {
     #[test]
     fn request_vote_rejects_lower_term() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         let out = p.handle_message(
             NodeId::new("b", 1),
@@ -926,7 +1000,7 @@ mod tests {
     #[test]
     fn request_vote_rejects_stale_log() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.log.push(LogEntry {
             term: 3,
             value: "x".into(),
@@ -950,7 +1024,7 @@ mod tests {
     #[test]
     fn request_vote_already_voted_in_same_term_rejects_other() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let b = NodeId::new("b", 1);
         let c = NodeId::new("c", 1);
         let _ = p.handle_message(
@@ -985,7 +1059,7 @@ mod tests {
     fn vote_quorum_promotes_to_leader_and_heartbeats() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.election_deadline = Instant::now() - Duration::from_millis(1);
         let _ = p.on_tick(Instant::now());
         assert!(matches!(p.role, Role::Candidate));
@@ -1012,7 +1086,7 @@ mod tests {
     #[test]
     fn higher_term_steps_down_to_follower() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 3;
         p.voted_for = Some(p.node_id.clone());
@@ -1032,7 +1106,7 @@ mod tests {
     #[test]
     fn vote_response_for_old_term_ignored() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.election_deadline = Instant::now() - Duration::from_millis(1);
         let _ = p.on_tick(Instant::now()); // p.current_term = 1
         let out = p.handle_message(
@@ -1049,7 +1123,7 @@ mod tests {
     #[test]
     fn append_entries_resets_election_timer_and_accepts_leader() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let leader = NodeId::new("b", 1);
         // Force a known-stale deadline so the reset is observable regardless of
         // how the next randomized sample lands.
@@ -1087,7 +1161,7 @@ mod tests {
     #[test]
     fn append_entries_rejects_lower_term() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         let out = p.handle_message(
             NodeId::new("b", 1),
@@ -1113,7 +1187,7 @@ mod tests {
     #[test]
     fn append_entries_rejects_log_gap() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let out = p.handle_message(
             NodeId::new("b", 1),
             RaftMessage::AppendEntries {
@@ -1138,7 +1212,7 @@ mod tests {
     #[test]
     fn append_entries_rejects_term_mismatch_at_prev() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.log.push(LogEntry {
             term: 1,
             value: "old".into(),
@@ -1164,7 +1238,7 @@ mod tests {
     #[test]
     fn append_entries_appends_when_prev_matches() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let _ = p.handle_message(
             NodeId::new("b", 1),
             RaftMessage::AppendEntries {
@@ -1202,7 +1276,7 @@ mod tests {
     #[test]
     fn append_entries_truncates_conflicting_suffix() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 2;
         p.log = vec![
             LogEntry {
@@ -1242,7 +1316,7 @@ mod tests {
         // not produce. A heartbeat with `prev_log_index = Some(2)` must report
         // match_index = Some(2), not Some(5) — otherwise the leader treats the
         // stale suffix as replicated.
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         p.log = vec![
             LogEntry {
@@ -1312,7 +1386,7 @@ mod tests {
         // Follower has a longer stale suffix at indices 3..=5. After the loop,
         // indices 3 and 4 match the leader (truncate-and-append on conflict),
         // but index 5 is still unverified. match_index should be 4, not 5.
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         p.log = vec![
             LogEntry {
@@ -1380,7 +1454,7 @@ mod tests {
         use crate::message::RaftMessage;
         // First heartbeat from a new leader to a fresh follower: prev_log_index
         // is None and entries is empty. Nothing has been verified by this RPC.
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let leader = NodeId::new("b", 1);
         let out = p.handle_message(
             leader.clone(),
@@ -1407,7 +1481,7 @@ mod tests {
     fn append_entries_match_index_when_prev_none_with_entries() {
         use crate::message::{LogEntry, RaftMessage};
         // prev_log_index = None, entries fill indices [0..=1]. Verified up to 1.
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let leader = NodeId::new("b", 1);
         let out = p.handle_message(
             leader.clone(),
@@ -1442,7 +1516,7 @@ mod tests {
     #[test]
     fn append_entries_idempotent_for_already_present_entries() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 1;
         p.log = vec![
             LogEntry {
@@ -1476,7 +1550,7 @@ mod tests {
     #[test]
     fn leader_commit_advances_commit_index_and_yields_decisions() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let _ = p.handle_message(
             NodeId::new("b", 1),
             RaftMessage::AppendEntries {
@@ -1510,7 +1584,7 @@ mod tests {
     fn leader_propose_appends_to_log_and_emits_append_entries() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -1530,7 +1604,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -1561,7 +1635,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
@@ -1588,7 +1662,7 @@ mod tests {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
@@ -1611,7 +1685,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -1639,7 +1713,7 @@ mod tests {
     #[test]
     fn leader_commit_is_capped_at_last_log_index() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let _ = p.handle_message(
             NodeId::new("b", 1),
             RaftMessage::AppendEntries {
@@ -1661,7 +1735,7 @@ mod tests {
     #[test]
     fn follower_reports_conflict_index_on_log_gap() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         let out = p.handle_message(
             NodeId::new("b", 1),
@@ -1688,7 +1762,7 @@ mod tests {
     #[test]
     fn follower_reports_conflict_term_on_term_mismatch_at_prev() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         p.log = vec![
             LogEntry {
@@ -1731,7 +1805,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
@@ -1770,7 +1844,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 7;
         p.leader = Some(me.clone());
@@ -1823,7 +1897,7 @@ mod tests {
     #[test]
     fn drain_persist_intent_returns_pending_state_and_clears_flags() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         p.voted_for = Some(NodeId::new("b", 1));
         p.log = vec![
@@ -1855,7 +1929,7 @@ mod tests {
 
     #[test]
     fn drain_persist_intent_returns_empty_when_no_pending() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let intent = p.drain_persist_intent();
         assert!(intent.term.is_none());
         assert!(intent.voted_for.is_none());
@@ -1867,8 +1941,8 @@ mod tests {
     #[test]
     fn recover_loads_state_correctly() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
-        p.recover(
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.restore_state(
             7,
             Some(NodeId::new("b", 1)),
             vec![
@@ -1900,8 +1974,8 @@ mod tests {
     #[test]
     fn recover_with_no_decisions_leaves_commit_index_none() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
-        p.recover(
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
+        p.restore_state(
             2,
             None,
             vec![LogEntry {
@@ -1920,7 +1994,7 @@ mod tests {
     #[test]
     fn follower_forwards_proposal_to_known_leader() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let leader = NodeId::new("b", 1);
         // Receive an AppendEntries from a leader to set p.leader.
         let _ = p.handle_message(
@@ -1951,7 +2025,7 @@ mod tests {
 
     #[test]
     fn follower_buffers_proposal_when_no_leader_known() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         assert!(p.leader.is_none());
         let out =
             <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
@@ -1964,7 +2038,7 @@ mod tests {
     fn leader_handles_forwarded_proposal_as_normal_propose() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -1981,7 +2055,7 @@ mod tests {
     #[test]
     fn pending_proposals_drained_as_forwards_when_leader_learned() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let _ =
             <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "buffered".into());
         assert_eq!(p.pending_proposals.len(), 1);
@@ -2008,7 +2082,7 @@ mod tests {
     #[test]
     fn non_leader_buffers_received_forward_when_no_leader_known() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         // p.role is Follower, p.leader is None
         let out = p.handle_message(
             NodeId::new("b", 1),
@@ -2022,7 +2096,7 @@ mod tests {
     #[test]
     fn non_leader_chain_forwards_received_forward_to_known_leader() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let leader = NodeId::new("c", 1);
         // Establish that we know c is the leader.
         let _ = p.handle_message(
@@ -2054,7 +2128,7 @@ mod tests {
     #[test]
     fn non_leader_buffers_forward_when_sender_is_believed_leader() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let b = NodeId::new("b", 1);
         // Let p believe b is leader.
         let _ = p.handle_message(
@@ -2082,7 +2156,7 @@ mod tests {
 
     #[test]
     fn single_node_raft_starts_as_follower_with_zero_term() {
-        let p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        let p = raft::<String>(NodeId::new("solo", 1), 1, RaftConfig::default());
         assert!(matches!(p.role, Role::Follower));
         assert_eq!(p.current_term, 0);
         assert!(p.voted_for.is_none());
@@ -2093,7 +2167,7 @@ mod tests {
 
     #[test]
     fn single_node_raft_commits_after_solo_election() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("solo", 1), 1, RaftConfig::default());
         let _ =
             <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "hello".into());
         assert!(matches!(p.role, Role::Follower));
@@ -2111,7 +2185,7 @@ mod tests {
 
     #[test]
     fn three_node_raft_does_not_commit_immediately_on_propose() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(p.node_id.clone());
@@ -2126,7 +2200,7 @@ mod tests {
     fn buffered_proposals_drain_when_self_becomes_leader() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         // Buffer two proposals while no leader is known.
         let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "x".into());
         let _ = <RaftProtocol<String> as ConsensusProtocol<String>>::propose(&mut p, "y".into());
@@ -2166,7 +2240,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
@@ -2193,7 +2267,7 @@ mod tests {
     #[test]
     fn leader_does_not_heartbeat_within_interval() {
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -2208,7 +2282,7 @@ mod tests {
     #[test]
     fn granting_vote_resets_election_deadline() {
         use crate::message::RaftMessage;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let earlier = Instant::now() - Duration::from_secs(1);
         p.election_deadline = earlier;
         let candidate = NodeId::new("b", 1);
@@ -2230,7 +2304,7 @@ mod tests {
     #[test]
     fn append_entries_with_conflict_yields_truncate_and_append_intent() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 2;
         p.log = vec![
             LogEntry {
@@ -2266,14 +2340,14 @@ mod tests {
     #[test]
     fn recover_with_partial_decisions_sets_commit_index_correctly() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         let log = (0..5)
             .map(|i| LogEntry {
                 term: 1,
                 value: format!("v{i}"),
             })
             .collect();
-        p.recover(
+        p.restore_state(
             1,
             None,
             log,
@@ -2289,7 +2363,7 @@ mod tests {
     #[test]
     fn is_idle_false_when_leader() {
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.leader = Some(me);
         assert!(!p.is_idle(), "leader is never idle");
@@ -2297,7 +2371,7 @@ mod tests {
 
     #[test]
     fn is_idle_false_when_pending_proposals() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.pending_proposals.push("x".into());
         assert!(!p.is_idle());
     }
@@ -2305,7 +2379,7 @@ mod tests {
     #[test]
     fn is_idle_false_when_log_nonempty() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.log.push(LogEntry {
             term: 1,
             value: "x".into(),
@@ -2316,7 +2390,7 @@ mod tests {
     #[test]
     fn conflict_hint_uses_first_index_of_term() {
         use crate::message::{LogEntry, RaftMessage};
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 5;
         p.log = vec![
             LogEntry {
@@ -2370,7 +2444,7 @@ mod tests {
         use crate::message::{LogEntry, RaftMessage};
         let me = NodeId::new("a", 1);
         let b = NodeId::new("b", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 1;
         p.leader = Some(me.clone());
@@ -2394,7 +2468,7 @@ mod tests {
 
     #[test]
     fn single_node_raft_no_persist_intent_until_election() {
-        let mut p = RaftProtocol::<String>::new(NodeId::new("solo", 1), 1, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("solo", 1), 1, RaftConfig::default());
         let intent = p.drain_persist_intent();
         assert!(intent.term.is_none());
         assert!(intent.voted_for.is_none());
@@ -2408,8 +2482,8 @@ mod tests {
     #[test]
     fn single_node_recover_from_empty_storage_starts_as_follower() {
         let me = NodeId::new("solo", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
-        p.recover(0, None, Vec::new(), Vec::new());
+        let mut p = raft::<String>(me.clone(), 1, RaftConfig::default());
+        p.restore_state(0, None, Vec::new(), Vec::new());
         assert!(matches!(p.role, Role::Follower));
         assert_eq!(p.current_term, 0);
         assert!(p.voted_for.is_none());
@@ -2423,12 +2497,12 @@ mod tests {
     fn single_node_recover_preserves_persisted_term_and_log() {
         use crate::message::LogEntry;
         let me = NodeId::new("solo", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 1, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 1, RaftConfig::default());
         let log = vec![LogEntry {
             term: 1,
             value: "x".into(),
         }];
-        p.recover(1, Some(me.clone()), log, vec![(0, "x".into())]);
+        p.restore_state(1, Some(me.clone()), log, vec![(0, "x".into())]);
         assert!(matches!(p.role, Role::Leader));
         assert_eq!(p.current_term, 1);
         assert_eq!(p.commit_index, Some(0));
@@ -2442,10 +2516,10 @@ mod tests {
     #[test]
     fn multi_node_recover_resets_to_follower() {
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.leader = Some(me.clone());
-        p.recover(5, Some(me.clone()), Vec::new(), Vec::new());
+        p.restore_state(5, Some(me.clone()), Vec::new(), Vec::new());
         assert!(matches!(p.role, Role::Follower));
         assert_eq!(p.leader, None);
         assert_eq!(p.current_term, 5);
@@ -2455,7 +2529,7 @@ mod tests {
     fn old_leader_after_term_bump_chain_forwards() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut p = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut p = raft::<String>(me.clone(), 3, RaftConfig::default());
         p.role = Role::Leader;
         p.current_term = 5;
         p.leader = Some(me.clone());
@@ -2494,7 +2568,7 @@ mod tests {
     fn stale_leader_steps_down_on_higher_term_heartbeat() {
         use crate::message::RaftMessage;
         let me = NodeId::new("a", 1);
-        let mut old = RaftProtocol::<String>::new(me.clone(), 3, RaftConfig::default());
+        let mut old = raft::<String>(me.clone(), 3, RaftConfig::default());
         old.role = Role::Leader;
         old.current_term = 3;
         old.voted_for = Some(me.clone());
@@ -2519,7 +2593,7 @@ mod tests {
     #[test]
     fn peek_state_reports_raft_state() {
         use crate::message::LogEntry;
-        let mut p = RaftProtocol::<String>::new(NodeId::new("a", 1), 3, RaftConfig::default());
+        let mut p = raft::<String>(NodeId::new("a", 1), 3, RaftConfig::default());
         p.current_term = 4;
         p.log.push(LogEntry {
             term: 4,

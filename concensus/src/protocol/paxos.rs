@@ -6,8 +6,10 @@ use rand::RngExt;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::config::{NodeId, PaxosConfig};
+use crate::error::StorageError;
 use crate::message::{PaxosMessage, ProposalNumber};
 use crate::protocol::{ConsensusProtocol, Decision, Outgoing, SendTarget};
+use crate::storage::PaxosStorage;
 
 #[cfg(feature = "multi-paxos")]
 #[derive(Debug)]
@@ -57,6 +59,8 @@ pub(crate) struct PaxosProtocol<V> {
     /// unconditionally so the field is available regardless of features.
     #[allow(dead_code)]
     heartbeat_interval: Duration,
+    /// Owned storage backend. Decisions are persisted here as they are made.
+    storage: Box<dyn PaxosStorage<V> + Send + Sync>,
 }
 
 /// Per-slot Paxos instance
@@ -113,16 +117,13 @@ impl<V> PaxosInstance<V> {
 
 impl<V> PaxosProtocol<V>
 where
-    V: Serialize + DeserializeOwned + Clone + Send + PartialEq,
+    V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
 {
-    pub(crate) fn new(node_id: NodeId, total_nodes: usize) -> Self {
-        Self::new_with_config(node_id, total_nodes, PaxosConfig::default())
-    }
-
     pub(crate) fn new_with_config(
         node_id: NodeId,
         total_nodes: usize,
         config: PaxosConfig,
+        storage: Box<dyn PaxosStorage<V> + Send + Sync>,
     ) -> Self {
         Self {
             node_id,
@@ -145,7 +146,34 @@ where
             #[cfg(feature = "multi-paxos")]
             forwarded_proposals: Vec::new(),
             heartbeat_interval: config.heartbeat_interval,
+            storage,
         }
+    }
+
+    /// Restore in-memory state from owned storage. Loads previously decided
+    /// values and seeds `decided_slots` / `next_slot` so the node can resume
+    /// the protocol after a restart.
+    pub(crate) async fn recover(&mut self) -> Result<(), StorageError> {
+        let decisions = self.storage.load_decisions().await?;
+        self.initialize_from_decisions(decisions);
+        Ok(())
+    }
+
+    /// No-op for Paxos — there is no per-message persistence intent like the
+    /// Raft term/voted_for/log flush. Decisions are persisted lazily in
+    /// [`drain_decisions`].
+    pub(crate) async fn flush_persist(&mut self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Drain the in-memory pending decisions, persisting each through owned
+    /// storage before returning the list to the caller.
+    pub(crate) async fn drain_decisions(&mut self) -> Result<Vec<Decision<V>>, StorageError> {
+        let decisions = self.take_decisions();
+        for d in &decisions {
+            self.storage.save_decision(d.slot, d.value.clone()).await?;
+        }
+        Ok(decisions)
     }
 
     pub(crate) fn initialize_from_decisions(&mut self, decisions: Vec<(u64, V)>) {
@@ -1068,7 +1096,12 @@ mod tests {
     }
 
     fn make_protocol(name: &str, total_nodes: usize) -> PaxosProtocol<String> {
-        PaxosProtocol::new(node(name), total_nodes)
+        PaxosProtocol::new_with_config(
+            node(name),
+            total_nodes,
+            PaxosConfig::default(),
+            Box::new(crate::storage::PaxosMemoryStorage::<String>::new()),
+        )
     }
 
     // -- Acceptor tests (Phase 1) --

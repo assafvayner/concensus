@@ -3,7 +3,8 @@ mod helpers;
 use std::time::Duration;
 
 use concensus::{
-    channel, Node, NodeId, PaxosMemoryStorage, PeerInfo, RaftConfig, RaftMemoryStorage, RaftStorage,
+    channel, Node, NodeId, PaxosConfig, PaxosMemoryStorage, PeerInfo, RaftConfig,
+    RaftMemoryStorage, RaftStorage,
 };
 use helpers::{collect_decisions, SharedMemoryStorage, SharedRaftStorage};
 use tokio::time::timeout;
@@ -50,15 +51,23 @@ fn build_paxos_cluster(
             sender: tx1.clone(),
         },
     ];
-    let (n0, h0, d0) = Node::with_id(ids[0].clone(), peers0, rx0, storage0);
-    let (n1, h1, d1) = Node::with_id(
+    let (n0, h0, d0) = Node::paxos_with_id(
+        ids[0].clone(),
+        PaxosConfig::default(),
+        peers0,
+        rx0,
+        storage0,
+    );
+    let (n1, h1, d1) = Node::paxos_with_id(
         ids[1].clone(),
+        PaxosConfig::default(),
         peers1,
         rx1,
         PaxosMemoryStorage::<String>::new(),
     );
-    let (n2, h2, d2) = Node::with_id(
+    let (n2, h2, d2) = Node::paxos_with_id(
         ids[2].clone(),
+        PaxosConfig::default(),
         peers2,
         rx2,
         PaxosMemoryStorage::<String>::new(),
@@ -158,15 +167,15 @@ async fn raft_restart_recovers_decisions() {
         },
     ];
     let (n0, h0, mut d0) =
-        Node::with_raft_config_and_id(ids[0].clone(), cfg.clone(), peers0, rx0, storage0.clone());
-    let (n1, h1, _d1) = Node::with_raft_config_and_id(
+        Node::raft_with_id(ids[0].clone(), cfg.clone(), peers0, rx0, storage0.clone());
+    let (n1, h1, _d1) = Node::raft_with_id(
         ids[1].clone(),
         cfg.clone(),
         peers1,
         rx1,
         RaftMemoryStorage::<String>::new(),
     );
-    let (n2, _h2, _d2) = Node::with_raft_config_and_id(
+    let (n2, _h2, _d2) = Node::raft_with_id(
         ids[2].clone(),
         cfg.clone(),
         peers2,

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 /// For production use, implement this trait with a database or file-backed
 /// store. For testing, use [`PaxosMemoryStorage`].
 #[async_trait]
-pub trait PaxosStorage<V>: Send + 'static
+pub trait PaxosStorage<V>: Send + Sync + 'static
 where
     V: Serialize + DeserializeOwned + Clone + Send,
 {
@@ -38,14 +38,13 @@ where
 /// [`PaxosStorage`](PaxosStorage) for parity across algorithms) and the
 /// persistent Raft state from the paper: `currentTerm`, `votedFor`, and the
 /// replicated log. The [`Node`](crate::Node) constructed via
-/// [`Node::with_raft_config`](crate::Node::with_raft_config) requires this
-/// trait; it is invoked to flush term, vote, and log entries before sending
-/// the corresponding RPC.
+/// [`Node::raft`](crate::Node::raft) requires this trait; it is invoked to
+/// flush term, vote, and log entries before sending the corresponding RPC.
 ///
 /// Use [`RaftMemoryStorage`] in tests; production deployments should provide
 /// a durable backing store.
 #[async_trait]
-pub trait RaftStorage<V>: Send + 'static
+pub trait RaftStorage<V>: Send + Sync + 'static
 where
     V: Serialize + DeserializeOwned + Clone + Send,
 {

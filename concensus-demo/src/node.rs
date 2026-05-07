@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use concensus::{
-    DecisionReceiver, Node, NodeHandle, NodeId, PaxosMemoryStorage, ProposeError, RaftConfig,
-    RaftMemoryStorage, TcpTransport, UdsTransport,
+    DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, ProposeError,
+    RaftConfig, RaftMemoryStorage, TcpTransport, UdsTransport,
 };
 
 pub mod consensus_proto {
@@ -264,13 +264,14 @@ async fn start_node_tcp(
 
     let node_id = NodeId::new(node_name, 0);
     let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::with_id(
+        Algorithm::Paxos => Node::paxos_with_id(
             node_id,
+            PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<String>::new(),
         ),
-        Algorithm::Raft => Node::with_raft_config_and_id(
+        Algorithm::Raft => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
@@ -302,13 +303,14 @@ async fn start_node_uds(
 
     let node_id = NodeId::new(node_name, 0);
     let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::with_id(
+        Algorithm::Paxos => Node::paxos_with_id(
             node_id,
+            PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<String>::new(),
         ),
-        Algorithm::Raft => Node::with_raft_config_and_id(
+        Algorithm::Raft => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,

@@ -17,6 +17,7 @@ use crate::config::{NodeId, RaftConfig};
 use crate::message::{LogEntry, RaftMessage};
 use crate::protocol::raft::{RaftProtocol, Role};
 use crate::protocol::{ConsensusProtocol, Outgoing, SendTarget};
+use crate::storage::RaftMemoryStorage;
 
 const NUM_NODES: usize = 3;
 
@@ -64,7 +65,14 @@ impl Harness {
             .collect();
         let nodes: Vec<RaftProtocol<u32>> = ids
             .iter()
-            .map(|id| RaftProtocol::new(id.clone(), NUM_NODES, cfg.clone()))
+            .map(|id| {
+                RaftProtocol::new(
+                    id.clone(),
+                    NUM_NODES,
+                    cfg.clone(),
+                    Box::new(RaftMemoryStorage::<u32>::new()),
+                )
+            })
             .collect();
         Self {
             nodes,
@@ -174,7 +182,7 @@ impl Harness {
             Step::Restart(n) => {
                 let n = (*n as usize) % NUM_NODES;
                 self.flush_persist(n);
-                self.nodes[n].recover(
+                self.nodes[n].restore_state(
                     self.persisted_term[n],
                     self.persisted_voted_for[n].clone(),
                     self.persisted_log[n].clone(),
