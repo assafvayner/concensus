@@ -67,5 +67,46 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --all-targets --all-features
 
-      - name: cargo test
-        run: cargo test --workspace --all-features
+      - name: Test — daccord (core library)
+        run: cargo test -p daccord --all-features
+
+      - name: Test — daccord-client (SDK)
+        run: cargo test -p daccord-client --all-features
+
+      - name: Test — daccord-demo (gRPC service)
+        run: cargo test -p daccord-demo --all-features
+
+      - name: Test — integration / consensus correctness
+        run: |
+          cargo test -p daccord-tests --all-features \
+            --test cluster \
+            --test multi_paxos \
+            --test raft_cluster \
+            --test raft_specific \
+            --test complex_values \
+            --test lifecycle \
+            --test larger_clusters \
+            --test parity_larger \
+            --test algorithm_parity \
+            --test safety_invariants
+
+      - name: Test — integration / network simulation
+        run: |
+          cargo test -p daccord-tests --all-features \
+            --test adversarial_cluster \
+            --test parity_adversarial \
+            --test delayed_cluster \
+            --test parity_delayed \
+            --test parity_lossy \
+            --test parity_reordering \
+            --test stress \
+            --test parity_stress
+
+      - name: Test — integration / recovery & storage
+        run: |
+          cargo test -p daccord-tests --all-features \
+            --test recovery \
+            --test parity_recovery \
+            --test duckdb_recovery \
+            --test redb_recovery \
+            --test benchmark
