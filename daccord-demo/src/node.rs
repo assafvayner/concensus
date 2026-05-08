@@ -1,26 +1,32 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
 
 use daccord::{
-    DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, ProposeError,
-    RaftConfig, RaftMemoryStorage, TcpTransport, UdsTransport,
+    DecisionReceiver, Node, NodeAlgorithm as CoreAlgorithm, NodeHandle, NodeId, NodeRole,
+    NodeState, PaxosConfig, PaxosMemoryStorage, ProposeError, RaftConfig, RaftMemoryStorage,
+    TcpTransport, UdsTransport,
 };
 #[cfg(feature = "duckdb-bundled")]
 use daccord::{DuckdbPaxosStorage, DuckdbRaftStorage};
 
 pub mod consensus_proto {
-    tonic::include_proto!("consensus");
+    tonic::include_proto!("daccord.v1");
 }
 
 use consensus_proto::consensus_service_server::{ConsensusService, ConsensusServiceServer};
 use consensus_proto::{
     Decision, GetDecisionsRequest, GetDecisionsResponse, HealthRequest, HealthResponse,
-    ProposeRequest, ProposeResponse, StatusRequest, StatusResponse,
+    ProposeRequest, ProposeResponse, StatusRequest, StatusResponse, WatchRequest,
 };
+
+const DEFAULT_GET_LIMIT: usize = 1000;
+const DECISION_BROADCAST_CAPACITY: usize = 256;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -165,16 +171,48 @@ fn parse_uds_peers(peers_str: &str) -> Vec<(NodeId, PathBuf)> {
         .collect()
 }
 
+// ─── Decision log (snapshot + broadcast) ─────────────────────────────────────
+
+/// Append-only in-memory log of decisions plus a broadcast channel for
+/// streaming live updates to `Watch` subscribers.
+struct DecisionLog {
+    entries: RwLock<Vec<Decision>>,
+    tx: broadcast::Sender<Decision>,
+}
+
+impl DecisionLog {
+    fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self {
+            entries: RwLock::new(Vec::new()),
+            tx,
+        }
+    }
+
+    async fn append(&self, decision: Decision) {
+        self.entries.write().await.push(decision.clone());
+        // Errors only when no receivers are subscribed; that's fine.
+        let _ = self.tx.send(decision);
+    }
+
+    async fn snapshot(&self) -> Vec<Decision> {
+        self.entries.read().await.clone()
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<Decision> {
+        self.tx.subscribe()
+    }
+}
+
 // ─── gRPC Service ────────────────────────────────────────────────────────────
 
-type DecisionList = Arc<RwLock<Vec<Decision>>>;
-
 struct ConsensusServiceImpl {
-    handle: NodeHandle<String>,
-    decisions: DecisionList,
-    node_id: String,
+    handle: NodeHandle<Vec<u8>>,
+    decisions: Arc<DecisionLog>,
     algorithm: Algorithm,
 }
+
+type DecisionStream = Pin<Box<dyn Stream<Item = Result<Decision, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl ConsensusService for ConsensusServiceImpl {
@@ -182,26 +220,110 @@ impl ConsensusService for ConsensusServiceImpl {
         &self,
         request: Request<ProposeRequest>,
     ) -> Result<Response<ProposeResponse>, Status> {
-        let value = request.into_inner().value;
-        tracing::info!(value = %value, "gRPC propose request");
+        let payload = request.into_inner().payload;
+        tracing::info!(payload_len = payload.len(), "gRPC propose request");
 
-        match self.handle.propose(value).await {
-            Ok(()) => Ok(Response::new(ProposeResponse {
-                status: "proposed".to_string(),
+        match self.handle.propose(payload).await {
+            Ok(decided) => Ok(Response::new(ProposeResponse {
+                slot: decided.slot,
+                payload: decided.value,
             })),
             Err(ProposeError::ChannelFull) => {
                 Err(Status::resource_exhausted("proposal channel full"))
             }
             Err(ProposeError::NotRunning) => Err(Status::unavailable("node is not running")),
+            Err(ProposeError::Cancelled) => Err(Status::unavailable(
+                "node was shut down before proposal was decided",
+            )),
+            Err(ProposeError::Superseded) => {
+                Err(Status::aborted("proposal was superseded by another leader"))
+            }
         }
+    }
+
+    type WatchStream = DecisionStream;
+
+    async fn watch(
+        &self,
+        request: Request<WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let start_index = request.into_inner().start_index;
+        let log = self.decisions.clone();
+
+        let stream = async_stream::stream! {
+            // Subscribe BEFORE snapshotting, so we don't miss decisions appended
+            // between the snapshot read and the live tail subscription.
+            let mut rx = log.subscribe();
+            let snapshot = log.snapshot().await;
+
+            // Track the last slot already yielded from the snapshot to filter
+            // out duplicates that the broadcast may also deliver.
+            let mut last_yielded: Option<u64> = None;
+
+            for d in snapshot.into_iter() {
+                if d.slot >= start_index {
+                    last_yielded = Some(d.slot);
+                    yield Ok(d);
+                }
+            }
+
+            loop {
+                match rx.recv().await {
+                    Ok(d) => {
+                        if d.slot < start_index {
+                            continue;
+                        }
+                        if let Some(last) = last_yielded {
+                            if d.slot <= last {
+                                continue;
+                            }
+                        }
+                        last_yielded = Some(d.slot);
+                        yield Ok(d);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        yield Err(Status::resource_exhausted(
+                            "watch lagged behind, reconnect with start_index = last_seen + 1",
+                        ));
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream) as Self::WatchStream))
     }
 
     async fn get_decisions(
         &self,
-        _request: Request<GetDecisionsRequest>,
+        request: Request<GetDecisionsRequest>,
     ) -> Result<Response<GetDecisionsResponse>, Status> {
-        let decisions = self.decisions.read().await.clone();
-        Ok(Response::new(GetDecisionsResponse { decisions }))
+        let req = request.into_inner();
+        let start_index = req.start_index as usize;
+        let limit = req
+            .limit
+            .filter(|n| *n != 0)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_GET_LIMIT);
+
+        let entries = self.decisions.entries.read().await;
+        let total = entries.len();
+        let (decisions, next_index) = if start_index >= total {
+            (Vec::new(), start_index as u64)
+        } else {
+            let end = (start_index + limit).min(total);
+            let slice = entries[start_index..end].to_vec();
+            let next = (start_index + slice.len()) as u64;
+            (slice, next)
+        };
+
+        Ok(Response::new(GetDecisionsResponse {
+            decisions,
+            next_index,
+        }))
     }
 
     async fn health(
@@ -217,39 +339,71 @@ impl ConsensusService for ConsensusServiceImpl {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Ok(Response::new(StatusResponse {
-            node_id: self.node_id.clone(),
-            algorithm: self.algorithm.as_str().to_string(),
-            role: "N/A".into(),
-            term: 0,
-            leader: String::new(),
-            log_len: 0,
-            has_commit_index: false,
-            commit_index: 0,
-            has_last_applied: false,
-            last_applied: 0,
-        }))
+        let state: NodeState = self.handle.status();
+        Ok(Response::new(project_status(state, self.algorithm)))
+    }
+}
+
+fn project_status(state: NodeState, configured: Algorithm) -> StatusResponse {
+    let algorithm = match state.algorithm {
+        CoreAlgorithm::Paxos => "paxos",
+        CoreAlgorithm::Raft => "raft",
+    };
+    // Sanity: configured and reported algorithms must agree; if not, we trust
+    // the core's report and just log.
+    if (configured == Algorithm::Paxos && state.algorithm != CoreAlgorithm::Paxos)
+        || (configured == Algorithm::Raft && state.algorithm != CoreAlgorithm::Raft)
+    {
+        tracing::warn!(
+            configured = configured.as_str(),
+            reported = algorithm,
+            "configured algorithm differs from core node state"
+        );
+    }
+
+    let role = match state.role {
+        Some(NodeRole::Follower) => "follower",
+        Some(NodeRole::Candidate) => "candidate",
+        Some(NodeRole::Leader) => "leader",
+        None => "n/a",
+    };
+
+    StatusResponse {
+        node_id: state.node_id.to_string(),
+        algorithm: algorithm.to_string(),
+        role: role.to_string(),
+        term: state.term,
+        leader_id: state
+            .leader
+            .as_ref()
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        log_len: state.log_len,
+        commit_index: state.commit_index,
+        last_applied: state.last_applied,
     }
 }
 
 // ─── Decision collector ──────────────────────────────────────────────────────
 
 async fn collect_decisions(
-    mut decision_rx: DecisionReceiver<String>,
-    decisions: DecisionList,
+    mut decision_rx: DecisionReceiver<Vec<u8>>,
+    decisions: Arc<DecisionLog>,
     node_name: String,
 ) {
     while let Some(decided) = decision_rx.recv().await {
         tracing::info!(
             node_name = %node_name,
             slot = decided.slot,
-            value = %decided.value,
+            payload_len = decided.value.len(),
             "decision reached"
         );
-        decisions.write().await.push(Decision {
-            slot: decided.slot,
-            value: decided.value,
-        });
+        decisions
+            .append(Decision {
+                slot: decided.slot,
+                payload: decided.value,
+            })
+            .await;
     }
     tracing::info!("decision channel closed");
 }
@@ -262,7 +416,7 @@ async fn start_node_tcp(
     bind_addr: SocketAddr,
     peers: Vec<(NodeId, String)>,
     data_dir: Option<&Path>,
-) -> (NodeHandle<String>, DecisionReceiver<String>) {
+) -> (NodeHandle<Vec<u8>>, DecisionReceiver<Vec<u8>>) {
     let peers = resolve_tcp_peers(peers).await;
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
         .await
@@ -276,7 +430,7 @@ async fn start_node_tcp(
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            DuckdbPaxosStorage::<String>::open(dir.join("paxos.db"))
+            DuckdbPaxosStorage::<Vec<u8>>::open(dir.join("paxos.db"))
                 .expect("failed to open DuckDB Paxos storage"),
         ),
         #[cfg(feature = "duckdb-bundled")]
@@ -285,7 +439,7 @@ async fn start_node_tcp(
             RaftConfig::default(),
             peer_infos,
             receiver,
-            DuckdbRaftStorage::<String>::open(dir.join("raft.db"))
+            DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
                 .expect("failed to open DuckDB Raft storage"),
         ),
         (Algorithm::Paxos, _) => Node::paxos_with_id(
@@ -293,14 +447,14 @@ async fn start_node_tcp(
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            PaxosMemoryStorage::<String>::new(),
+            PaxosMemoryStorage::<Vec<u8>>::new(),
         ),
         (Algorithm::Raft, _) => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
             receiver,
-            RaftMemoryStorage::<String>::new(),
+            RaftMemoryStorage::<Vec<u8>>::new(),
         ),
     };
 
@@ -321,7 +475,7 @@ async fn start_node_uds(
     bind_path: PathBuf,
     peers: Vec<(NodeId, PathBuf)>,
     data_dir: Option<&Path>,
-) -> (NodeHandle<String>, DecisionReceiver<String>) {
+) -> (NodeHandle<Vec<u8>>, DecisionReceiver<Vec<u8>>) {
     let (peer_infos, receiver) = UdsTransport::create(bind_path, peers)
         .await
         .expect("failed to bind UDS transport");
@@ -334,7 +488,7 @@ async fn start_node_uds(
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            DuckdbPaxosStorage::<String>::open(dir.join("paxos.db"))
+            DuckdbPaxosStorage::<Vec<u8>>::open(dir.join("paxos.db"))
                 .expect("failed to open DuckDB Paxos storage"),
         ),
         #[cfg(feature = "duckdb-bundled")]
@@ -343,7 +497,7 @@ async fn start_node_uds(
             RaftConfig::default(),
             peer_infos,
             receiver,
-            DuckdbRaftStorage::<String>::open(dir.join("raft.db"))
+            DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
                 .expect("failed to open DuckDB Raft storage"),
         ),
         (Algorithm::Paxos, _) => Node::paxos_with_id(
@@ -351,14 +505,14 @@ async fn start_node_uds(
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            PaxosMemoryStorage::<String>::new(),
+            PaxosMemoryStorage::<Vec<u8>>::new(),
         ),
         (Algorithm::Raft, _) => Node::raft_with_id(
             node_id,
             RaftConfig::default(),
             peer_infos,
             receiver,
-            RaftMemoryStorage::<String>::new(),
+            RaftMemoryStorage::<Vec<u8>>::new(),
         ),
     };
 
@@ -434,7 +588,7 @@ async fn main() {
         }
     };
 
-    let decisions: DecisionList = Arc::new(RwLock::new(Vec::new()));
+    let decisions = Arc::new(DecisionLog::new(DECISION_BROADCAST_CAPACITY));
 
     tokio::spawn(collect_decisions(
         decision_rx,
@@ -449,7 +603,6 @@ async fn main() {
     let service = ConsensusServiceImpl {
         handle,
         decisions,
-        node_id: config.node_name.clone(),
         algorithm: config.algorithm,
     };
 

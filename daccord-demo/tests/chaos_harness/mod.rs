@@ -158,7 +158,7 @@ pub async fn propose(addr: &str, value: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     client
         .propose(ProposeRequest {
-            value: value.into(),
+            payload: value.as_bytes().to_vec(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -171,13 +171,16 @@ pub async fn fetch_decisions(addr: &str) -> Result<Vec<(u64, String)>, String> {
         .await
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get_decisions(GetDecisionsRequest {})
+        .get_decisions(GetDecisionsRequest {
+            start_index: 0,
+            limit: None,
+        })
         .await
         .map_err(|e| e.to_string())?;
     Ok(resp
         .into_inner()
         .decisions
         .into_iter()
-        .map(|d| (d.slot, d.value))
+        .map(|d| (d.slot, String::from_utf8_lossy(&d.payload).to_string()))
         .collect())
 }

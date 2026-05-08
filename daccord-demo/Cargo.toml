@@ -20,6 +20,8 @@ daccord = { path = "../daccord", features = ["tcp-transport", "uds-transport", "
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
