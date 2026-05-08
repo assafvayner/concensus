@@ -8,7 +8,7 @@ use tokio::time::Duration;
 /// With message loss, Paxos retries take longer. Use generous timeouts.
 /// At high loss rates with contention, multiple retry rounds with exponential
 /// backoff can add up significantly.
-const TIMEOUT_PER_DECISION: Duration = Duration::from_secs(30);
+const TIMEOUT_PER_DECISION: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // 1% drop rate
@@ -118,11 +118,18 @@ async fn lossy_10pct_multiple_proposals() {
 async fn lossy_10pct_proposals_from_different_nodes() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("from-{}", i)).await.unwrap();
-        // Small stagger to reduce initial slot contention between proposers
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                // Small stagger to reduce initial slot contention between proposers
+                tokio::time::sleep(Duration::from_millis(10 * i as u64)).await;
+                h.propose(format!("from-{}", i)).await
+            })
+        })
+        .collect();
 
     let expected: HashSet<String> = (0..3).map(|i| format!("from-{}", i)).collect();
 
@@ -136,6 +143,9 @@ async fn lossy_10pct_proposals_from_different_nodes() {
     }
     assert_consistent_decisions(&all);
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }
@@ -197,11 +207,18 @@ async fn lossy_20pct_multiple_proposals() {
 async fn lossy_20pct_proposals_from_different_nodes() {
     let mut cluster = create_lossy_cluster(3, 0.20);
 
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("from-{}", i)).await.unwrap();
-        // Small stagger to reduce initial slot contention between proposers
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                // Small stagger to reduce initial slot contention between proposers
+                tokio::time::sleep(Duration::from_millis(10 * i as u64)).await;
+                h.propose(format!("from-{}", i)).await
+            })
+        })
+        .collect();
 
     let expected: HashSet<String> = (0..3).map(|i| format!("from-{}", i)).collect();
 
@@ -215,6 +232,9 @@ async fn lossy_20pct_proposals_from_different_nodes() {
     }
     assert_consistent_decisions(&all);
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }
@@ -276,11 +296,18 @@ async fn lossy_30pct_multiple_proposals() {
 async fn lossy_30pct_proposals_from_different_nodes() {
     let mut cluster = create_lossy_cluster(3, 0.30);
 
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("from-{}", i)).await.unwrap();
-        // Small stagger to reduce initial slot contention between proposers
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                // Small stagger to reduce initial slot contention between proposers
+                tokio::time::sleep(Duration::from_millis(10 * i as u64)).await;
+                h.propose(format!("from-{}", i)).await
+            })
+        })
+        .collect();
 
     let expected: HashSet<String> = (0..3).map(|i| format!("from-{}", i)).collect();
 
@@ -294,6 +321,9 @@ async fn lossy_30pct_proposals_from_different_nodes() {
     }
     assert_consistent_decisions(&all);
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }

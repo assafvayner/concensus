@@ -27,8 +27,17 @@ async fn dropping_all_handles_causes_clean_shutdown() {
 async fn shutdown_during_active_proposal() {
     let cluster = create_cluster(3);
 
-    // Propose a value but don't wait for any decision.
-    let _ = cluster[0].handle.propose("inflight".to_string()).await;
+    // Propose a value without waiting on the result. The propose future will
+    // be cancelled when the cluster shuts down — but the spawned task holds
+    // a NodeHandle clone, so abort it to release that handle before waiting
+    // for the event loops to exit.
+    let h = cluster[0].handle.clone();
+    let propose_handle = tokio::spawn(async move { h.propose("inflight".to_string()).await });
+
+    // Give the event loop a moment to register the proposal.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    propose_handle.abort();
+    let _ = propose_handle.await;
 
     let mut run_handles = Vec::new();
     for node in cluster {
