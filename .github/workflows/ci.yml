@@ -46,38 +46,61 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  build-and-test:
-    name: Build & Test
+  test-daccord:
+    name: Test — daccord (core library)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
+      - run: cargo test -p daccord --all-features --all-targets
 
-      - name: cargo build
-        run: cargo build --workspace --all-targets --all-features
+  test-daccord-client:
+    name: Test — daccord-client (SDK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: cargo test -p daccord-client --all-features --all-targets
 
-      - name: Test — daccord (core library)
-        run: cargo test -p daccord --all-features
+  test-daccord-demo:
+    name: Test — daccord-demo (gRPC service)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: cargo test -p daccord-demo --all-features --all-targets
 
-      - name: Test — daccord-client (SDK)
-        run: cargo test -p daccord-client --all-features
-
-      - name: Test — daccord-demo (gRPC service)
-        run: cargo test -p daccord-demo --all-features
-
-      - name: Test — integration / consensus correctness
-        run: |
+  test-integration-consensus:
+    name: Test — integration / consensus correctness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: |
           cargo test -p daccord-tests --all-features \
             --test cluster \
             --test multi_paxos \
@@ -90,8 +113,19 @@ jobs:
             --test algorithm_parity \
             --test safety_invariants
 
-      - name: Test — integration / network simulation
-        run: |
+  test-integration-network-sim:
+    name: Test — integration / network simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: |
           cargo test -p daccord-tests --all-features \
             --test adversarial_cluster \
             --test parity_adversarial \
@@ -102,8 +136,19 @@ jobs:
             --test stress \
             --test parity_stress
 
-      - name: Test — integration / recovery & storage
-        run: |
+  test-integration-recovery:
+    name: Test — integration / recovery & storage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      - run: |
           cargo test -p daccord-tests --all-features \
             --test recovery \
             --test parity_recovery \
