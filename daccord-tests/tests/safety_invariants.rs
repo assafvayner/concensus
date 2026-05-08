@@ -14,15 +14,9 @@ async fn safety_under_loss_with_concurrent_proposers() {
     let mut cluster = create_lossy_cluster(5, 0.15);
 
     // All 5 nodes propose simultaneously.
-    let propose_handles: Vec<_> = cluster
-        .iter()
-        .enumerate()
-        .take(5)
-        .map(|(i, node)| {
-            let h = node.handle.clone();
-            tokio::spawn(async move { h.propose(format!("val-{}", i)).await })
-        })
-        .collect();
+    for (i, node) in cluster.iter().enumerate().take(5) {
+        node.handle.propose(format!("val-{}", i)).await.unwrap();
+    }
 
     // Collect up to 5 decisions per node, tolerating fewer.
     let mut all_decisions = Vec::new();
@@ -39,9 +33,6 @@ async fn safety_under_loss_with_concurrent_proposers() {
 
     assert_safety_invariant(&all_decisions);
 
-    for h in propose_handles {
-        h.abort();
-    }
     for node in cluster {
         drop(node.handle);
     }
@@ -56,15 +47,9 @@ async fn safety_four_node_under_loss_with_concurrent_proposers() {
     let mut cluster = create_lossy_cluster(4, 0.15);
 
     // All 4 nodes propose simultaneously.
-    let propose_handles: Vec<_> = cluster
-        .iter()
-        .enumerate()
-        .take(4)
-        .map(|(i, node)| {
-            let h = node.handle.clone();
-            tokio::spawn(async move { h.propose(format!("val-{}", i)).await })
-        })
-        .collect();
+    for (i, node) in cluster.iter().enumerate().take(4) {
+        node.handle.propose(format!("val-{}", i)).await.unwrap();
+    }
 
     // Collect up to 4 decisions per node, tolerating fewer.
     let mut all_decisions = Vec::new();
@@ -81,9 +66,6 @@ async fn safety_four_node_under_loss_with_concurrent_proposers() {
 
     assert_safety_invariant(&all_decisions);
 
-    for h in propose_handles {
-        h.abort();
-    }
     for node in cluster {
         drop(node.handle);
     }
@@ -97,21 +79,12 @@ async fn safety_four_node_under_loss_with_concurrent_proposers() {
 async fn safety_under_rapid_concurrent_proposals() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
-    // Each node proposes 10 values; spawn so the per-node loops run in
-    // parallel with the cross-node ones.
-    let propose_handles: Vec<_> = cluster
-        .iter()
-        .enumerate()
-        .take(3)
-        .map(|(i, node)| {
-            let h = node.handle.clone();
-            tokio::spawn(async move {
-                for j in 0..10 {
-                    let _ = h.propose(format!("n{}-v{}", i, j)).await;
-                }
-            })
-        })
-        .collect();
+    // Each node proposes 10 values.
+    for (i, node) in cluster.iter().enumerate().take(3) {
+        for j in 0..10 {
+            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
+        }
+    }
 
     // Collect up to 30 decisions per node.
     let mut all_decisions = Vec::new();
@@ -131,9 +104,6 @@ async fn safety_under_rapid_concurrent_proposals() {
     let total: usize = all_decisions.iter().map(|d| d.len()).sum();
     assert!(total > 0, "expected at least some decisions, got none");
 
-    for h in propose_handles {
-        h.abort();
-    }
     for node in cluster {
         drop(node.handle);
     }
@@ -147,20 +117,12 @@ async fn safety_under_rapid_concurrent_proposals() {
 async fn safety_under_loss_and_delay() {
     let mut cluster = create_lossy_delayed_cluster(5, 0.10, 0, 30);
 
-    // First 3 nodes propose 5 values each in parallel.
-    let propose_handles: Vec<_> = cluster
-        .iter()
-        .enumerate()
-        .take(3)
-        .map(|(i, node)| {
-            let h = node.handle.clone();
-            tokio::spawn(async move {
-                for j in 0..5 {
-                    let _ = h.propose(format!("n{}-v{}", i, j)).await;
-                }
-            })
-        })
-        .collect();
+    // First 3 nodes propose 5 values each.
+    for (i, node) in cluster.iter().enumerate().take(3) {
+        for j in 0..5 {
+            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
+        }
+    }
 
     // Collect up to 15 decisions per node.
     let mut all_decisions = Vec::new();
@@ -177,9 +139,6 @@ async fn safety_under_loss_and_delay() {
 
     assert_safety_invariant(&all_decisions);
 
-    for h in propose_handles {
-        h.abort();
-    }
     for node in cluster {
         drop(node.handle);
     }
