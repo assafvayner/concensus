@@ -19,6 +19,13 @@ tracing = "0.1"
 [build-dependencies]
 tonic-build = "0.12"
 
+[dev-dependencies]
+daccord = { path = "../daccord", features = ["channel-transport", "test-support"] }
+daccord-demo = { path = "../daccord-demo", features = ["test-support"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [[example]]
 name = "echo"
 required-features = []
