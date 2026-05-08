@@ -29,8 +29,7 @@ const PAXOS_DECISIONS: TableDefinition<u64, &str> = TableDefinition::new("paxos_
 const RAFT_DECISIONS: TableDefinition<u64, &str> = TableDefinition::new("raft_decisions");
 const RAFT_LOG: TableDefinition<u64, (u64, &str)> = TableDefinition::new("raft_log");
 const RAFT_TERM: TableDefinition<&str, u64> = TableDefinition::new("raft_term");
-const RAFT_VOTED_FOR: TableDefinition<&str, (&str, u64)> =
-    TableDefinition::new("raft_voted_for");
+const RAFT_VOTED_FOR: TableDefinition<&str, (&str, u64)> = TableDefinition::new("raft_voted_for");
 const RAFT_COMMIT_INDEX: TableDefinition<&str, u64> = TableDefinition::new("raft_commit_index");
 
 // Single-row meta tables key all entries under this constant.
@@ -38,8 +37,9 @@ const META_KEY: &str = "k";
 
 fn open_database(path: Option<&Path>) -> Result<Database, StorageError> {
     match path {
-        Some(p) => Database::create(p)
-            .map_err(|e| StorageError::Persist(format!("open redb: {e}"))),
+        Some(p) => {
+            Database::create(p).map_err(|e| StorageError::Persist(format!("open redb: {e}")))
+        }
         None => Builder::new()
             .create_with_backend(InMemoryBackend::new())
             .map_err(|e| StorageError::Persist(format!("open redb in-memory: {e}"))),
@@ -114,9 +114,7 @@ where
             let txn = db.begin_write().map_err(persist)?;
             {
                 let mut table = txn.open_table(PAXOS_DECISIONS).map_err(persist)?;
-                table
-                    .insert(slot, serialized.as_str())
-                    .map_err(persist)?;
+                table.insert(slot, serialized.as_str()).map_err(persist)?;
             }
             txn.commit().map_err(persist)?;
             Ok(())
@@ -201,9 +199,7 @@ where
             let txn = db.begin_write().map_err(persist)?;
             {
                 let mut table = txn.open_table(RAFT_DECISIONS).map_err(persist)?;
-                table
-                    .insert(slot, serialized.as_str())
-                    .map_err(persist)?;
+                table.insert(slot, serialized.as_str()).map_err(persist)?;
             }
             txn.commit().map_err(persist)?;
             Ok(())
@@ -316,9 +312,7 @@ where
                 };
                 for (i, (term, json)) in serialized.iter().enumerate() {
                     let idx = next_index + i as u64;
-                    table
-                        .insert(idx, (*term, json.as_str()))
-                        .map_err(persist)?;
+                    table.insert(idx, (*term, json.as_str())).map_err(persist)?;
                 }
             }
             txn.commit().map_err(persist)?;

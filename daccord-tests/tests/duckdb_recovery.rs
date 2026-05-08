@@ -358,10 +358,7 @@ async fn paxos_cluster_restart_recovers_decisions_via_duckdb() {
     handles2[0].propose("v3".into()).await.unwrap();
     let resumed = timeout(Duration::from_secs(10), async {
         loop {
-            let d = decisions2[0]
-                .recv()
-                .await
-                .expect("decision channel closed");
+            let d = decisions2[0].recv().await.expect("decision channel closed");
             if d.slot == 3 {
                 break d;
             }

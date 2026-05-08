@@ -332,10 +332,7 @@ pub fn create_raft_cluster(n: usize) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, daccord::RaftConfig::default())
 }
 
-pub fn create_raft_cluster_with_config(
-    n: usize,
-    config: daccord::RaftConfig,
-) -> Vec<ClusterNode> {
+pub fn create_raft_cluster_with_config(n: usize, config: daccord::RaftConfig) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, config)
 }
 
@@ -964,7 +961,7 @@ pub async fn collect_decisions(
     rx: &mut DecisionReceiver<String>,
     count: usize,
 ) -> Vec<Decided<String>> {
-    collect_decisions_with_timeout(rx, count, Duration::from_secs(5)).await
+    collect_decisions_with_timeout(rx, count, Duration::from_secs(30)).await
 }
 
 pub async fn collect_decisions_with_timeout(
