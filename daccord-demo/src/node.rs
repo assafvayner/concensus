@@ -26,7 +26,12 @@ use consensus_proto::{
 };
 
 const DEFAULT_GET_LIMIT: usize = 1000;
-const DECISION_BROADCAST_CAPACITY: usize = 256;
+/// Capacity of the decision broadcast channel used to fan out live updates
+/// to `Watch` subscribers. Larger values cost a bit of memory but tolerate
+/// slow / mid-snapshot consumers without forcing them to reconnect with
+/// `ResourceExhausted` ("watch lagged"). 4096 leaves comfortable headroom
+/// for the typical demo workload.
+const DECISION_BROADCAST_CAPACITY: usize = 4096;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -190,13 +195,43 @@ impl DecisionLog {
     }
 
     async fn append(&self, decision: Decision) {
-        self.entries.write().await.push(decision.clone());
-        // Errors only when no receivers are subscribed; that's fine.
+        let mut entries = self.entries.write().await;
+        // Core's `DecisionReceiver` is at-least-once: after a crash + recovery,
+        // `restore_state` may re-deliver decisions for slots already appended,
+        // and multi-Paxos may decide multiple slots concurrently and emit them
+        // out of slot order on the broadcast channel. Sorted-insert with
+        // dedup-by-slot handles both cases. The cluster invariant guarantees
+        // any duplicate slot carries an identical value.
+        match entries.binary_search_by_key(&decision.slot, |d| d.slot) {
+            Ok(_) => {
+                // Already have this slot; skip the broadcast too so live
+                // subscribers don't see redelivered duplicates.
+                return;
+            }
+            Err(pos) => {
+                entries.insert(pos, decision.clone());
+            }
+        }
+        // Drop the write lock before sending so a slow subscriber can't pin
+        // the log under the write lock.
+        drop(entries);
+        // Errors only when no receivers are subscribed; that's fine. Watch
+        // consumers may receive decisions out of slot order — they dedupe and
+        // sort on their side.
         let _ = self.tx.send(decision);
     }
 
     async fn snapshot(&self) -> Vec<Decision> {
         self.entries.read().await.clone()
+    }
+
+    async fn range(&self, start: usize, limit: usize) -> (Vec<Decision>, u64) {
+        let entries = self.entries.read().await;
+        if start >= entries.len() {
+            return (Vec::new(), start as u64);
+        }
+        let end = (start + limit).min(entries.len());
+        (entries[start..end].to_vec(), end as u64)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Decision> {
@@ -302,23 +337,14 @@ impl ConsensusService for ConsensusServiceImpl {
         request: Request<GetDecisionsRequest>,
     ) -> Result<Response<GetDecisionsResponse>, Status> {
         let req = request.into_inner();
-        let start_index = req.start_index as usize;
+        let start_index: usize = req.start_index.try_into().unwrap_or(usize::MAX);
         let limit = req
             .limit
             .filter(|n| *n != 0)
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_GET_LIMIT);
 
-        let entries = self.decisions.entries.read().await;
-        let total = entries.len();
-        let (decisions, next_index) = if start_index >= total {
-            (Vec::new(), start_index as u64)
-        } else {
-            let end = (start_index + limit).min(total);
-            let slice = entries[start_index..end].to_vec();
-            let next = (start_index + slice.len()) as u64;
-            (slice, next)
-        };
+        let (decisions, next_index) = self.decisions.range(start_index, limit).await;
 
         Ok(Response::new(GetDecisionsResponse {
             decisions,

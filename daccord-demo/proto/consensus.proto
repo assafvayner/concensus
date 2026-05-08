@@ -27,7 +27,7 @@ message ProposeRequest {
 }
 message ProposeResponse {
   uint64 slot = 1;
-  bytes payload = 2;  // echo of the decided payload (== request.payload)
+  bytes payload = 2;  // the value that was decided in this slot
 }
 
 message WatchRequest {
