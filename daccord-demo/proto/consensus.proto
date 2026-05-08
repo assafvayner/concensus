@@ -36,7 +36,7 @@ message WatchRequest {
 
 message GetDecisionsRequest {
   uint64 start_index = 1;
-  uint32 limit = 2;        // 0 means "use server default" (e.g. 1000)
+  optional uint32 limit = 2;  // unset = server default (e.g. 1000)
 }
 message GetDecisionsResponse {
   repeated Decision decisions = 1;
