@@ -11,10 +11,7 @@ service ConsensusService {
 message ProposeRequest { string value = 1; }
 message ProposeResponse { string status = 1; }
 
-message GetDecisionsRequest {
-  uint64 start_index = 1;
-  optional uint32 limit = 2;  // unset = server default (e.g. 1000)
-}
+message GetDecisionsRequest {}
 message GetDecisionsResponse { repeated Decision decisions = 1; }
 
 message Decision { uint64 slot = 1; string value = 2; }

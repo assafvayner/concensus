@@ -171,10 +171,7 @@ pub async fn fetch_decisions(addr: &str) -> Result<Vec<(u64, String)>, String> {
         .await
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get_decisions(GetDecisionsRequest {
-            start_index: 0,
-            limit: None,
-        })
+        .get_decisions(GetDecisionsRequest {})
         .await
         .map_err(|e| e.to_string())?;
     Ok(resp

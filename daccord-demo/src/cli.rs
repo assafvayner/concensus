@@ -59,13 +59,7 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        Command::Decisions => match client
-            .get_decisions(GetDecisionsRequest {
-                start_index: 0,
-                limit: None,
-            })
-            .await
-        {
+        Command::Decisions => match client.get_decisions(GetDecisionsRequest {}).await {
             Ok(response) => {
                 let decisions = response.into_inner().decisions;
                 if decisions.is_empty() {
