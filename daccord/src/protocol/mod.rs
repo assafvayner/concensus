@@ -163,7 +163,6 @@ where
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn peek_state(&self) -> crate::protocol::raft::ProtocolSnapshot {
         match self {
             ProtocolImpl::Paxos(p) => p.peek_state(),
