@@ -16,7 +16,7 @@ name = "daccord-cli"
 path = "src/cli.rs"
 
 [dependencies]
-daccord = { path = "../daccord", features = ["tcp-transport", "uds-transport"] }
+daccord = { path = "../daccord", features = ["tcp-transport", "uds-transport", "test-support"] }
 tonic = "0.12"
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
@@ -32,7 +32,7 @@ multi-paxos = ["daccord/multi-paxos"]
 duckdb-bundled = ["daccord/duckdb-bundled"]
 # Exposes in-process test helpers (channel transport + gRPC server wiring) for
 # downstream integration tests. Not used by the production binaries.
-test-support = ["daccord/channel-transport", "daccord/test-support"]
+test-support = ["daccord/channel-transport"]
 
 [build-dependencies]
 tonic-build = "0.12"

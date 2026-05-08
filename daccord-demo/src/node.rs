@@ -160,8 +160,8 @@ async fn start_node_tcp(
 
     let (node, handle, decision_rx) = match (algorithm, data_dir) {
         #[cfg(feature = "duckdb-bundled")]
-        (Algorithm::Paxos, Some(dir)) => Node::paxos(
-            node_name,
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
@@ -169,23 +169,23 @@ async fn start_node_tcp(
                 .expect("failed to open DuckDB Paxos storage"),
         ),
         #[cfg(feature = "duckdb-bundled")]
-        (Algorithm::Raft, Some(dir)) => Node::raft(
-            node_name,
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
             DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
                 .expect("failed to open DuckDB Raft storage"),
         ),
-        (Algorithm::Paxos, _) => Node::paxos(
-            node_name,
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<Vec<u8>>::new(),
         ),
-        (Algorithm::Raft, _) => Node::raft(
-            node_name,
+        (Algorithm::Raft, _) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
@@ -217,8 +217,8 @@ async fn start_node_uds(
 
     let (node, handle, decision_rx) = match (algorithm, data_dir) {
         #[cfg(feature = "duckdb-bundled")]
-        (Algorithm::Paxos, Some(dir)) => Node::paxos(
-            node_name,
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
@@ -226,23 +226,23 @@ async fn start_node_uds(
                 .expect("failed to open DuckDB Paxos storage"),
         ),
         #[cfg(feature = "duckdb-bundled")]
-        (Algorithm::Raft, Some(dir)) => Node::raft(
-            node_name,
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
             DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
                 .expect("failed to open DuckDB Raft storage"),
         ),
-        (Algorithm::Paxos, _) => Node::paxos(
-            node_name,
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
             PaxosMemoryStorage::<Vec<u8>>::new(),
         ),
-        (Algorithm::Raft, _) => Node::raft(
-            node_name,
+        (Algorithm::Raft, _) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
