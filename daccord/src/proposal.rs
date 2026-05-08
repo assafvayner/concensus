@@ -47,8 +47,10 @@ pub(crate) struct Submission<V> {
 /// Adapts a user-supplied [`PaxosStorage<V>`] into a [`PaxosStorage<Pending<V>>`].
 ///
 /// `save_decision` drops the nonce before delegating; `load_decisions`
-/// synthesizes a fresh nonce (which won't match any pending oneshot — the
-/// proposer is presumed gone after restart).
+/// synthesizes `nonce = 0` as the recovered-value sentinel. This cannot
+/// collide with a live proposal because `live_nonce()` in `node.rs` reserves
+/// `nonce = 0` exclusively for recovered values — it retries until it draws
+/// a non-zero value.
 pub(crate) struct PendingPaxosStorage<V, S> {
     inner: S,
     _marker: std::marker::PhantomData<V>,

@@ -175,6 +175,21 @@ impl<V> Drop for PendingMap<V> {
     }
 }
 
+/// Returns a random nonce suitable for a live proposal.
+///
+/// `nonce = 0` is reserved as the sentinel for values recovered from storage,
+/// so live proposals must never use it. This function loops until it draws a
+/// non-zero value; with a 64-bit RNG the loop body runs exactly once with
+/// overwhelming probability.
+fn live_nonce() -> u64 {
+    loop {
+        let n = rand::random::<u64>();
+        if n != 0 {
+            return n;
+        }
+    }
+}
+
 fn initial_state(node_id: NodeId, algorithm: NodeAlgorithm) -> NodeState {
     NodeState {
         node_id,
@@ -646,7 +661,7 @@ where
     /// - [`ProposeError::Cancelled`] — the node shut down before the proposal
     ///   was decided.
     pub async fn propose(&self, value: V) -> Result<Decided<V>, ProposeError> {
-        let nonce = rand::random::<u64>();
+        let nonce = live_nonce();
         let (tx, rx) = oneshot::channel();
         let submission = Submission {
             pending: Pending { nonce, value },
@@ -1122,6 +1137,13 @@ mod tests {
         // Cluster shutdown
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
+    }
+
+    #[test]
+    fn live_nonce_is_never_zero() {
+        for _ in 0..10_000 {
+            assert_ne!(live_nonce(), 0);
+        }
     }
 
     #[test]
