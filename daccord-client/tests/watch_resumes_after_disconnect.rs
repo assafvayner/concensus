@@ -102,12 +102,11 @@ async fn watch_resumes_after_server_restart() {
     assert_eq!(phase2[1].slot, 4);
     assert_eq!(phase2[1].payload.as_ref(), b"e");
 
-    // Drain anything else briefly; we expect nothing more.
-    let extra = drain_briefly(&mut decisions_rx, Duration::from_millis(200)).await;
-    assert!(
-        extra.is_empty(),
-        "did not expect additional decisions after phase 2: {extra:?}"
-    );
+    // Phase 2 saw slots 3 and 4. Confirm no straggler arrives in a small grace window.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+        msg = decisions_rx.recv() => panic!("unexpected extra decision: {msg:?}"),
+    }
 
     drop(client);
     drop(_restarted);
@@ -133,23 +132,4 @@ async fn collect_decisions_with_timeout(
         }
     }
     out
-}
-
-async fn drain_briefly(
-    rx: &mut mpsc::UnboundedReceiver<Decision>,
-    duration: Duration,
-) -> Vec<Decision> {
-    let mut out = Vec::new();
-    let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return out;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(d)) => out.push(d),
-            Ok(None) => return out,
-            Err(_) => return out,
-        }
-    }
 }

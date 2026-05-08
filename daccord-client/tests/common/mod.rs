@@ -13,6 +13,7 @@ use daccord_demo::test_support::{start_in_process_node, InProcessNode};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 /// In-process gRPC server backed by a single-node Paxos cluster over channel
@@ -31,8 +32,13 @@ impl TestServer {
     /// to `127.0.0.1:0` (OS-assigned port).
     pub async fn start() -> Self {
         let node = start_in_process_node("test-node");
-        let (addr, server_task, shutdown) =
-            spawn_server(SocketAddr::from(([127, 0, 0, 1], 0)), &node).await;
+        let (addr, server_task, shutdown) = spawn_server(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            node.handle.clone(),
+            node.decisions.clone(),
+            node.algorithm,
+        )
+        .await;
         Self {
             addr,
             node,
@@ -100,37 +106,43 @@ impl Drop for TestServer {
     }
 }
 
+/// Wrap an already-bound `TcpListener` in a tonic gRPC server, spawn the
+/// serve loop, and return the actual bound address plus task and shutdown
+/// handles. Both `spawn_server` and `restart_server_on_addr` delegate here.
+fn bind_and_serve(
+    listener: TcpListener,
+    handle: daccord::NodeHandle<Vec<u8>>,
+    decisions: Arc<DecisionLog>,
+    algorithm: Algorithm,
+    shutdown: oneshot::Receiver<()>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let local_addr = listener.local_addr().expect("local_addr");
+    let stream = TcpListenerStream::new(listener);
+    let svc = ConsensusServiceImpl::new(handle, decisions, algorithm);
+    let server = Server::builder()
+        .add_service(ConsensusServiceServer::new(svc))
+        .serve_with_incoming_shutdown(stream, async move {
+            let _ = shutdown.await;
+        });
+    let join = tokio::spawn(async move {
+        if let Err(e) = server.await {
+            tracing::error!(error = %e, "test gRPC server error");
+        }
+    });
+    (local_addr, join)
+}
+
 /// Bind the gRPC server to `bind_addr` (use port 0 for OS-assigned), spawn
 /// the serve loop, and return the actual bound address plus shutdown handles.
 async fn spawn_server(
     bind_addr: SocketAddr,
-    node: &InProcessNode,
+    handle: daccord::NodeHandle<Vec<u8>>,
+    decisions: Arc<DecisionLog>,
+    algorithm: Algorithm,
 ) -> (SocketAddr, JoinHandle<()>, oneshot::Sender<()>) {
     let listener = bind_with_retry(bind_addr).await;
-    let addr = listener.local_addr().expect("local_addr");
-    let std_listener = listener.into_std().expect("into_std");
-    std_listener.set_nonblocking(true).expect("set_nonblocking");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(
-        tokio::net::TcpListener::from_std(std_listener).expect("from_std"),
-    );
-
-    let service =
-        ConsensusServiceImpl::new(node.handle.clone(), node.decisions.clone(), node.algorithm);
-    let server = Server::builder().add_service(ConsensusServiceServer::new(service));
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server_task = tokio::spawn(async move {
-        let shutdown = async move {
-            let _ = shutdown_rx.await;
-        };
-        if let Err(e) = server
-            .serve_with_incoming_shutdown(incoming, shutdown)
-            .await
-        {
-            tracing::error!(error = %e, "test gRPC server error");
-        }
-    });
-
+    let (addr, server_task) = bind_and_serve(listener, handle, decisions, algorithm, shutdown_rx);
     (addr, server_task, shutdown_tx)
 }
 
@@ -160,29 +172,10 @@ pub async fn restart_server_on_addr(
     algorithm: Algorithm,
 ) -> RestartedServer {
     let listener = bind_with_retry(addr).await;
-    let bound = listener.local_addr().expect("local_addr");
-    assert_eq!(bound, addr, "rebound to a different address");
-    let std_listener = listener.into_std().expect("into_std");
-    std_listener.set_nonblocking(true).expect("set_nonblocking");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(
-        tokio::net::TcpListener::from_std(std_listener).expect("from_std"),
-    );
-
-    let service = ConsensusServiceImpl::new(handle, decisions, algorithm);
-    let server = Server::builder().add_service(ConsensusServiceServer::new(service));
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server_task = tokio::spawn(async move {
-        let shutdown = async move {
-            let _ = shutdown_rx.await;
-        };
-        if let Err(e) = server
-            .serve_with_incoming_shutdown(incoming, shutdown)
-            .await
-        {
-            tracing::error!(error = %e, "restarted test gRPC server error");
-        }
-    });
+    let (local_addr, server_task) =
+        bind_and_serve(listener, handle, decisions, algorithm, shutdown_rx);
+    assert_eq!(local_addr, addr, "rebound to a different address");
 
     RestartedServer {
         addr,

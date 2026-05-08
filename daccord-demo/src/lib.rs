@@ -6,7 +6,7 @@ pub mod consensus_proto {
 
 pub mod service;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use consensus_proto::consensus_service_client::ConsensusServiceClient;

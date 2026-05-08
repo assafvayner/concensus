@@ -90,9 +90,12 @@ impl DecisionLog {
         // Drop the write lock before sending so a slow subscriber can't pin
         // the log under the write lock.
         drop(entries);
-        // Errors only when no receivers are subscribed; that's fine. Watch
-        // consumers may receive decisions out of slot order — they dedupe and
-        // sort on their side.
+        // FIXME(multi-paxos): in multi-Paxos, decisions can arrive on the broadcast
+        // channel out of slot order. Watch consumers track `last_yielded` monotonically,
+        // so a slot that broadcasts late may be missed. This is safe for single-leader /
+        // Raft but a known gap for multi-Paxos. See the design plan for the mitigation.
+        //
+        // Errors only when no receivers are subscribed; that's fine.
         let _ = self.tx.send(decision);
     }
 
