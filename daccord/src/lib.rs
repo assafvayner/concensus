@@ -58,11 +58,11 @@ pub mod transport;
 pub use config::{NodeId, PaxosConfig, PeerInfo, RaftConfig};
 #[cfg(feature = "duckdb")]
 pub use duckdb_storage::{DuckdbPaxosStorage, DuckdbRaftStorage};
-#[cfg(feature = "redb")]
-pub use redb_storage::{RedbPaxosStorage, RedbRaftStorage};
 pub use error::{NodeError, ProposeError, StorageError, TransportError};
 pub use message::raft::LogEntry;
 pub use node::{Decided, DecisionReceiver, Node, NodeAlgorithm, NodeHandle, NodeRole, NodeState};
+#[cfg(feature = "redb")]
+pub use redb_storage::{RedbPaxosStorage, RedbRaftStorage};
 pub use storage::{PaxosMemoryStorage, PaxosStorage, RaftMemoryStorage, RaftStorage};
 pub use transport::{MessageReceiver, MessageSender};
 

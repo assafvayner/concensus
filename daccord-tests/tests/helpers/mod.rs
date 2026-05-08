@@ -332,10 +332,7 @@ pub fn create_raft_cluster(n: usize) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, daccord::RaftConfig::default())
 }
 
-pub fn create_raft_cluster_with_config(
-    n: usize,
-    config: daccord::RaftConfig,
-) -> Vec<ClusterNode> {
+pub fn create_raft_cluster_with_config(n: usize, config: daccord::RaftConfig) -> Vec<ClusterNode> {
     create_raft_cluster_inner(n, config)
 }
 

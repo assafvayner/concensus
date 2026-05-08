@@ -292,8 +292,7 @@ where
                 (Some(name), Some(inc)) => Ok(Some(NodeId::new(name, inc))),
                 (None, None) => Ok(None),
                 (Some(_), None) | (None, Some(_)) => Err(StorageError::Load(
-                    "raft_meta.voted_for_name and voted_for_incarnation are inconsistent"
-                        .into(),
+                    "raft_meta.voted_for_name and voted_for_incarnation are inconsistent".into(),
                 )),
             }
         })

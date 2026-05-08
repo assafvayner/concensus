@@ -8,10 +8,7 @@ use consensus_proto::consensus_service_client::ConsensusServiceClient;
 use consensus_proto::{GetDecisionsRequest, HealthRequest, ProposeRequest};
 
 #[derive(Parser)]
-#[command(
-    name = "daccord-cli",
-    about = "CLI client for daccord-node gRPC API"
-)]
+#[command(name = "daccord-cli", about = "CLI client for daccord-node gRPC API")]
 struct Cli {
     /// gRPC server address (e.g. http://localhost:50051)
     #[arg(long)]
