@@ -30,6 +30,9 @@ hostname = "0.4"
 [features]
 multi-paxos = ["daccord/multi-paxos"]
 duckdb-bundled = ["daccord/duckdb-bundled"]
+# Exposes in-process test helpers (channel transport + gRPC server wiring) for
+# downstream integration tests. Not used by the production binaries.
+test-support = ["daccord/channel-transport"]
 
 [build-dependencies]
 tonic-build = "0.12"
