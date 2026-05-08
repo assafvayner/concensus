@@ -76,18 +76,18 @@ mod tests {
 
     #[test]
     fn algorithm_parses_known_values() {
-        assert_eq!(Algorithm::from_str("paxos").unwrap(), Algorithm::Paxos);
-        assert_eq!(Algorithm::from_str("raft").unwrap(), Algorithm::Raft);
-        assert!(Algorithm::from_str("zab").is_err());
+        assert_eq!("paxos".parse::<Algorithm>().unwrap(), Algorithm::Paxos);
+        assert_eq!("raft".parse::<Algorithm>().unwrap(), Algorithm::Raft);
+        assert!("zab".parse::<Algorithm>().is_err());
     }
 
     #[test]
     fn role_parses_known_values() {
-        assert_eq!(Role::from_str("follower").unwrap(), Role::Follower);
-        assert_eq!(Role::from_str("candidate").unwrap(), Role::Candidate);
-        assert_eq!(Role::from_str("leader").unwrap(), Role::Leader);
-        assert_eq!(Role::from_str("n/a").unwrap(), Role::NotApplicable);
-        assert!(Role::from_str("dictator").is_err());
+        assert_eq!("follower".parse::<Role>().unwrap(), Role::Follower);
+        assert_eq!("candidate".parse::<Role>().unwrap(), Role::Candidate);
+        assert_eq!("leader".parse::<Role>().unwrap(), Role::Leader);
+        assert_eq!("n/a".parse::<Role>().unwrap(), Role::NotApplicable);
+        assert!("dictator".parse::<Role>().is_err());
     }
 
     #[test]

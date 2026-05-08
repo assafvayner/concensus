@@ -6,7 +6,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::error::Error;
 use crate::proto::consensus_service_client::ConsensusServiceClient;
 use crate::proto::{GetDecisionsRequest, ProposeRequest, StatusRequest, WatchRequest};
-use crate::types::{Algorithm, ClusterStatus, Decision, Role};
+use crate::types::{ClusterStatus, Decision};
 
 const PROPOSE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -67,15 +67,16 @@ impl Client {
             Ok(r) => r,
             Err(status) => match status.code() {
                 tonic::Code::Unavailable => {
-                    tokio::time::sleep(PROPOSE_RETRY_BACKOFF).await;
-                    let next_ep = self.endpoints.get(1).or_else(|| self.endpoints.first());
-                    match next_ep {
-                        Some(ep) => {
-                            let mut alt = Self::connect_single(ep).await?;
-                            alt.propose(tonic::Request::new(req())).await?
-                        }
-                        None => return Err(Error::Rpc(status)),
+                    // Best-effort: if only one endpoint is configured, surfaces
+                    // the original `Unavailable` error rather than retrying
+                    // against the same endpoint.
+                    if self.endpoints.len() < 2 {
+                        return Err(Error::Rpc(status));
                     }
+                    tokio::time::sleep(PROPOSE_RETRY_BACKOFF).await;
+                    let ep = &self.endpoints[1];
+                    let mut alt = Self::connect_single(ep).await?;
+                    alt.propose(tonic::Request::new(req())).await?
                 }
                 tonic::Code::Aborted => {
                     tokio::time::sleep(PROPOSE_RETRY_BACKOFF).await;
@@ -131,8 +132,8 @@ impl Client {
 
         Ok(ClusterStatus {
             node_id: inner.node_id,
-            algorithm: Algorithm::from_str(&inner.algorithm)?,
-            role: Role::from_str(&inner.role)?,
+            algorithm: inner.algorithm.parse()?,
+            role: inner.role.parse()?,
             term: inner.term,
             leader_id,
             log_len: inner.log_len,

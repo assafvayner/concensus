@@ -1,6 +1,8 @@
+use std::str::FromStr;
+
 use bytes::Bytes;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub slot: u64,
     pub payload: Bytes,
@@ -20,7 +22,7 @@ pub enum Role {
     NotApplicable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClusterStatus {
     pub node_id: String,
     pub algorithm: Algorithm,
@@ -32,8 +34,10 @@ pub struct ClusterStatus {
     pub last_applied: Option<u64>,
 }
 
-impl Algorithm {
-    pub(crate) fn from_str(s: &str) -> Result<Self, crate::Error> {
+impl FromStr for Algorithm {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "paxos" => Ok(Algorithm::Paxos),
             "raft" => Ok(Algorithm::Raft),
@@ -44,8 +48,10 @@ impl Algorithm {
     }
 }
 
-impl Role {
-    pub(crate) fn from_str(s: &str) -> Result<Self, crate::Error> {
+impl FromStr for Role {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "follower" => Ok(Role::Follower),
             "candidate" => Ok(Role::Candidate),
