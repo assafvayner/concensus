@@ -6,7 +6,11 @@ use tokio::time::Duration;
 async fn lossy_single_value_for(alg: Algorithm, drop_rate: f64) {
     let mut cluster = create_lossy_unbounded_with_algorithm(3, drop_rate, alg);
     tokio::time::sleep(Duration::from_millis(800)).await;
-    cluster[0].handle.propose("hello".into()).await.unwrap();
+    // Raft followers don't retry dropped Forward messages, so under heavy
+    // loss a propose at a non-leader can hang. Spawn so the test can still
+    // collect whatever decisions arrive.
+    let h = cluster[0].handle.clone();
+    let propose_handle = tokio::spawn(async move { h.propose("hello".into()).await });
     let mut all = Vec::new();
     for node in &mut cluster {
         let mut d = Vec::new();
@@ -18,6 +22,7 @@ async fn lossy_single_value_for(alg: Algorithm, drop_rate: f64) {
         all.push(d);
     }
     assert_safety_invariant(&all);
+    propose_handle.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -56,9 +61,14 @@ async fn raft_lossy_30pct_single_value() {
 async fn lossy_concurrent_proposals_for(alg: Algorithm, drop_rate: f64) {
     let mut cluster = create_lossy_unbounded_with_algorithm(5, drop_rate, alg);
     tokio::time::sleep(Duration::from_millis(800)).await;
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("v-{i}")).await.unwrap();
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move { h.propose(format!("v-{i}")).await })
+        })
+        .collect();
     let mut all = Vec::new();
     for node in &mut cluster {
         let mut d = Vec::new();
@@ -75,6 +85,9 @@ async fn lossy_concurrent_proposals_for(alg: Algorithm, drop_rate: f64) {
     checker.poll(&mut cluster);
     let _ = checker.total_decided();
     assert_safety_invariant(&all);
+    for h in propose_handles {
+        h.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

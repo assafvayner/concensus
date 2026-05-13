@@ -6,11 +6,18 @@ use tokio::time::Duration;
 async fn stress_concurrent_proposals_for(alg: Algorithm) {
     let mut cluster = create_cluster_with_algorithm(3, alg);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    for (i, node) in cluster.iter().enumerate() {
-        for j in 0..50 {
-            node.handle.propose(format!("n{i}-v{j}")).await.unwrap();
-        }
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                for j in 0..50 {
+                    let _ = h.propose(format!("n{i}-v{j}")).await;
+                }
+            })
+        })
+        .collect();
     let mut all = Vec::new();
     for node in &mut cluster {
         let mut d = Vec::new();
@@ -27,6 +34,9 @@ async fn stress_concurrent_proposals_for(alg: Algorithm) {
     checker.poll(&mut cluster);
     let _ = checker.total_decided();
     assert_safety_invariant(&all);
+    for h in propose_handles {
+        h.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

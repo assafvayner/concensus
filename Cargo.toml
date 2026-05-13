@@ -3,5 +3,6 @@ members = [
   "daccord",
   "daccord-tests",
   "daccord-demo",
+  "daccord-client",
 ]
 resolver = "2"

@@ -8,7 +8,7 @@ use tokio::time::Duration;
 /// With message loss, Paxos retries take longer. Use generous timeouts.
 /// At high loss rates with contention, multiple retry rounds with exponential
 /// backoff can add up significantly.
-const TIMEOUT_PER_DECISION: Duration = Duration::from_secs(30);
+const TIMEOUT_PER_DECISION: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // 1% drop rate

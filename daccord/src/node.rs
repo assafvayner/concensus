@@ -1,20 +1,22 @@
 //! Core consensus node and its associated handle types.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{NodeId, PeerInfo};
 use crate::error::{NodeError, ProposeError};
 use crate::message::{Message, WireVariant};
+use crate::proposal::{Pending, PendingPaxosStorage, PendingRaftStorage, Submission};
 use crate::protocol::{Outgoing, PaxosProtocol, ProtocolImpl, SendTarget};
 use crate::storage::{PaxosStorage, RaftStorage};
 use crate::transport::{MessageReceiver, MessageSender};
 
-/// Public mirror of the internal Raft role. Used by the test-support
-/// observability hook [`Node::peek_state`].
+/// Public mirror of the internal Raft role. Exposed via [`NodeHandle::status`]
+/// and [`Node::peek_state`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeRole {
     Follower,
@@ -23,7 +25,7 @@ pub enum NodeRole {
 }
 
 /// Identifies which consensus algorithm a [`Node`] is running. Reported by
-/// [`Node::peek_state`] as part of [`NodeState`].
+/// [`NodeHandle::status`] / [`Node::peek_state`] as part of [`NodeState`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAlgorithm {
     Paxos,
@@ -32,9 +34,9 @@ pub enum NodeAlgorithm {
 
 /// Snapshot of a node's protocol state, for tests and observability.
 ///
-/// Returned by [`Node::peek_state`] (test-support feature only). Fields that
-/// don't apply to the active algorithm carry sentinel values: a Paxos node
-/// always reports `role = None`, `term = 0`, `voted_for = None`.
+/// Returned by [`NodeHandle::status`]. Fields that don't apply to the active
+/// algorithm carry sentinel values: a Paxos node always reports
+/// `role = None`, `term = 0`, `voted_for = None`.
 #[derive(Clone, Debug)]
 pub struct NodeState {
     pub node_id: NodeId,
@@ -50,8 +52,8 @@ pub struct NodeState {
 
 /// Channel receiver for consensus decisions.
 ///
-/// Yields [`Decided`] values in the order they are finalized by the Paxos protocol.
-/// Obtain one from [`Node::paxos`] / [`Node::raft`].
+/// Yields [`Decided`] values in the order they are finalized by the consensus
+/// protocol. Obtain one from [`Node::paxos`] / [`Node::raft`].
 pub type DecisionReceiver<V> = mpsc::Receiver<Decided<V>>;
 
 /// A value that has reached consensus, paired with its slot number.
@@ -80,10 +82,11 @@ pub struct Decided<V> {
 const PROPOSAL_CHANNEL_CAPACITY: usize = 1024;
 const DECISION_CHANNEL_CAPACITY: usize = 1024;
 
-/// A Paxos consensus node.
+/// A consensus node.
 ///
-/// `Node` is the central type in this crate. It runs the Multi-Paxos protocol
-/// over a set of peers using pluggable transport and storage backends.
+/// `Node` is the central type in this crate. It runs a consensus protocol
+/// (Multi-Paxos or Raft) over a set of peers using pluggable transport and
+/// storage backends.
 ///
 /// # Type Parameters
 ///
@@ -102,72 +105,147 @@ const DECISION_CHANNEL_CAPACITY: usize = 1024;
 /// 4. **Consume** decided values from the [`DecisionReceiver`].
 /// 5. **Shut down** by dropping all [`NodeHandle`] clones — the event loop exits
 ///    gracefully once the proposal channel closes.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # use daccord::*;
-/// # async fn example<S: MessageSender + Sync, R: MessageReceiver>(
-/// #     peers: Vec<PeerInfo<S>>, receiver: R,
-/// # ) -> Result<(), Box<dyn std::error::Error>> {
-/// let storage = PaxosMemoryStorage::<String>::new();
-/// let (node, handle, mut decisions) = Node::paxos("my-node", PaxosConfig::default(), peers, receiver, storage);
-///
-/// // Run the event loop
-/// tokio::spawn(async move {
-///     if let Err(e) = node.run().await {
-///         eprintln!("node error: {e}");
-///     }
-/// });
-///
-/// // Propose a value
-/// handle.propose("hello".into()).await?;
-///
-/// // Wait for the decision
-/// if let Some(decided) = decisions.recv().await {
-///     println!("slot {}: {}", decided.slot, decided.value);
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// # Single-Node Mode
-///
-/// When constructed with an empty peer list, the node acts as a single-node
-/// cluster. Multi-Paxos decides values as soon as the leader proposes. Raft
-/// starts in term 0; the event loop runs periodic ticks so the peer can complete
-/// its one-vote election before replication commits with quorum 1.
 pub struct Node<V, S: MessageSender, R: MessageReceiver> {
     node_id: NodeId,
     peers: Vec<PeerInfo<S>>,
     receiver: Option<R>,
-    protocol: ProtocolImpl<V>,
-    proposal_rx: mpsc::Receiver<V>,
+    protocol: ProtocolImpl<Pending<V>>,
+    proposal_rx: mpsc::Receiver<Submission<V>>,
     decision_tx: mpsc::Sender<Decided<V>>,
+    state_tx: Arc<watch::Sender<NodeState>>,
+    algorithm: NodeAlgorithm,
 }
 
 /// A cloneable handle for submitting proposals to a running [`Node`].
 ///
 /// Obtain a `NodeHandle` from [`Node::paxos`] / [`Node::raft`]. Cloning is
-/// cheap (wraps a tokio mpsc sender) and allows multiple producers to submit
-/// proposals concurrently.
+/// cheap (wraps a tokio mpsc sender + a watch receiver) and allows multiple
+/// producers to submit proposals concurrently.
 ///
 /// The node shuts down gracefully when all `NodeHandle` clones are dropped.
 pub struct NodeHandle<V> {
-    proposal_tx: mpsc::Sender<V>,
+    proposal_tx: mpsc::Sender<Submission<V>>,
+    state_rx: watch::Receiver<NodeState>,
 }
 
 impl<V> Clone for NodeHandle<V> {
     fn clone(&self) -> Self {
         Self {
             proposal_tx: self.proposal_tx.clone(),
+            state_rx: self.state_rx.clone(),
         }
+    }
+}
+
+/// Holds outstanding proposal completion senders, firing
+/// [`ProposeError::Cancelled`] on every remaining oneshot when dropped.
+///
+/// Wrapping the pending map in a guard ensures cancellation fires on panic-
+/// induced unwind as well as normal shutdown.
+struct PendingEntry<V> {
+    value: V,
+    completion: oneshot::Sender<Result<Decided<V>, ProposeError>>,
+}
+
+struct PendingMap<V> {
+    inner: HashMap<u64, PendingEntry<V>>,
+}
+
+impl<V> PendingMap<V> {
+    fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        pending: Pending<V>,
+        tx: oneshot::Sender<Result<Decided<V>, ProposeError>>,
+    ) {
+        self.inner.insert(
+            pending.nonce,
+            PendingEntry {
+                value: pending.value,
+                completion: tx,
+            },
+        );
+    }
+
+    fn remove_for_decision(
+        &mut self,
+        nonce: u64,
+        value: &V,
+    ) -> Option<oneshot::Sender<Result<Decided<V>, ProposeError>>>
+    where
+        V: PartialEq,
+    {
+        if nonce != 0 {
+            return self.inner.remove(&nonce).map(|entry| entry.completion);
+        }
+
+        // A recovered Raft log entry has the synthetic nonce 0 because durable
+        // storage only persists user values. Match one outstanding live proposal
+        // by value so callers do not hang after leader restart.
+        let matching_nonce = self.inner.iter().find_map(|(candidate_nonce, entry)| {
+            (entry.value == *value).then_some(*candidate_nonce)
+        });
+        matching_nonce.and_then(|candidate_nonce| {
+            self.inner
+                .remove(&candidate_nonce)
+                .map(|entry| entry.completion)
+        })
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<V> Drop for PendingMap<V> {
+    fn drop(&mut self) {
+        for (_, entry) in self.inner.drain() {
+            let _ = entry.completion.send(Err(ProposeError::Cancelled));
+        }
+    }
+}
+
+/// Returns a random nonce suitable for a live proposal.
+///
+/// `nonce = 0` is reserved as the sentinel for values recovered from storage,
+/// so live proposals must never use it. This function loops until it draws a
+/// non-zero value; with a 64-bit RNG the loop body runs exactly once with
+/// overwhelming probability.
+fn live_nonce() -> u64 {
+    loop {
+        let n = rand::random::<u64>();
+        if n != 0 {
+            return n;
+        }
+    }
+}
+
+fn initial_state(node_id: NodeId, algorithm: NodeAlgorithm) -> NodeState {
+    NodeState {
+        node_id,
+        algorithm,
+        role: match algorithm {
+            NodeAlgorithm::Raft => Some(NodeRole::Follower),
+            NodeAlgorithm::Paxos => None,
+        },
+        term: 0,
+        leader: None,
+        voted_for: None,
+        log_len: 0,
+        commit_index: None,
+        last_applied: None,
     }
 }
 
 impl<V, S, R> Node<V, S, R>
 where
-    V: Serialize + DeserializeOwned + Clone + Send + PartialEq + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + PartialEq + 'static,
     S: MessageSender,
     R: MessageReceiver,
 {
@@ -222,14 +300,18 @@ where
         storage: impl PaxosStorage<V> + 'static,
     ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
+        let adapted = PendingPaxosStorage::<V, _>::new(storage);
         let protocol = ProtocolImpl::Paxos(PaxosProtocol::new_with_config(
             node_id.clone(),
             total_nodes,
             config,
-            Box::new(storage),
+            Box::new(adapted),
         ));
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
+        let initial = initial_state(node_id.clone(), NodeAlgorithm::Paxos);
+        let (state_tx, state_rx) = watch::channel(initial);
+        let state_tx = Arc::new(state_tx);
 
         let node = Self {
             node_id,
@@ -238,9 +320,18 @@ where
             protocol,
             proposal_rx,
             decision_tx,
+            state_tx,
+            algorithm: NodeAlgorithm::Paxos,
         };
 
-        (node, NodeHandle { proposal_tx }, decision_rx)
+        (
+            node,
+            NodeHandle {
+                proposal_tx,
+                state_rx,
+            },
+            decision_rx,
+        )
     }
 
     /// Creates a Raft consensus node with an auto-generated [`NodeId`].
@@ -255,10 +346,7 @@ where
         peers: Vec<PeerInfo<S>>,
         receiver: R,
         storage: impl RaftStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
-    where
-        V: Sync,
-    {
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let incarnation = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
@@ -277,10 +365,7 @@ where
         peers: Vec<PeerInfo<S>>,
         receiver: R,
         storage: impl RaftStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
-    where
-        V: Sync,
-    {
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         Self::raft_with_id_inner(node_id, config, peers, receiver, storage)
     }
 
@@ -290,19 +375,20 @@ where
         peers: Vec<PeerInfo<S>>,
         receiver: R,
         storage: impl RaftStorage<V> + 'static,
-    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>)
-    where
-        V: Sync,
-    {
+    ) -> (Self, NodeHandle<V>, DecisionReceiver<V>) {
         let total_nodes = peers.len() + 1;
+        let adapted = PendingRaftStorage::<V, _>::new(storage);
         let protocol = ProtocolImpl::Raft(crate::protocol::RaftProtocol::new(
             node_id.clone(),
             total_nodes,
             config,
-            Box::new(storage),
+            Box::new(adapted),
         ));
         let (proposal_tx, proposal_rx) = mpsc::channel(PROPOSAL_CHANNEL_CAPACITY);
         let (decision_tx, decision_rx) = mpsc::channel(DECISION_CHANNEL_CAPACITY);
+        let initial = initial_state(node_id.clone(), NodeAlgorithm::Raft);
+        let (state_tx, state_rx) = watch::channel(initial);
+        let state_tx = Arc::new(state_tx);
         let node = Self {
             node_id,
             peers,
@@ -310,26 +396,33 @@ where
             protocol,
             proposal_rx,
             decision_tx,
+            state_tx,
+            algorithm: NodeAlgorithm::Raft,
         };
-        (node, NodeHandle { proposal_tx }, decision_rx)
+        (
+            node,
+            NodeHandle {
+                proposal_tx,
+                state_rx,
+            },
+            decision_rx,
+        )
     }
 
-    /// Test-only snapshot of the node's current protocol state.
+    /// Snapshot of the node's current protocol state.
     ///
-    /// Useful for integration tests that need to observe per-node state
-    /// (current term, role, log length, commit index) without coupling to
-    /// internal types. Returns sentinel values for fields that don't apply
-    /// to the active algorithm (Paxos always reports `role = None`).
+    /// Backwards-compat thin wrapper around the watch-channel state. Tests may
+    /// also poll [`NodeHandle::status`] for the same information.
     #[cfg(any(test, feature = "test-support"))]
     pub fn peek_state(&self) -> NodeState {
+        self.compute_state()
+    }
+
+    fn compute_state(&self) -> NodeState {
         let snap = self.protocol.peek_state();
-        let algorithm = match &self.protocol {
-            crate::protocol::ProtocolImpl::Paxos(_) => NodeAlgorithm::Paxos,
-            crate::protocol::ProtocolImpl::Raft(_) => NodeAlgorithm::Raft,
-        };
         NodeState {
             node_id: self.node_id.clone(),
-            algorithm,
+            algorithm: self.algorithm,
             role: snap.role,
             term: snap.term,
             leader: snap.leader,
@@ -340,19 +433,26 @@ where
         }
     }
 
-    /// Runs the Paxos event loop until shutdown or fatal error.
+    fn publish_state(&self) {
+        let new_state = self.compute_state();
+        self.state_tx.send_replace(new_state);
+    }
+
+    /// Runs the consensus event loop until shutdown or fatal error.
     ///
     /// This method consumes the `Node` and drives the consensus protocol:
     /// - Loads previously decided values from storage
     /// - Listens for proposals via the internal channel (from [`NodeHandle`])
-    /// - Processes incoming Paxos messages from peers
+    /// - Processes incoming messages from peers
     /// - Periodically retries stalled proposals with exponential backoff
     /// - Re-broadcasts recent decisions so late peers can catch up
     ///
     /// # Shutdown
     ///
     /// The event loop exits when all [`NodeHandle`] clones are dropped (the
-    /// proposal channel closes). It returns `Ok(())` in this case.
+    /// proposal channel closes). It returns `Ok(())` in this case. Any
+    /// proposals still pending at shutdown have their oneshots fired with
+    /// [`ProposeError::Cancelled`] via the [`PendingMap`] drop guard.
     ///
     /// # Errors
     ///
@@ -363,6 +463,7 @@ where
         tracing::info!(node_id = %self.node_id, "node starting");
 
         self.protocol.recover().await.map_err(NodeError::Storage)?;
+        self.publish_state();
 
         // Build senders list
         let mut senders: Vec<(NodeId, S)> = Vec::new();
@@ -383,18 +484,20 @@ where
         let mut retry_interval = tokio::time::interval(std::time::Duration::from_millis(50));
         retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Track whether the receiver is still usable. On a transport error we
-        // either bail with NoQuorum (when we still need replies to make
-        // progress) or stop polling it — re-polling a closed receiver returns
-        // synchronously and would busy-loop the select!.
+        // Track whether the receiver is still usable.
         let mut receiver_alive = has_peers;
+
+        // Pending proposal completions, keyed by nonce. Wrapped in a guard so
+        // every outstanding oneshot is fired with `Cancelled` on panic-induced
+        // unwind as well as normal shutdown.
+        let mut pending: PendingMap<V> = PendingMap::new();
 
         loop {
             if receiver_alive {
                 tokio::select! {
                     proposal = self.proposal_rx.recv() => {
                         match proposal {
-                            Some(value) => self.handle_proposal(value, &senders).await?,
+                            Some(submission) => self.handle_submission(submission, &mut pending, &senders).await?,
                             None => {
                                 tracing::info!("all proposal handles dropped, shutting down");
                                 return Ok(());
@@ -404,7 +507,7 @@ where
                     result = receiver.recv() => {
                         match result {
                             Ok(data) => {
-                                self.handle_incoming_bytes(&data, &senders).await?;
+                                self.handle_incoming_bytes(&data, &mut pending, &senders).await?;
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "receiver error");
@@ -416,17 +519,14 @@ where
                         }
                     }
                     _ = retry_interval.tick() => {
-                        self.handle_retries(&senders).await?;
+                        self.handle_retries(&mut pending, &senders).await?;
                     }
                 }
             } else {
-                // No (or no-longer-usable) receiver. Still run `on_tick` so
-                // Raft can complete an initial election and send leader
-                // heartbeats; Paxos uses ticks for its leader-side timers.
                 tokio::select! {
                     proposal = self.proposal_rx.recv() => {
                         match proposal {
-                            Some(value) => self.handle_proposal(value, &senders).await?,
+                            Some(submission) => self.handle_submission(submission, &mut pending, &senders).await?,
                             None => {
                                 tracing::info!("all proposal handles dropped, shutting down");
                                 return Ok(());
@@ -434,34 +534,42 @@ where
                         }
                     }
                     _ = retry_interval.tick() => {
-                        self.handle_retries(&senders).await?;
+                        self.handle_retries(&mut pending, &senders).await?;
                     }
                 }
             }
         }
     }
 
-    async fn handle_proposal(
+    async fn handle_submission(
         &mut self,
-        value: V,
+        submission: Submission<V>,
+        pending: &mut PendingMap<V>,
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
-        let outgoing = self.protocol.propose(value);
+        let Submission {
+            pending: pending_value,
+            completion,
+        } = submission;
+        pending.insert(pending_value.clone(), completion);
+        let outgoing = self.protocol.propose(pending_value);
         self.protocol
             .flush_persist()
             .await
             .map_err(NodeError::Storage)?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-        self.process_decisions().await?;
+        self.process_decisions(pending).await?;
+        self.publish_state();
         Ok(())
     }
 
     async fn handle_incoming_bytes(
         &mut self,
         data: &[u8],
+        pending: &mut PendingMap<V>,
         senders: &[(NodeId, S)],
     ) -> Result<(), NodeError> {
-        match Message::<V>::from_bytes(data) {
+        match Message::<Pending<V>>::from_bytes(data) {
             Ok(msg) => {
                 let from = msg.sender;
                 let outgoing = self.protocol.handle_wire_message(from, msg.variant);
@@ -470,7 +578,7 @@ where
                     .await
                     .map_err(NodeError::Storage)?;
                 Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-                self.process_decisions().await?;
+                self.process_decisions(pending).await?;
 
                 // Re-propose any lost proposals
                 let lost = self.protocol.take_lost_proposals();
@@ -481,8 +589,9 @@ where
                         .await
                         .map_err(NodeError::Storage)?;
                     Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-                    self.process_decisions().await?;
+                    self.process_decisions(pending).await?;
                 }
+                self.publish_state();
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to deserialize message");
@@ -491,20 +600,25 @@ where
         Ok(())
     }
 
-    async fn handle_retries(&mut self, senders: &[(NodeId, S)]) -> Result<(), NodeError> {
+    async fn handle_retries(
+        &mut self,
+        pending: &mut PendingMap<V>,
+        senders: &[(NodeId, S)],
+    ) -> Result<(), NodeError> {
         let outgoing = self.protocol.on_tick(Instant::now());
         self.protocol
             .flush_persist()
             .await
             .map_err(NodeError::Storage)?;
         Self::send_outgoing(&self.node_id, &outgoing, senders).await;
-        self.process_decisions().await?;
+        self.process_decisions(pending).await?;
+        self.publish_state();
         Ok(())
     }
 
     async fn send_outgoing(
         node_id: &NodeId,
-        outgoing: &[Outgoing<WireVariant<V>>],
+        outgoing: &[Outgoing<WireVariant<Pending<V>>>],
         senders: &[(NodeId, S)],
     ) {
         for out in outgoing {
@@ -534,25 +648,39 @@ where
         }
     }
 
-    async fn process_decisions(&mut self) -> Result<(), NodeError> {
+    async fn process_decisions(&mut self, pending: &mut PendingMap<V>) -> Result<(), NodeError> {
         let decisions = self
             .protocol
             .drain_decisions()
             .await
             .map_err(NodeError::Storage)?;
-        for decision in &decisions {
-            tracing::info!(slot = decision.slot, "value decided");
+        for decision in decisions {
+            let slot = decision.slot;
+            let Pending { nonce, value } = decision.value;
+            tracing::info!(slot, "value decided");
 
-            if self
-                .decision_tx
-                .send(Decided {
-                    slot: decision.slot,
-                    value: decision.value.clone(),
-                })
-                .await
-                .is_err()
-            {
-                tracing::warn!("decision receiver dropped, decisions will not be delivered");
+            let public = Decided {
+                slot,
+                value: value.clone(),
+            };
+
+            if let Some(tx) = pending.remove_for_decision(nonce, &value) {
+                // The receiver may have been dropped (caller no longer cares),
+                // in which case the send simply fails — that's fine.
+                let _ = tx.send(Ok(public.clone()));
+            }
+
+            match self.decision_tx.try_send(public) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        slot,
+                        "decision receiver lagged behind; dropping public decision delivery"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("decision receiver dropped, decisions will not be delivered");
+                }
             }
         }
 
@@ -564,25 +692,46 @@ impl<V> NodeHandle<V>
 where
     V: Serialize + DeserializeOwned + Clone + Send + 'static,
 {
-    /// Submit a value for consensus.
+    /// Submit a value for consensus and await its commit.
     ///
-    /// The value is enqueued for the node's event loop to process. It will
-    /// eventually be assigned a slot and decided by the cluster, or
-    /// re-proposed if another value wins the slot.
-    ///
-    /// This method uses non-blocking `try_send` semantics internally, so it
-    /// returns immediately.
+    /// Returns when the value has been decided by the cluster or an error
+    /// prevents progress. The returned [`Decided`] carries the slot the value
+    /// was assigned and (currently) the original value passed in.
     ///
     /// # Errors
     ///
     /// - [`ProposeError::ChannelFull`] — the internal proposal queue (capacity
     ///   1024) is full. Back off and retry.
     /// - [`ProposeError::NotRunning`] — the node's event loop has stopped.
-    pub async fn propose(&self, value: V) -> Result<(), ProposeError> {
-        self.proposal_tx.try_send(value).map_err(|e| match e {
+    /// - [`ProposeError::Cancelled`] — the node shut down before the proposal
+    ///   was decided.
+    pub async fn propose(&self, value: V) -> Result<Decided<V>, ProposeError> {
+        let nonce = live_nonce();
+        let (tx, rx) = oneshot::channel();
+        let submission = Submission {
+            pending: Pending { nonce, value },
+            completion: tx,
+        };
+        self.proposal_tx.try_send(submission).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => ProposeError::ChannelFull,
             mpsc::error::TrySendError::Closed(_) => ProposeError::NotRunning,
-        })
+        })?;
+        match rx.await {
+            Ok(result) => result,
+            // The event-loop dropped the sender without firing it (e.g., panic
+            // in the loop that bypassed the PendingMap drop guard). Surface as
+            // Cancelled so callers don't wait forever.
+            Err(_) => Err(ProposeError::Cancelled),
+        }
+    }
+
+    /// Returns the latest observed [`NodeState`] for this node.
+    ///
+    /// The returned snapshot is updated every time the event loop processes a
+    /// proposal, an incoming message, or a periodic tick. May briefly lag the
+    /// truly-current protocol state by one event-loop iteration.
+    pub fn status(&self) -> NodeState {
+        self.state_rx.borrow().clone()
     }
 }
 
@@ -662,6 +811,8 @@ mod tests {
     #[tokio::test]
     async fn propose_returns_channel_full_when_full() {
         use crate::config::PaxosConfig;
+        // Construct a node but never spawn the event loop, so the proposal
+        // channel fills up and stays full.
         let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos(
             "test-node",
             PaxosConfig::default(),
@@ -669,13 +820,226 @@ mod tests {
             DummyReceiver,
             PaxosMemoryStorage::new(),
         );
-        // Fill the channel (capacity 1024)
         for i in 0..1024 {
-            handle.propose(format!("msg-{}", i)).await.unwrap();
+            let h = handle.clone();
+            // Spawn so the await on the oneshot doesn't block this test —
+            // we only care that try_send succeeds. The spawned future lives
+            // forever (no event loop) but the test doesn't wait on it.
+            tokio::spawn(async move {
+                let _ = h.propose(format!("msg-{}", i)).await;
+            });
+            tokio::task::yield_now().await;
         }
-        // Next one should fail
+        // Give spawned tasks a moment to enqueue.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The next propose should be rejected with ChannelFull.
         let result = handle.propose("overflow".to_string()).await;
         assert!(matches!(result, Err(ProposeError::ChannelFull)));
+    }
+
+    #[tokio::test]
+    async fn propose_channel_full() {
+        // Distinct test: fill the proposal channel without spawning the event
+        // loop and assert ChannelFull. Mirrors the test above but uses the
+        // explicit name from the task plan.
+        use crate::config::PaxosConfig;
+        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos(
+            "test-node",
+            PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        for i in 0..1024 {
+            let h = handle.clone();
+            tokio::spawn(async move {
+                let _ = h.propose(format!("msg-{}", i)).await;
+            });
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let result = handle.propose("overflow".to_string()).await;
+        assert!(matches!(result, Err(ProposeError::ChannelFull)));
+    }
+
+    #[tokio::test]
+    async fn propose_returns_decided_value() {
+        use crate::config::PaxosConfig;
+        let (node, handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
+            "solo",
+            PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        let _run_handle = tokio::spawn(node.run());
+
+        let decided = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle.propose("hello".to_string()),
+        )
+        .await
+        .expect("timed out waiting for propose to resolve")
+        .expect("propose returned an error");
+
+        assert_eq!(decided.slot, 0);
+        assert_eq!(decided.value, "hello");
+    }
+
+    #[tokio::test]
+    async fn propose_resolves_when_decision_receiver_is_full() {
+        use crate::config::PaxosConfig;
+
+        let (node, handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
+            "solo",
+            PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+
+        for i in 0..=DECISION_CHANNEL_CAPACITY {
+            let decided = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle.propose(format!("v-{i}")),
+            )
+            .await
+            .expect("proposal should resolve even when DecisionReceiver is full")
+            .expect("proposal should decide");
+            assert_eq!(decided.slot, i as u64);
+        }
+
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
+    }
+
+    #[tokio::test]
+    async fn propose_cancelled_on_drop() {
+        use crate::config::PaxosConfig;
+        // Build a Paxos node with a single peer it can never reach: any
+        // proposal needs 2-of-2 quorum so it will sit pending. The receiver
+        // blocks forever. We spawn the event loop, kick off a propose, then
+        // abort the run task so the Node (and its PendingMap drop guard) is
+        // dropped while the proposal is still pending.
+        let peer_id = NodeId::new("never", 1);
+        let (node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::paxos_with_id(
+            NodeId::new("solo", 1),
+            PaxosConfig::default(),
+            vec![PeerInfo {
+                id: peer_id,
+                sender: DummySender,
+            }],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+
+        // Spawn the propose. The future will sit awaiting the oneshot until
+        // the PendingMap drop guard fires Cancelled.
+        let h = handle.clone();
+        let propose_handle =
+            tokio::spawn(async move { h.propose("never-decides".to_string()).await });
+
+        // Give the event loop a moment to register the proposal.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Aborting the run task drops the Node (and the PendingMap inside),
+        // which fires Cancelled on every outstanding oneshot.
+        run_handle.abort();
+        let _ = run_handle.await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), propose_handle)
+            .await
+            .expect("propose did not resolve")
+            .expect("task panicked");
+        assert!(matches!(result, Err(ProposeError::Cancelled)));
+
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn pending_does_not_leak() {
+        use crate::config::PaxosConfig;
+        // Single-node Paxos: every proposal commits immediately, so the
+        // pending map should always end up empty after process_decisions
+        // resolves the oneshot. We can't directly inspect the pending map from
+        // outside the loop, but we can use a stand-in: drive several proposals
+        // in sequence and make sure each completes successfully.
+        let (node, handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
+            "solo",
+            PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        let _run_handle = tokio::spawn(node.run());
+
+        for i in 0..5 {
+            let decided = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle.propose(format!("v-{}", i)),
+            )
+            .await
+            .expect("timed out")
+            .expect("propose error");
+            assert_eq!(decided.slot, i as u64);
+            assert_eq!(decided.value, format!("v-{}", i));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_map_drop_fires_cancelled() {
+        // White-box: dropping the PendingMap directly should send Cancelled
+        // on every contained oneshot.
+        let mut pending: PendingMap<String> = PendingMap::new();
+        let (tx0, rx0) = oneshot::channel();
+        let (tx1, rx1) = oneshot::channel();
+        pending.insert(
+            Pending {
+                nonce: 1,
+                value: "a".to_string(),
+            },
+            tx0,
+        );
+        pending.insert(
+            Pending {
+                nonce: 2,
+                value: "b".to_string(),
+            },
+            tx1,
+        );
+        assert_eq!(pending.len(), 2);
+        drop(pending);
+        assert!(matches!(rx0.await.unwrap(), Err(ProposeError::Cancelled)));
+        assert!(matches!(rx1.await.unwrap(), Err(ProposeError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn pending_map_matches_recovered_nonce_by_value() {
+        let mut pending: PendingMap<String> = PendingMap::new();
+        let (tx, rx) = oneshot::channel();
+        pending.insert(
+            Pending {
+                nonce: 42,
+                value: "recovered".to_string(),
+            },
+            tx,
+        );
+
+        let tx = pending
+            .remove_for_decision(0, &"recovered".to_string())
+            .expect("synthetic recovered nonce should match by value");
+        tx.send(Ok(Decided {
+            slot: 7,
+            value: "recovered".to_string(),
+        }))
+        .expect("receiver should still be open");
+
+        let decided = rx.await.unwrap().unwrap();
+        assert_eq!(decided.slot, 7);
+        assert_eq!(decided.value, "recovered");
+        assert_eq!(pending.len(), 0);
     }
 
     #[tokio::test]
@@ -691,15 +1055,18 @@ mod tests {
 
         let run_handle = tokio::spawn(node.run());
 
-        handle.propose("hello".to_string()).await.unwrap();
-
-        let decided = tokio::time::timeout(std::time::Duration::from_secs(1), decision_rx.recv())
-            .await
-            .expect("timed out")
-            .expect("channel closed");
-
+        let decided = handle.propose("hello".to_string()).await.unwrap();
         assert_eq!(decided.slot, 0);
         assert_eq!(decided.value, "hello");
+
+        let from_channel =
+            tokio::time::timeout(std::time::Duration::from_secs(1), decision_rx.recv())
+                .await
+                .expect("timed out")
+                .expect("channel closed");
+
+        assert_eq!(from_channel.slot, 0);
+        assert_eq!(from_channel.value, "hello");
 
         drop(handle);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
@@ -837,7 +1204,7 @@ mod tests {
             }
         }
 
-        let raft_msg: Message<String> = Message {
+        let raft_msg: Message<Pending<String>> = Message {
             sender: NodeId::new("attacker", 1),
             variant: WireVariant::Raft(RaftMessage::RequestVote {
                 term: 99,
@@ -885,6 +1252,13 @@ mod tests {
     }
 
     #[test]
+    fn live_nonce_is_never_zero() {
+        for _ in 0..10_000 {
+            assert_ne!(live_nonce(), 0);
+        }
+    }
+
+    #[test]
     fn node_state_is_constructible() {
         let s = NodeState {
             node_id: NodeId::new("a", 1),
@@ -916,6 +1290,24 @@ mod tests {
         assert_eq!(s.node_id, id);
         assert_eq!(s.algorithm, NodeAlgorithm::Raft);
         // Before `run()`, Raft is a follower at term 0 (paper-aligned bootstrap).
+        assert_eq!(s.term, 0);
+        assert!(matches!(s.role, Some(NodeRole::Follower)));
+    }
+
+    #[tokio::test]
+    async fn node_handle_status_returns_initial_state() {
+        use crate::config::RaftConfig;
+        let id = NodeId::new("solo", 1);
+        let (_node, handle, _rx) = Node::<String, DummySender, DummyReceiver>::raft_with_id(
+            id.clone(),
+            RaftConfig::default(),
+            vec![],
+            DummyReceiver,
+            RaftMemoryStorage::new(),
+        );
+        let s = handle.status();
+        assert_eq!(s.node_id, id);
+        assert_eq!(s.algorithm, NodeAlgorithm::Raft);
         assert_eq!(s.term, 0);
         assert!(matches!(s.role, Some(NodeRole::Follower)));
     }

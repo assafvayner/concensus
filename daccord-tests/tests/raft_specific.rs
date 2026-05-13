@@ -18,9 +18,17 @@ async fn detect_active_leader_index(cluster: &mut [ClusterNode]) -> Option<usize
             .unwrap()
             .as_nanos()
     );
-    for node in cluster.iter() {
-        let _ = node.handle.propose(probe.clone()).await;
-    }
+    // Spawn so probes run in parallel; whichever node is leader will commit
+    // fastest. The propose futures may not complete on minority/lossy nodes;
+    // we abort all of them after detection.
+    let probe_handles: Vec<_> = cluster
+        .iter()
+        .map(|node| {
+            let h = node.handle.clone();
+            let p = probe.clone();
+            tokio::spawn(async move { h.propose(p).await })
+        })
+        .collect();
     // Race the per-node decision recv timeouts.
     let mut futs: Vec<_> = cluster
         .iter_mut()
@@ -32,14 +40,19 @@ async fn detect_active_leader_index(cluster: &mut [ClusterNode]) -> Option<usize
             })
         })
         .collect();
+    let mut found = None;
     while !futs.is_empty() {
         let (result, _, remaining) = futures::future::select_all(futs).await;
         if result.1 {
-            return Some(result.0);
+            found = Some(result.0);
+            break;
         }
         futs = remaining;
     }
-    None
+    for h in probe_handles {
+        h.abort();
+    }
+    found
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -114,13 +127,16 @@ async fn network_partition_majority_progresses() {
         majority_decisions.push(d);
     }
 
-    // Minority side cannot commit (no quorum). Try to propose; expect no decision.
-    cluster[3].handle.propose("minority".into()).await.unwrap();
+    // Minority side cannot commit (no quorum). Spawn the propose so the test
+    // doesn't block on the never-arriving commit.
+    let minority_h = cluster[3].handle.clone();
+    let minority_propose = tokio::spawn(async move { minority_h.propose("minority".into()).await });
     let res = tokio::time::timeout(Duration::from_secs(2), cluster[3].decisions.recv()).await;
     assert!(
         res.is_err() || res.ok().flatten().is_none(),
         "minority must not decide while partitioned"
     );
+    minority_propose.abort();
 
     // Heal.
     for from in &group_a {
@@ -165,14 +181,15 @@ async fn partition_minority_leader_steps_down() {
     // Wait for the majority to elect a new leader and commit fresh values.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let mut majority_committed_one = false;
-    for (i, node) in cluster.iter().enumerate() {
-        if node.id == leader_id {
-            continue;
-        }
-        if (node.handle.propose(format!("post-iso-{i}")).await).is_ok() {
-            // ok
-        }
-    }
+    let post_iso_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.id != leader_id)
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move { h.propose(format!("post-iso-{i}")).await })
+        })
+        .collect();
     tokio::time::sleep(Duration::from_millis(800)).await;
     for (i, node) in cluster.iter_mut().enumerate() {
         if node.id == leader_id {
@@ -190,6 +207,9 @@ async fn partition_minority_leader_steps_down() {
         majority_committed_one,
         "majority must commit while leader is isolated"
     );
+    for h in post_iso_handles {
+        h.abort();
+    }
 
     // Heal.
     for other in &other_ids {
@@ -242,9 +262,13 @@ async fn election_livelock_resolves() {
     // leader long enough to commit. We retry until the global deadline.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut got_decision = false;
+    let mut spawned: Vec<tokio::task::JoinHandle<_>> = Vec::new();
     while tokio::time::Instant::now() < deadline {
         for node in &cluster {
-            let _ = node.handle.propose("after-livelock".into()).await;
+            let h = node.handle.clone();
+            spawned.push(tokio::spawn(async move {
+                let _ = h.propose("after-livelock".into()).await;
+            }));
         }
         // Race a short timeout across all nodes.
         let mut futs: Vec<_> = cluster
@@ -275,6 +299,9 @@ async fn election_livelock_resolves() {
         got_decision,
         "cluster must settle on a leader and decide within 30s"
     );
+    for h in spawned {
+        h.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -286,6 +313,7 @@ async fn leader_completeness_under_churn() {
     let mut checker = RaftClusterInvariantChecker::new(cluster.len());
     let mut counter = 0u32;
     let mut killed: Vec<usize> = Vec::new();
+    let mut churn_proposes: Vec<tokio::task::JoinHandle<_>> = Vec::new();
     for round in 0..3 {
         let leader_idx = match detect_active_leader_index(&mut cluster).await {
             Some(i) if !killed.contains(&i) => i,
@@ -296,16 +324,20 @@ async fn leader_completeness_under_churn() {
         };
         for _ in 0..5 {
             counter += 1;
-            let _ = cluster[leader_idx]
-                .handle
-                .propose(format!("round-{round}-v-{counter}"))
-                .await;
+            let h = cluster[leader_idx].handle.clone();
+            let value = format!("round-{round}-v-{counter}");
+            churn_proposes.push(tokio::spawn(async move {
+                let _ = h.propose(value).await;
+            }));
         }
         tokio::time::sleep(Duration::from_millis(800)).await;
         checker.poll(&mut cluster);
         cluster[leader_idx].run_handle.abort();
         killed.push(leader_idx);
         tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    for h in churn_proposes {
+        h.abort();
     }
 
     // Drain remaining decisions across all surviving nodes; assert safety.

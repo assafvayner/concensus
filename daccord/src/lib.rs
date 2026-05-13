@@ -49,6 +49,7 @@ pub mod duckdb_storage;
 pub mod error;
 pub(crate) mod message;
 pub mod node;
+pub(crate) mod proposal;
 pub(crate) mod protocol;
 #[cfg(feature = "redb")]
 pub mod redb_storage;

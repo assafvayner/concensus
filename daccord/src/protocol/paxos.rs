@@ -32,6 +32,22 @@ struct ForwardedProposal<V> {
     value: V,
 }
 
+/// Per-election state collected by a candidate while gathering PromiseLeader
+/// responses. Once `promises_received` reaches quorum, the candidate runs log
+/// recovery and transitions to Leader.
+#[cfg(feature = "multi-paxos")]
+struct ElectionState<V> {
+    proposal_number: ProposalNumber,
+    /// Recovery floor sent to acceptors in PrepareLeader. Recorded for retry.
+    #[allow(dead_code)]
+    since_slot: u64,
+    promises_received: HashSet<NodeId>,
+    /// Every (slot, accepted_pn, accepted_value) reported by acceptors during
+    /// this election. The candidate keeps the highest accepted_pn per slot for
+    /// log recovery.
+    accepted: Vec<(u64, ProposalNumber, V)>,
+}
+
 /// Manages all active Paxos instances
 pub(crate) struct PaxosProtocol<V> {
     pub(crate) node_id: NodeId,
@@ -54,6 +70,21 @@ pub(crate) struct PaxosProtocol<V> {
     /// matches the value within the timeout, we re-propose locally.
     #[cfg(feature = "multi-paxos")]
     forwarded_proposals: Vec<ForwardedProposal<V>>,
+    /// Cluster-wide acceptor promise issued in response to PrepareLeader.
+    /// Once set, this acceptor refuses any Accept whose `proposal_number`
+    /// is less than `leader_promise`, regardless of per-slot promise state.
+    /// This is what makes the Multi-Paxos fast path safe: a new leader's
+    /// promise covers ALL future slots, so an old leader cannot get its
+    /// fast-path Accepts through after a higher-numbered leader is elected.
+    #[cfg(feature = "multi-paxos")]
+    leader_promise: Option<ProposalNumber>,
+    /// In-flight election state (Some while this node is a Candidate).
+    #[cfg(feature = "multi-paxos")]
+    election: Option<ElectionState<V>>,
+    /// When the most recent election attempt was started, used to retry on
+    /// timeout if a quorum of PromiseLeader responses isn't gathered.
+    #[cfg(feature = "multi-paxos")]
+    election_started_at: Option<Instant>,
     /// How often a leader emits heartbeats. Sourced from [`PaxosConfig`];
     /// only consulted under the `multi-paxos` feature, but stored
     /// unconditionally so the field is available regardless of features.
@@ -145,6 +176,12 @@ where
             last_heartbeat_time: None,
             #[cfg(feature = "multi-paxos")]
             forwarded_proposals: Vec::new(),
+            #[cfg(feature = "multi-paxos")]
+            leader_promise: None,
+            #[cfg(feature = "multi-paxos")]
+            election: None,
+            #[cfg(feature = "multi-paxos")]
+            election_started_at: None,
             heartbeat_interval: config.heartbeat_interval,
             storage,
         }
@@ -189,7 +226,6 @@ where
         self.instances.is_empty()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn peek_state(&self) -> crate::protocol::raft::ProtocolSnapshot {
         crate::protocol::raft::ProtocolSnapshot {
             role: None,
@@ -260,6 +296,24 @@ where
             PaxosMessage::Forward { value } => self.handle_forward(from, value),
             #[cfg(feature = "multi-paxos")]
             PaxosMessage::Heartbeat { term } => self.handle_heartbeat(from, term),
+            #[cfg(feature = "multi-paxos")]
+            PaxosMessage::PrepareLeader {
+                proposal_number,
+                since_slot,
+            } => self.handle_prepare_leader(from, proposal_number, since_slot),
+            #[cfg(feature = "multi-paxos")]
+            PaxosMessage::PromiseLeader {
+                proposal_number,
+                accepted,
+            } => self.handle_promise_leader(from, proposal_number, accepted),
+            #[cfg(feature = "multi-paxos")]
+            PaxosMessage::NackLeader {
+                proposal_number,
+                highest_promised,
+            } => {
+                self.handle_nack_leader(proposal_number, highest_promised);
+                vec![]
+            }
         }
     }
 
@@ -315,8 +369,13 @@ where
     }
 
     // -- Phase 2: Accept/Accepted (Acceptor side) --
-    // Acceptor accepts if proposal_number >= highest_promised.
-    // >= because the proposer that made the promise is now sending Accept with the same number.
+    // Acceptor accepts if proposal_number >= max(per-slot highest_promised, leader_promise).
+    // >= because the proposer that made the per-slot promise is now sending Accept with
+    // the same number — that's valid. Under Multi-Paxos, the cluster-wide
+    // `leader_promise` (issued in response to PrepareLeader) ALSO gates Accept:
+    // a leader at term T cannot get its Accept through if a newer leader at
+    // term T' > T has already been promised. This is the safety property that
+    // makes the Multi-Paxos fast path correct without per-slot Phase 1.
     fn handle_accept(
         &mut self,
         from: NodeId,
@@ -335,10 +394,30 @@ where
             }];
         }
 
+        // Effective per-slot promise floor is the max of the per-slot promise
+        // and the cluster-wide leader promise (multi-paxos only).
+        #[cfg(feature = "multi-paxos")]
+        let effective_floor: Option<ProposalNumber> = {
+            let per_slot = self
+                .instances
+                .get(&slot)
+                .and_then(|i| i.highest_promised.clone());
+            match (per_slot, self.leader_promise.clone()) {
+                (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
+        };
+        #[cfg(not(feature = "multi-paxos"))]
+        let effective_floor: Option<ProposalNumber> = self
+            .instances
+            .get(&slot)
+            .and_then(|i| i.highest_promised.clone());
+
         let instance = self.get_or_create_instance(slot);
 
-        if instance
-            .highest_promised
+        if effective_floor
             .as_ref()
             .is_none_or(|hp| proposal_number >= *hp)
         {
@@ -358,7 +437,7 @@ where
                 message: PaxosMessage::NackAccept {
                     slot,
                     proposal_number,
-                    highest_promised: instance.highest_promised.clone().unwrap(),
+                    highest_promised: effective_floor.unwrap(),
                 },
             }]
         }
@@ -397,19 +476,9 @@ where
 
         if instance.promises_received.len() >= quorum_size {
             tracing::debug!(slot, "promise quorum reached, starting Phase 2");
-            #[cfg(feature = "multi-paxos")]
-            {
-                let inst = self.instances.get(&slot).unwrap();
-                let term = inst.proposal_number.0;
-                // If this is an election-only slot (no proposed value), just become
-                // leader and clean up. No Phase 2 needed.
-                if inst.proposed_value.is_none() {
-                    self.become_leader(term);
-                    self.instances.remove(&slot);
-                    return vec![];
-                }
-                self.become_leader(term);
-            }
+            // Note: per-slot Prepare quorum no longer triggers leadership.
+            // Multi-Paxos leadership is established via PrepareLeader, not the
+            // per-slot Phase 1 used here. See `start_election`.
             self.start_phase2(slot)
         } else {
             vec![]
@@ -618,7 +687,7 @@ where
         instance.accepted = Some((proposal_number.clone(), value.clone()));
         instance.accepts_received.insert(node_id.clone());
         // Also count self in promises (for retry logic consistency)
-        instance.promises_received.insert(node_id);
+        instance.promises_received.insert(node_id.clone());
 
         tracing::debug!(slot, term, "leader fast path: skipping Phase 1");
 
@@ -901,53 +970,327 @@ where
     #[cfg(feature = "multi-paxos")]
     pub(crate) fn check_leader_timeout(&self) -> bool {
         let leader_timeout = std::time::Duration::from_millis(500);
-        if let LeaderState::Follower {
-            leader: Some(_),
-            last_contact,
-        } = &self.leader_state
-        {
-            Instant::now().duration_since(*last_contact) >= leader_timeout
-        } else {
-            false
+        match &self.leader_state {
+            // Lost contact with a known leader.
+            LeaderState::Follower {
+                leader: Some(_),
+                last_contact,
+            } => Instant::now().duration_since(*last_contact) >= leader_timeout,
+            // Bootstrap path: no leader has ever been seen, but the cluster has
+            // outstanding work (in-flight proposals or undecided slots). Without
+            // this, a fresh cluster would only ever run full Paxos because no
+            // one would ever start an election. Note: only fires when the
+            // node has actually been alive for at least one timeout period —
+            // we use `last_contact` which is initialized to creation time.
+            LeaderState::Follower {
+                leader: None,
+                last_contact,
+            } => {
+                !self.instances.is_empty()
+                    && Instant::now().duration_since(*last_contact) >= leader_timeout
+            }
+            _ => false,
         }
     }
 
+    /// Start a Multi-Paxos leader election: a single Phase 1 (PrepareLeader)
+    /// covering ALL future slots `>= since_slot`. Acceptors that grant the
+    /// promise echo every accepted value they hold for those slots so the
+    /// new leader can perform log recovery before claiming the term.
     #[cfg(feature = "multi-paxos")]
     pub(crate) fn start_election(&mut self) -> Vec<Outgoing<PaxosMessage<V>>> {
         tracing::info!(node = %self.node_id, "starting leader election");
         self.leader_state = LeaderState::Candidate;
 
         let round = self.highest_seen_round + 1;
-        let slot = self.next_slot;
-        self.next_slot += 1;
+        let proposal_number: ProposalNumber = (round, self.node_id.clone());
 
+        // Recovery floor: every slot from the lowest in-flight slot onward (or
+        // the next slot if no in-flight) is covered by this election Promise.
+        let since_slot = self
+            .instances
+            .keys()
+            .copied()
+            .min()
+            .unwrap_or(self.next_slot);
+
+        // Reset election bookkeeping.
+        let mut promises_received = HashSet::new();
+        promises_received.insert(self.node_id.clone());
+        self.election = Some(ElectionState {
+            proposal_number: proposal_number.clone(),
+            since_slot,
+            promises_received,
+            // Self-promise: include any accepted values we hold.
+            accepted: self.collect_accepted_for_promise(since_slot),
+        });
+        self.election_started_at = Some(Instant::now());
+
+        // Self-promise globally.
+        if self
+            .leader_promise
+            .as_ref()
+            .is_none_or(|hp| proposal_number > *hp)
+        {
+            self.leader_promise = Some(proposal_number.clone());
+        }
+        self.update_highest_seen_round(round);
+
+        // If single-node cluster, immediately complete.
+        if self.election.as_ref().unwrap().promises_received.len() >= self.quorum_size {
+            return self.complete_leader_election();
+        }
+
+        vec![Outgoing {
+            target: SendTarget::Broadcast,
+            message: PaxosMessage::PrepareLeader {
+                proposal_number,
+                since_slot,
+            },
+        }]
+    }
+
+    /// If an in-flight election has stalled (no quorum within the timeout),
+    /// abandon it so the next `check_leader_timeout` tick can start a fresh
+    /// one at a higher round.
+    #[cfg(feature = "multi-paxos")]
+    fn check_election_timeout(&mut self) -> bool {
+        let timeout = std::time::Duration::from_millis(500);
+        if let Some(t) = self.election_started_at {
+            if Instant::now().duration_since(t) >= timeout && self.election.is_some() {
+                tracing::debug!(node = %self.node_id, "election timed out, abandoning");
+                self.election = None;
+                self.election_started_at = None;
+                self.leader_state = LeaderState::Follower {
+                    leader: None,
+                    last_contact: Instant::now(),
+                };
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Gather every accepted value this node holds for slots `>= since_slot`
+    /// (and not yet decided), to attach to a PromiseLeader response.
+    #[cfg(feature = "multi-paxos")]
+    fn collect_accepted_for_promise(&self, since_slot: u64) -> Vec<(u64, ProposalNumber, V)> {
+        let mut out = Vec::new();
+        for (&slot, inst) in &self.instances {
+            if slot < since_slot {
+                continue;
+            }
+            if self.decided_slots.contains_key(&slot) {
+                continue;
+            }
+            if let Some((pn, val)) = &inst.accepted {
+                out.push((slot, pn.clone(), val.clone()));
+            }
+        }
+        out
+    }
+
+    /// Acceptor side of leader election. Grants a global promise if the
+    /// candidate's proposal_number exceeds any previous global promise, and
+    /// reports every accepted value this acceptor holds for slots `>= since_slot`.
+    #[cfg(feature = "multi-paxos")]
+    fn handle_prepare_leader(
+        &mut self,
+        from: NodeId,
+        proposal_number: ProposalNumber,
+        since_slot: u64,
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
+        if self
+            .leader_promise
+            .as_ref()
+            .is_none_or(|hp| proposal_number > *hp)
+        {
+            self.leader_promise = Some(proposal_number.clone());
+            self.update_highest_seen_round(proposal_number.0);
+            // A higher leader supersedes us if we thought we were leader.
+            if matches!(self.leader_state, LeaderState::Leader { .. }) {
+                self.step_down(Some(from.clone()));
+            }
+            // Cancel any in-flight election we were running at a lower number.
+            if let Some(ref e) = self.election {
+                if proposal_number > e.proposal_number {
+                    self.election = None;
+                    self.election_started_at = None;
+                }
+            }
+            let accepted = self.collect_accepted_for_promise(since_slot);
+            vec![Outgoing {
+                target: SendTarget::Peer(from),
+                message: PaxosMessage::PromiseLeader {
+                    proposal_number,
+                    accepted,
+                },
+            }]
+        } else {
+            vec![Outgoing {
+                target: SendTarget::Peer(from),
+                message: PaxosMessage::NackLeader {
+                    proposal_number,
+                    highest_promised: self.leader_promise.clone().unwrap(),
+                },
+            }]
+        }
+    }
+
+    /// Candidate side: aggregate PromiseLeader responses. Once a quorum is
+    /// reached, run log recovery and become leader.
+    #[cfg(feature = "multi-paxos")]
+    fn handle_promise_leader(
+        &mut self,
+        from: NodeId,
+        proposal_number: ProposalNumber,
+        accepted: Vec<(u64, ProposalNumber, V)>,
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
+        let quorum_size = self.quorum_size;
+        let ready = match self.election.as_mut() {
+            Some(e) if e.proposal_number == proposal_number => {
+                e.promises_received.insert(from);
+                e.accepted.extend(accepted);
+                e.promises_received.len() >= quorum_size
+            }
+            _ => return vec![],
+        };
+        if ready {
+            self.complete_leader_election()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Candidate side: a NackLeader with a higher promise means we lost the
+    /// election. Step down and bump our highest_seen_round so the next attempt
+    /// can pick a strictly larger number.
+    #[cfg(feature = "multi-paxos")]
+    fn handle_nack_leader(
+        &mut self,
+        _proposal_number: ProposalNumber,
+        highest_promised: ProposalNumber,
+    ) {
+        self.update_highest_seen_round(highest_promised.0);
+        self.election = None;
+        self.election_started_at = None;
+        if matches!(self.leader_state, LeaderState::Candidate) {
+            self.leader_state = LeaderState::Follower {
+                leader: None,
+                last_contact: Instant::now(),
+            };
+        }
+    }
+
+    /// Quorum of PromiseLeader responses received: pick the highest-numbered
+    /// accepted value at every slot the quorum knows about, replay each as an
+    /// Accept at our new term (log recovery), advance `next_slot` past the
+    /// recovery range, and transition to Leader. Only after this completes
+    /// can `propose_fast_path` be safely used for new slots.
+    #[cfg(feature = "multi-paxos")]
+    fn complete_leader_election(&mut self) -> Vec<Outgoing<PaxosMessage<V>>> {
+        let election = match self.election.take() {
+            Some(e) => e,
+            None => return vec![],
+        };
+        self.election_started_at = None;
+        let term = election.proposal_number.0;
+        let new_pn = election.proposal_number.clone();
+
+        // Per slot, keep the (pn, value) with the highest pn across all
+        // PromiseLeader responses. This is the value the new leader must
+        // re-Accept for safety: any value previously chosen at a quorum is
+        // guaranteed to appear in this set, by the standard Paxos argument.
+        let mut highest_per_slot: HashMap<u64, (ProposalNumber, V)> = HashMap::new();
+        for (slot, pn, val) in election.accepted {
+            if self.decided_slots.contains_key(&slot) {
+                continue;
+            }
+            match highest_per_slot.get(&slot) {
+                Some((existing_pn, _)) if pn <= *existing_pn => {}
+                _ => {
+                    highest_per_slot.insert(slot, (pn, val));
+                }
+            }
+        }
+
+        let max_recovered_slot = highest_per_slot.keys().copied().max();
+        // Advance next_slot past the recovery range so future fast-path
+        // proposals don't collide with replayed slots.
+        if let Some(m) = max_recovered_slot {
+            if m + 1 > self.next_slot {
+                self.next_slot = m + 1;
+            }
+        }
+        // Also advance past anything the recovery floor covered but didn't
+        // turn up — i.e., slots we already had instances for.
+        let max_local_slot = self.instances.keys().copied().max();
+        if let Some(m) = max_local_slot {
+            if m + 1 > self.next_slot {
+                self.next_slot = m + 1;
+            }
+        }
+
+        self.become_leader(term);
+
+        // Replay Accepts for each recovered slot at our new term. The value is
+        // the highest accepted value we observed; the Accept self-votes locally
+        // and broadcasts so peers re-anchor on our new term too.
+        let mut out = Vec::new();
+        let recovered_slots: Vec<(u64, V)> = highest_per_slot
+            .into_iter()
+            .map(|(slot, (_, val))| (slot, val))
+            .collect();
+        for (slot, value) in recovered_slots {
+            out.extend(self.replay_accept(slot, new_pn.clone(), value));
+        }
+        out
+    }
+
+    /// Issue an Accept at the new leader's proposal number for a slot whose
+    /// recovered value was selected during election. Self-votes locally so the
+    /// new leader counts itself toward the recovery quorum.
+    #[cfg(feature = "multi-paxos")]
+    fn replay_accept(
+        &mut self,
+        slot: u64,
+        proposal_number: ProposalNumber,
+        value: V,
+    ) -> Vec<Outgoing<PaxosMessage<V>>> {
+        if self.decided_slots.contains_key(&slot) {
+            return vec![];
+        }
         let node_id = self.node_id.clone();
-        let proposal_number: ProposalNumber = (round, node_id.clone());
         let instance = self.get_or_create_instance(slot);
         instance.proposal_number = proposal_number.clone();
+        instance.proposed_value = Some(value.clone());
         instance.is_proposer = true;
         instance.last_send_time = Some(Instant::now());
         let stale_ms = 100u64;
         let jitter_ms = rand::rng().random_range(0..=stale_ms / 2);
         instance.next_retry_at =
             Some(Instant::now() + std::time::Duration::from_millis(stale_ms + jitter_ms));
-
-        // Self-vote
         instance.highest_promised = Some(proposal_number.clone());
+        instance.accepted = Some((proposal_number.clone(), value.clone()));
+        instance.accepts_received.clear();
+        instance.accepts_received.insert(node_id.clone());
+        instance.promises_received.clear();
         instance.promises_received.insert(node_id);
 
-        if instance.promises_received.len() >= self.quorum_size {
-            self.become_leader(round);
-            return vec![];
+        if instance.accepts_received.len() >= self.quorum_size {
+            self.decide(slot, value.clone());
+            self.instances.remove(&slot);
+            return vec![Outgoing {
+                target: SendTarget::Broadcast,
+                message: PaxosMessage::Decide { slot, value },
+            }];
         }
-
-        self.update_highest_seen_round(round);
-
         vec![Outgoing {
             target: SendTarget::Broadcast,
-            message: PaxosMessage::Prepare {
+            message: PaxosMessage::Accept {
                 slot,
                 proposal_number,
+                value,
             },
         }]
     }
@@ -1065,6 +1408,9 @@ where
             if self.should_send_heartbeat() {
                 out.extend(self.make_heartbeat());
             }
+            // Abandon a stalled election so the next leader-timeout tick
+            // (or this tick, if we have no leader) can start a fresh one.
+            self.check_election_timeout();
             if self.check_leader_timeout() {
                 out.extend(self.start_election());
             }

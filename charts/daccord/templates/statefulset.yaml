@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "daccord.fullname" . }}
+  labels:
+    {{- include "daccord.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "daccord.headlessName" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "daccord.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "daccord.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the StatefulSet when the PEERS ConfigMap changes.
+        checksum/peers-config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: daccord
+          image: {{ include "daccord.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: consensus
+              containerPort: {{ .Values.ports.consensus }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.ports.grpc }}
+              protocol: TCP
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TRANSPORT
+              value: "tcp"
+            - name: BIND_ADDR
+              value: "0.0.0.0:{{ .Values.ports.consensus }}"
+            - name: GRPC_PORT
+              value: {{ .Values.ports.grpc | quote }}
+            - name: ALGORITHM
+              value: {{ include "daccord.algorithmEnv" . | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logging.level | quote }}
+            - name: PEERS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "daccord.peersConfigMapName" . }}
+                  key: PEERS
+            {{- if .Values.persistence.enabled }}
+            - name: DATA_DIR
+              value: {{ .Values.persistence.mountPath | quote }}
+            {{- end }}
+          readinessProbe:
+            exec:
+              command:
+                - daccord-cli
+                - --addr
+                - localhost:{{ .Values.ports.grpc }}
+                - health
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command:
+                - daccord-cli
+                - --addr
+                - localhost:{{ .Values.ports.grpc }}
+                - health
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "daccord.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

@@ -255,12 +255,20 @@ async fn heartbeat_keeps_leadership() {
 async fn safety_under_leader_transition() {
     let mut cluster = create_lossy_cluster(3, 0.10);
 
-    // Each of 3 nodes proposes 5 values.
-    for (i, node) in cluster.iter().enumerate().take(3) {
-        for j in 0..5 {
-            node.handle.propose(format!("n{}-v{}", i, j)).await.unwrap();
-        }
-    }
+    // Each of 3 nodes proposes 5 values in parallel.
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .take(3)
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                for j in 0..5 {
+                    let _ = h.propose(format!("n{}-v{}", i, j)).await;
+                }
+            })
+        })
+        .collect();
 
     // Collect up to 15 decisions per node with 10s timeout; don't fail if fewer.
     let mut all_decisions = Vec::new();
@@ -280,6 +288,9 @@ async fn safety_under_leader_transition() {
     let total: usize = all_decisions.iter().map(|d| d.len()).sum();
     assert!(total > 0, "expected at least some decisions, got none");
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }

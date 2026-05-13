@@ -66,10 +66,17 @@ async fn four_node_multiple_proposals() {
 async fn four_node_proposals_from_different_nodes() {
     let mut cluster = create_cluster(4);
 
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("from-{}", i)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10 * i as u64)).await;
+                h.propose(format!("from-{}", i)).await
+            })
+        })
+        .collect();
 
     let expected: HashSet<String> = (0..4).map(|i| format!("from-{}", i)).collect();
 
@@ -82,6 +89,9 @@ async fn four_node_proposals_from_different_nodes() {
     }
     assert_consistent_decisions(&all);
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }
@@ -191,10 +201,17 @@ async fn five_node_multiple_proposals() {
 async fn five_node_proposals_from_different_nodes() {
     let mut cluster = create_cluster(5);
 
-    for (i, node) in cluster.iter().enumerate() {
-        node.handle.propose(format!("from-{}", i)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let h = node.handle.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10 * i as u64)).await;
+                h.propose(format!("from-{}", i)).await
+            })
+        })
+        .collect();
 
     let expected: HashSet<String> = (0..5).map(|i| format!("from-{}", i)).collect();
 
@@ -207,6 +224,9 @@ async fn five_node_proposals_from_different_nodes() {
     }
     assert_consistent_decisions(&all);
 
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }

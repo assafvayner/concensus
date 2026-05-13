@@ -1,23 +1,19 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::transport::Server;
 
 use daccord::{
-    DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, ProposeError,
-    RaftConfig, RaftMemoryStorage, TcpTransport, UdsTransport,
+    DecisionReceiver, Node, NodeHandle, NodeId, PaxosConfig, PaxosMemoryStorage, RaftConfig,
+    RaftMemoryStorage, TcpTransport, UdsTransport,
 };
+#[cfg(feature = "duckdb-bundled")]
+use daccord::{DuckdbPaxosStorage, DuckdbRaftStorage};
 
-pub mod consensus_proto {
-    tonic::include_proto!("consensus");
-}
-
-use consensus_proto::consensus_service_server::{ConsensusService, ConsensusServiceServer};
-use consensus_proto::{
-    Decision, GetDecisionsRequest, GetDecisionsResponse, HealthRequest, HealthResponse,
-    ProposeRequest, ProposeResponse, StatusRequest, StatusResponse,
+use daccord_demo::consensus_proto::consensus_service_server::ConsensusServiceServer;
+use daccord_demo::service::{
+    collect_decisions, Algorithm, ConsensusServiceImpl, DecisionLog, DECISION_BROADCAST_CAPACITY,
 };
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -34,27 +30,13 @@ enum Transport {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Algorithm {
-    Paxos,
-    Raft,
-}
-
-impl Algorithm {
-    fn as_str(self) -> &'static str {
-        match self {
-            Algorithm::Paxos => "paxos",
-            Algorithm::Raft => "raft",
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Config {
     node_name: String,
     transport: Transport,
     grpc_port: u16,
     algorithm: Algorithm,
+    data_dir: Option<PathBuf>,
 }
 
 fn resolve_algorithm() -> Algorithm {
@@ -108,12 +90,14 @@ fn parse_config() -> Config {
     };
 
     let algorithm = resolve_algorithm();
+    let data_dir = std::env::var("DATA_DIR").ok().map(PathBuf::from);
 
     Config {
         node_name,
         transport,
         grpc_port,
         algorithm,
+        data_dir,
     }
 }
 
@@ -160,95 +144,6 @@ fn parse_uds_peers(peers_str: &str) -> Vec<(NodeId, PathBuf)> {
         .collect()
 }
 
-// ─── gRPC Service ────────────────────────────────────────────────────────────
-
-type DecisionList = Arc<RwLock<Vec<Decision>>>;
-
-struct ConsensusServiceImpl {
-    handle: NodeHandle<String>,
-    decisions: DecisionList,
-    node_id: String,
-    algorithm: Algorithm,
-}
-
-#[tonic::async_trait]
-impl ConsensusService for ConsensusServiceImpl {
-    async fn propose(
-        &self,
-        request: Request<ProposeRequest>,
-    ) -> Result<Response<ProposeResponse>, Status> {
-        let value = request.into_inner().value;
-        tracing::info!(value = %value, "gRPC propose request");
-
-        match self.handle.propose(value).await {
-            Ok(()) => Ok(Response::new(ProposeResponse {
-                status: "proposed".to_string(),
-            })),
-            Err(ProposeError::ChannelFull) => {
-                Err(Status::resource_exhausted("proposal channel full"))
-            }
-            Err(ProposeError::NotRunning) => Err(Status::unavailable("node is not running")),
-        }
-    }
-
-    async fn get_decisions(
-        &self,
-        _request: Request<GetDecisionsRequest>,
-    ) -> Result<Response<GetDecisionsResponse>, Status> {
-        let decisions = self.decisions.read().await.clone();
-        Ok(Response::new(GetDecisionsResponse { decisions }))
-    }
-
-    async fn health(
-        &self,
-        _request: Request<HealthRequest>,
-    ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: "ok".to_string(),
-        }))
-    }
-
-    async fn status(
-        &self,
-        _request: Request<StatusRequest>,
-    ) -> Result<Response<StatusResponse>, Status> {
-        Ok(Response::new(StatusResponse {
-            node_id: self.node_id.clone(),
-            algorithm: self.algorithm.as_str().to_string(),
-            role: "N/A".into(),
-            term: 0,
-            leader: String::new(),
-            log_len: 0,
-            has_commit_index: false,
-            commit_index: 0,
-            has_last_applied: false,
-            last_applied: 0,
-        }))
-    }
-}
-
-// ─── Decision collector ──────────────────────────────────────────────────────
-
-async fn collect_decisions(
-    mut decision_rx: DecisionReceiver<String>,
-    decisions: DecisionList,
-    node_name: String,
-) {
-    while let Some(decided) = decision_rx.recv().await {
-        tracing::info!(
-            node_name = %node_name,
-            slot = decided.slot,
-            value = %decided.value,
-            "decision reached"
-        );
-        decisions.write().await.push(Decision {
-            slot: decided.slot,
-            value: decided.value,
-        });
-    }
-    tracing::info!("decision channel closed");
-}
-
 // ─── Node startup (generic over transport) ───────────────────────────────────
 
 async fn start_node_tcp(
@@ -256,27 +151,45 @@ async fn start_node_tcp(
     algorithm: Algorithm,
     bind_addr: SocketAddr,
     peers: Vec<(NodeId, String)>,
-) -> (NodeHandle<String>, DecisionReceiver<String>) {
+    data_dir: Option<&Path>,
+) -> (NodeHandle<Vec<u8>>, DecisionReceiver<Vec<u8>>) {
     let peers = resolve_tcp_peers(peers).await;
     let (peer_infos, receiver) = TcpTransport::create(bind_addr, peers)
         .await
         .expect("failed to bind TCP transport");
 
-    let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::paxos_with_id(
-            node_id,
+    let (node, handle, decision_rx) = match (algorithm, data_dir) {
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            PaxosMemoryStorage::<String>::new(),
+            DuckdbPaxosStorage::<Vec<u8>>::open(dir.join("paxos.db"))
+                .expect("failed to open DuckDB Paxos storage"),
         ),
-        Algorithm::Raft => Node::raft_with_id(
-            node_id,
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
-            RaftMemoryStorage::<String>::new(),
+            DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
+                .expect("failed to open DuckDB Raft storage"),
+        ),
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            PaxosMemoryStorage::<Vec<u8>>::new(),
+        ),
+        (Algorithm::Raft, _) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            RaftMemoryStorage::<Vec<u8>>::new(),
         ),
     };
 
@@ -296,26 +209,44 @@ async fn start_node_uds(
     algorithm: Algorithm,
     bind_path: PathBuf,
     peers: Vec<(NodeId, PathBuf)>,
-) -> (NodeHandle<String>, DecisionReceiver<String>) {
+    data_dir: Option<&Path>,
+) -> (NodeHandle<Vec<u8>>, DecisionReceiver<Vec<u8>>) {
     let (peer_infos, receiver) = UdsTransport::create(bind_path, peers)
         .await
         .expect("failed to bind UDS transport");
 
-    let node_id = NodeId::new(node_name, 0);
-    let (node, handle, decision_rx) = match algorithm {
-        Algorithm::Paxos => Node::paxos_with_id(
-            node_id,
+    let (node, handle, decision_rx) = match (algorithm, data_dir) {
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Paxos, Some(dir)) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
             PaxosConfig::default(),
             peer_infos,
             receiver,
-            PaxosMemoryStorage::<String>::new(),
+            DuckdbPaxosStorage::<Vec<u8>>::open(dir.join("paxos.db"))
+                .expect("failed to open DuckDB Paxos storage"),
         ),
-        Algorithm::Raft => Node::raft_with_id(
-            node_id,
+        #[cfg(feature = "duckdb-bundled")]
+        (Algorithm::Raft, Some(dir)) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
             RaftConfig::default(),
             peer_infos,
             receiver,
-            RaftMemoryStorage::<String>::new(),
+            DuckdbRaftStorage::<Vec<u8>>::open(dir.join("raft.db"))
+                .expect("failed to open DuckDB Raft storage"),
+        ),
+        (Algorithm::Paxos, _) => Node::paxos_with_id(
+            NodeId::new(node_name, 0),
+            PaxosConfig::default(),
+            peer_infos,
+            receiver,
+            PaxosMemoryStorage::<Vec<u8>>::new(),
+        ),
+        (Algorithm::Raft, _) => Node::raft_with_id(
+            NodeId::new(node_name, 0),
+            RaftConfig::default(),
+            peer_infos,
+            receiver,
+            RaftMemoryStorage::<Vec<u8>>::new(),
         ),
     };
 
@@ -349,6 +280,7 @@ async fn main() {
         "using consensus algorithm"
     );
 
+    let data_dir = config.data_dir.as_deref();
     let (handle, decision_rx) = match config.transport {
         Transport::Tcp { bind_addr, peers } => {
             tracing::info!(
@@ -357,9 +289,17 @@ async fn main() {
                 bind = %bind_addr,
                 grpc_port = config.grpc_port,
                 algorithm = %config.algorithm.as_str(),
+                data_dir = ?data_dir,
                 "node started"
             );
-            start_node_tcp(&config.node_name, config.algorithm, bind_addr, peers).await
+            start_node_tcp(
+                &config.node_name,
+                config.algorithm,
+                bind_addr,
+                peers,
+                data_dir,
+            )
+            .await
         }
         Transport::Uds { bind_path, peers } => {
             tracing::info!(
@@ -368,13 +308,21 @@ async fn main() {
                 bind = ?bind_path,
                 grpc_port = config.grpc_port,
                 algorithm = %config.algorithm.as_str(),
+                data_dir = ?data_dir,
                 "node started"
             );
-            start_node_uds(&config.node_name, config.algorithm, bind_path, peers).await
+            start_node_uds(
+                &config.node_name,
+                config.algorithm,
+                bind_path,
+                peers,
+                data_dir,
+            )
+            .await
         }
     };
 
-    let decisions: DecisionList = Arc::new(RwLock::new(Vec::new()));
+    let decisions = Arc::new(DecisionLog::new(DECISION_BROADCAST_CAPACITY));
 
     tokio::spawn(collect_decisions(
         decision_rx,
@@ -386,12 +334,7 @@ async fn main() {
         .parse()
         .expect("invalid gRPC address");
 
-    let service = ConsensusServiceImpl {
-        handle,
-        decisions,
-        node_id: config.node_name.clone(),
-        algorithm: config.algorithm,
-    };
+    let service = ConsensusServiceImpl::new(handle, decisions, config.algorithm);
 
     tracing::info!(addr = %grpc_addr, "gRPC server starting");
 

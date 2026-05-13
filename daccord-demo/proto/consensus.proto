@@ -1,20 +1,52 @@
 syntax = "proto3";
-package consensus;
+package daccord.v1;
 
 service ConsensusService {
+  // Submit a value. Returns when the value has been decided in a slot,
+  // or with an error if it is known the value will not be decided.
   rpc Propose (ProposeRequest) returns (ProposeResponse);
+
+  // Stream decisions starting at start_index. The server pushes Decision
+  // messages in slot order; on disconnect, reconnect with start_index =
+  // last_seen_slot + 1.
+  rpc Watch (WatchRequest) returns (stream Decision);
+
+  // Pull-based snapshot of decisions in [start_index, start_index + limit).
+  // Useful for debugging and simple consumers.
   rpc GetDecisions (GetDecisionsRequest) returns (GetDecisionsResponse);
+
+  // Liveness only.
   rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Detailed cluster/node state.
   rpc Status (StatusRequest) returns (StatusResponse);
 }
 
-message ProposeRequest { string value = 1; }
-message ProposeResponse { string status = 1; }
+message ProposeRequest {
+  bytes payload = 1;
+}
+message ProposeResponse {
+  uint64 slot = 1;
+  bytes payload = 2;  // the value that was decided in this slot
+}
 
-message GetDecisionsRequest {}
-message GetDecisionsResponse { repeated Decision decisions = 1; }
+message WatchRequest {
+  uint64 start_index = 1;  // 0 = from beginning
+}
 
-message Decision { uint64 slot = 1; string value = 2; }
+message GetDecisionsRequest {
+  uint64 start_index = 1;
+  optional uint32 limit = 2;  // unset = server default (e.g. 1000)
+}
+message GetDecisionsResponse {
+  repeated Decision decisions = 1;
+  uint64 next_index = 2;   // cursor for the next page
+}
+
+message Decision {
+  uint64 slot = 1;
+  bytes payload = 2;
+}
 
 message HealthRequest {}
 message HealthResponse { string status = 1; }
@@ -22,13 +54,11 @@ message HealthResponse { string status = 1; }
 message StatusRequest {}
 message StatusResponse {
   string node_id = 1;
-  string algorithm = 2;
-  string role = 3;
+  string algorithm = 2;          // "paxos" | "raft"
+  string role = 3;               // "follower" | "candidate" | "leader" | "n/a"
   uint64 term = 4;
-  string leader = 5;
+  string leader_id = 5;
   uint64 log_len = 6;
-  bool has_commit_index = 7;
-  uint64 commit_index = 8;
-  bool has_last_applied = 9;
-  uint64 last_applied = 10;
+  optional uint64 commit_index = 7;
+  optional uint64 last_applied = 8;
 }

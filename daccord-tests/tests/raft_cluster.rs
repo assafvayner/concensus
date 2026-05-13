@@ -19,10 +19,15 @@ async fn raft_three_node_consensus() {
     // Wait for an election to settle.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Try to propose from each node — at least one is the leader.
-    for node in &cluster {
-        let _ = node.handle.propose("hello".into()).await;
-    }
+    // Try to propose from each node — at least one is the leader. Spawn so
+    // the propose futures don't serialize and the test can race on decisions.
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .map(|node| {
+            let h = node.handle.clone();
+            tokio::spawn(async move { h.propose("hello".into()).await })
+        })
+        .collect();
 
     let mut all = Vec::new();
     for node in &mut cluster {
@@ -34,6 +39,9 @@ async fn raft_three_node_consensus() {
         assert_eq!(d[0].value, "hello");
     }
     assert_consistent_decisions(&all);
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }
@@ -43,9 +51,13 @@ async fn raft_three_node_consensus() {
 async fn raft_lossy_cluster_makes_progress() {
     let mut cluster = helpers::create_raft_lossy_unbounded_cluster(3, 0.10);
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    for node in &cluster {
-        let _ = node.handle.propose("hello".into()).await;
-    }
+    let propose_handles: Vec<_> = cluster
+        .iter()
+        .map(|node| {
+            let h = node.handle.clone();
+            tokio::spawn(async move { h.propose("hello".into()).await })
+        })
+        .collect();
     let mut all = Vec::new();
     for node in &mut cluster {
         let mut decisions = Vec::new();
@@ -60,6 +72,9 @@ async fn raft_lossy_cluster_makes_progress() {
         all.push(decisions);
     }
     helpers::assert_safety_invariant(&all);
+    for h in propose_handles {
+        h.abort();
+    }
     for node in cluster {
         drop(node.handle);
     }

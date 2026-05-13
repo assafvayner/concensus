@@ -1,0 +1,34 @@
+{{ include "daccord.fullname" . }} — {{ .Values.replicaCount }}-node consensus cluster ({{ .Values.algorithm }})
+
+Pods will come up as:
+{{- range $i, $_ := until (.Values.replicaCount | int) }}
+  - {{ include "daccord.fullname" $ }}-{{ $i }}.{{ include "daccord.headlessName" $ }}.{{ $.Release.Namespace }}.svc.cluster.local
+{{- end }}
+
+Wait for them to become Ready:
+  kubectl --namespace {{ .Release.Namespace }} rollout status statefulset/{{ include "daccord.fullname" . }}
+
+Reach the gRPC API from inside the cluster at:
+  {{ include "daccord.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.grpc }}
+
+To call it from your laptop, port-forward the client Service:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "daccord.fullname" . }} {{ .Values.ports.grpc }}:{{ .Values.ports.grpc }}
+
+Then propose a value and read decisions:
+  daccord-cli --addr localhost:{{ .Values.ports.grpc }} propose hello
+  daccord-cli --addr localhost:{{ .Values.ports.grpc }} get-decisions
+
+{{- if .Values.persistence.enabled }}
+
+Each pod has its own PVC mounted at {{ .Values.persistence.mountPath }}; consensus state survives pod restarts.
+PVCs are *retained* on `helm uninstall` (StatefulSet behavior). To delete them:
+  kubectl --namespace {{ .Release.Namespace }} delete pvc -l app.kubernetes.io/instance={{ .Release.Name }}
+{{- else }}
+
+Persistence is DISABLED — pods are using emptyDir, so consensus state is lost on every restart.
+Set persistence.enabled=true for a durable cluster.
+{{- end }}
+
+NOTE: replicaCount is wired into the PEERS env var at install time. Do NOT scale this StatefulSet
+with `kubectl scale` — that will not update the peer list. To change cluster size, use
+`helm upgrade --set replicaCount=N` and accept that running peers may need a full restart.

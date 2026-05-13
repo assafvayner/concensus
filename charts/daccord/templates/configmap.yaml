@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "daccord.peersConfigMapName" . }}
+  labels:
+    {{- include "daccord.labels" . | nindent 4 }}
+data:
+  PEERS: {{ include "daccord.peersString" . | quote }}

@@ -91,7 +91,6 @@ pub(crate) struct RaftProtocol<V> {
 
 /// Inner snapshot used by `ConsensusProtocol::peek_state`. Mirrors `NodeState`
 /// minus `node_id` and `algorithm`, which the wrapper fills in.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ProtocolSnapshot {
     pub role: Option<crate::node::NodeRole>,
     pub term: u64,
@@ -148,7 +147,6 @@ where
         (self.total_nodes / 2) + 1
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn peek_state(&self) -> ProtocolSnapshot {
         let role = Some(match self.role {
             Role::Follower => crate::node::NodeRole::Follower,

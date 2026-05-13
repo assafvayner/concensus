@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "daccord.headlessName" . }}
+  labels:
+    {{- include "daccord.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Important: peers need to resolve each other before any pod is Ready.
+  publishNotReadyAddresses: true
+  ports:
+    - name: consensus
+      port: {{ .Values.ports.consensus }}
+      targetPort: consensus
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    {{- include "daccord.selectorLabels" . | nindent 4 }}

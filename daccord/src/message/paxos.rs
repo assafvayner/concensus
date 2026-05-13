@@ -47,6 +47,29 @@ pub(crate) enum PaxosMessage<V> {
     Heartbeat {
         term: u64,
     },
+    /// Multi-Paxos election Prepare: a single Phase 1 covering ALL future slots
+    /// at the given proposal number. Acceptors promise globally and respond
+    /// with every accepted value they hold for slots `>= since_slot`.
+    #[cfg(feature = "multi-paxos")]
+    PrepareLeader {
+        proposal_number: ProposalNumber,
+        /// Recovery floor: acceptor reports accepted values for slots `>= since_slot`.
+        /// Set to `min(decided slots + 1, lowest in-flight slot)` by the candidate.
+        since_slot: u64,
+    },
+    /// Response to PrepareLeader. `accepted` lists every accepted value the
+    /// acceptor holds at slots `>= since_slot` from the Prepare.
+    #[cfg(feature = "multi-paxos")]
+    PromiseLeader {
+        proposal_number: ProposalNumber,
+        accepted: Vec<(u64, ProposalNumber, V)>,
+    },
+    /// Nack for PrepareLeader: the acceptor has already promised a higher leader.
+    #[cfg(feature = "multi-paxos")]
+    NackLeader {
+        proposal_number: ProposalNumber,
+        highest_promised: ProposalNumber,
+    },
 }
 
 #[cfg(test)]

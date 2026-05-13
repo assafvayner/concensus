@@ -1,14 +1,20 @@
 use thiserror::Error;
 
 /// Errors returned by [`NodeHandle::propose`](crate::NodeHandle::propose).
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ProposeError {
     /// The node's event loop has stopped (all handles dropped or fatal error).
     #[error("node is not running")]
     NotRunning,
     /// The internal proposal queue is full. Back off and retry.
-    #[error("proposal channel full")]
+    #[error("proposal channel is full")]
     ChannelFull,
+    /// The node was shut down before the proposal reached consensus.
+    #[error("node was shut down before the proposal was decided")]
+    Cancelled,
+    /// The proposal was superseded by another leader (Raft log truncation).
+    #[error("proposal was superseded by another leader")]
+    Superseded,
 }
 
 /// Errors returned by [`Node::run`](crate::Node::run).
@@ -56,7 +62,15 @@ mod tests {
         assert_eq!(ProposeError::NotRunning.to_string(), "node is not running");
         assert_eq!(
             ProposeError::ChannelFull.to_string(),
-            "proposal channel full"
+            "proposal channel is full"
+        );
+        assert_eq!(
+            ProposeError::Cancelled.to_string(),
+            "node was shut down before the proposal was decided"
+        );
+        assert_eq!(
+            ProposeError::Superseded.to_string(),
+            "proposal was superseded by another leader"
         );
     }
 

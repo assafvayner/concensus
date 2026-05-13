@@ -1,0 +1,16 @@
+apiVersion: v2
+name: daccord
+description: A 3-node daccord consensus cluster (Multi-Paxos / Raft) with DuckDB-backed durable storage
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/assafvayner/daccord
+sources:
+  - https://github.com/assafvayner/daccord
+keywords:
+  - consensus
+  - paxos
+  - raft
+  - distributed-systems
+maintainers:
+  - name: Assaf Vayner
