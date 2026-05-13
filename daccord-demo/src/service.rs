@@ -6,6 +6,7 @@
 //! the binary exposes — just over channel transport, without touching the
 //! network for the consensus messages themselves.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -90,11 +91,6 @@ impl DecisionLog {
         // Drop the write lock before sending so a slow subscriber can't pin
         // the log under the write lock.
         drop(entries);
-        // FIXME(multi-paxos): in multi-Paxos, decisions can arrive on the broadcast
-        // channel out of slot order. Watch consumers track `last_yielded` monotonically,
-        // so a slot that broadcasts late may be missed. This is safe for single-leader /
-        // Raft but a known gap for multi-Paxos. See the design plan for the mitigation.
-        //
         // Errors only when no receivers are subscribed; that's fine.
         let _ = self.tx.send(decision);
     }
@@ -103,13 +99,23 @@ impl DecisionLog {
         self.entries.read().await.clone()
     }
 
-    pub async fn range(&self, start: usize, limit: usize) -> (Vec<Decision>, u64) {
+    pub async fn range(&self, start_slot: u64, limit: usize) -> (Vec<Decision>, u64) {
         let entries = self.entries.read().await;
-        if start >= entries.len() {
-            return (Vec::new(), start as u64);
+        let start = match entries.binary_search_by_key(&start_slot, |d| d.slot) {
+            Ok(pos) => pos,
+            Err(_) => return (Vec::new(), start_slot),
+        };
+
+        let mut next_slot = start_slot;
+        let mut out = Vec::new();
+        for decision in entries.iter().skip(start) {
+            if out.len() >= limit || decision.slot != next_slot {
+                break;
+            }
+            out.push(decision.clone());
+            next_slot = next_slot.saturating_add(1);
         }
-        let end = (start + limit).min(entries.len());
-        (entries[start..end].to_vec(), end as u64)
+        (out, next_slot)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Decision> {
@@ -140,6 +146,63 @@ impl ConsensusServiceImpl {
 }
 
 type DecisionStream = Pin<Box<dyn Stream<Item = Result<Decision, Status>> + Send + 'static>>;
+
+fn watch_decisions(log: Arc<DecisionLog>, start_index: u64) -> DecisionStream {
+    let stream = async_stream::stream! {
+        // Subscribe BEFORE snapshotting, so we don't miss decisions appended
+        // between the snapshot read and the live tail subscription.
+        let mut rx = log.subscribe();
+        let snapshot = log.snapshot().await;
+        let mut next_slot = start_index;
+        let mut buffered = BTreeMap::new();
+
+        for d in snapshot.into_iter() {
+            if d.slot < next_slot {
+                continue;
+            }
+            if d.slot == next_slot {
+                next_slot = next_slot.saturating_add(1);
+                yield Ok(d);
+                while let Some(buffered_decision) = buffered.remove(&next_slot) {
+                    next_slot = next_slot.saturating_add(1);
+                    yield Ok(buffered_decision);
+                }
+            } else {
+                buffered.entry(d.slot).or_insert(d);
+            }
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(d) => {
+                    if d.slot < next_slot {
+                        continue;
+                    }
+                    if d.slot == next_slot {
+                        next_slot = next_slot.saturating_add(1);
+                        yield Ok(d);
+                        while let Some(buffered_decision) = buffered.remove(&next_slot) {
+                            next_slot = next_slot.saturating_add(1);
+                            yield Ok(buffered_decision);
+                        }
+                    } else {
+                        buffered.entry(d.slot).or_insert(d);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    yield Err(Status::resource_exhausted(
+                        "watch lagged behind, reconnect with start_index = next expected slot",
+                    ));
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+    Box::pin(stream)
+}
 
 #[tonic::async_trait]
 impl ConsensusService for ConsensusServiceImpl {
@@ -176,52 +239,7 @@ impl ConsensusService for ConsensusServiceImpl {
     ) -> Result<Response<Self::WatchStream>, Status> {
         let start_index = request.into_inner().start_index;
         let log = self.decisions.clone();
-
-        let stream = async_stream::stream! {
-            // Subscribe BEFORE snapshotting, so we don't miss decisions appended
-            // between the snapshot read and the live tail subscription.
-            let mut rx = log.subscribe();
-            let snapshot = log.snapshot().await;
-
-            // Track the last slot already yielded from the snapshot to filter
-            // out duplicates that the broadcast may also deliver.
-            let mut last_yielded: Option<u64> = None;
-
-            for d in snapshot.into_iter() {
-                if d.slot >= start_index {
-                    last_yielded = Some(d.slot);
-                    yield Ok(d);
-                }
-            }
-
-            loop {
-                match rx.recv().await {
-                    Ok(d) => {
-                        if d.slot < start_index {
-                            continue;
-                        }
-                        if let Some(last) = last_yielded {
-                            if d.slot <= last {
-                                continue;
-                            }
-                        }
-                        last_yielded = Some(d.slot);
-                        yield Ok(d);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        yield Err(Status::resource_exhausted(
-                            "watch lagged behind, reconnect with start_index = last_seen + 1",
-                        ));
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(stream) as Self::WatchStream))
+        Ok(Response::new(watch_decisions(log, start_index)))
     }
 
     async fn get_decisions(
@@ -229,14 +247,13 @@ impl ConsensusService for ConsensusServiceImpl {
         request: Request<GetDecisionsRequest>,
     ) -> Result<Response<GetDecisionsResponse>, Status> {
         let req = request.into_inner();
-        let start_index: usize = req.start_index.try_into().unwrap_or(usize::MAX);
         let limit = req
             .limit
             .filter(|n| *n != 0)
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_GET_LIMIT);
 
-        let (decisions, next_index) = self.decisions.range(start_index, limit).await;
+        let (decisions, next_index) = self.decisions.range(req.start_index, limit).await;
 
         Ok(Response::new(GetDecisionsResponse {
             decisions,
@@ -325,4 +342,64 @@ pub async fn collect_decisions(
             .await;
     }
     tracing::info!("decision channel closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio_stream::StreamExt;
+
+    use super::{watch_decisions, Decision, DecisionLog};
+
+    fn decision(slot: u64, payload: &'static [u8]) -> Decision {
+        Decision {
+            slot,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn range_uses_slot_cursor_and_stops_at_gaps() {
+        let log = DecisionLog::new(16);
+        log.append(decision(0, b"a")).await;
+        log.append(decision(2, b"c")).await;
+
+        let (first_page, next_index) = log.range(0, 10).await;
+        assert_eq!(first_page, vec![decision(0, b"a")]);
+        assert_eq!(next_index, 1);
+
+        let (gap_page, next_index) = log.range(1, 10).await;
+        assert!(gap_page.is_empty());
+        assert_eq!(next_index, 1);
+
+        log.append(decision(1, b"b")).await;
+        let (filled_page, next_index) = log.range(1, 10).await;
+        assert_eq!(filled_page, vec![decision(1, b"b"), decision(2, b"c")]);
+        assert_eq!(next_index, 3);
+    }
+
+    #[tokio::test]
+    async fn watch_buffers_out_of_order_decisions_until_gap_fills() {
+        let log = Arc::new(DecisionLog::new(16));
+        log.append(decision(0, b"a")).await;
+        log.append(decision(2, b"c")).await;
+
+        let mut stream = watch_decisions(log.clone(), 0);
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, decision(0, b"a"));
+
+        let no_gap_skip = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+        assert!(
+            no_gap_skip.is_err(),
+            "watch should wait for slot 1 before yielding slot 2"
+        );
+
+        log.append(decision(1, b"b")).await;
+        let second = stream.next().await.unwrap().unwrap();
+        let third = stream.next().await.unwrap().unwrap();
+        assert_eq!(second, decision(1, b"b"));
+        assert_eq!(third, decision(2, b"c"));
+    }
 }

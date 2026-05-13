@@ -142,8 +142,13 @@ impl<V> Clone for NodeHandle<V> {
 ///
 /// Wrapping the pending map in a guard ensures cancellation fires on panic-
 /// induced unwind as well as normal shutdown.
+struct PendingEntry<V> {
+    value: V,
+    completion: oneshot::Sender<Result<Decided<V>, ProposeError>>,
+}
+
 struct PendingMap<V> {
-    inner: HashMap<u64, oneshot::Sender<Result<Decided<V>, ProposeError>>>,
+    inner: HashMap<u64, PendingEntry<V>>,
 }
 
 impl<V> PendingMap<V> {
@@ -153,12 +158,43 @@ impl<V> PendingMap<V> {
         }
     }
 
-    fn insert(&mut self, nonce: u64, tx: oneshot::Sender<Result<Decided<V>, ProposeError>>) {
-        self.inner.insert(nonce, tx);
+    fn insert(
+        &mut self,
+        pending: Pending<V>,
+        tx: oneshot::Sender<Result<Decided<V>, ProposeError>>,
+    ) {
+        self.inner.insert(
+            pending.nonce,
+            PendingEntry {
+                value: pending.value,
+                completion: tx,
+            },
+        );
     }
 
-    fn remove(&mut self, nonce: u64) -> Option<oneshot::Sender<Result<Decided<V>, ProposeError>>> {
-        self.inner.remove(&nonce)
+    fn remove_for_decision(
+        &mut self,
+        nonce: u64,
+        value: &V,
+    ) -> Option<oneshot::Sender<Result<Decided<V>, ProposeError>>>
+    where
+        V: PartialEq,
+    {
+        if nonce != 0 {
+            return self.inner.remove(&nonce).map(|entry| entry.completion);
+        }
+
+        // A recovered Raft log entry has the synthetic nonce 0 because durable
+        // storage only persists user values. Match one outstanding live proposal
+        // by value so callers do not hang after leader restart.
+        let matching_nonce = self.inner.iter().find_map(|(candidate_nonce, entry)| {
+            (entry.value == *value).then_some(*candidate_nonce)
+        });
+        matching_nonce.and_then(|candidate_nonce| {
+            self.inner
+                .remove(&candidate_nonce)
+                .map(|entry| entry.completion)
+        })
     }
 
     #[cfg(test)]
@@ -169,8 +205,8 @@ impl<V> PendingMap<V> {
 
 impl<V> Drop for PendingMap<V> {
     fn drop(&mut self) {
-        for (_, tx) in self.inner.drain() {
-            let _ = tx.send(Err(ProposeError::Cancelled));
+        for (_, entry) in self.inner.drain() {
+            let _ = entry.completion.send(Err(ProposeError::Cancelled));
         }
     }
 }
@@ -515,7 +551,7 @@ where
             pending: pending_value,
             completion,
         } = submission;
-        pending.insert(pending_value.nonce, completion);
+        pending.insert(pending_value.clone(), completion);
         let outgoing = self.protocol.propose(pending_value);
         self.protocol
             .flush_persist()
@@ -628,14 +664,23 @@ where
                 value: value.clone(),
             };
 
-            if self.decision_tx.send(public.clone()).await.is_err() {
-                tracing::warn!("decision receiver dropped, decisions will not be delivered");
-            }
-
-            if let Some(tx) = pending.remove(nonce) {
+            if let Some(tx) = pending.remove_for_decision(nonce, &value) {
                 // The receiver may have been dropped (caller no longer cares),
                 // in which case the send simply fails — that's fine.
-                let _ = tx.send(Ok(public));
+                let _ = tx.send(Ok(public.clone()));
+            }
+
+            match self.decision_tx.try_send(public) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        slot,
+                        "decision receiver lagged behind; dropping public decision delivery"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("decision receiver dropped, decisions will not be delivered");
+                }
             }
         }
 
@@ -842,6 +887,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn propose_resolves_when_decision_receiver_is_full() {
+        use crate::config::PaxosConfig;
+
+        let (node, handle, _decision_rx) = Node::<String, DummySender, DummyReceiver>::paxos(
+            "solo",
+            PaxosConfig::default(),
+            vec![],
+            DummyReceiver,
+            PaxosMemoryStorage::new(),
+        );
+        let run_handle = tokio::spawn(node.run());
+
+        for i in 0..=DECISION_CHANNEL_CAPACITY {
+            let decided = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                handle.propose(format!("v-{i}")),
+            )
+            .await
+            .expect("proposal should resolve even when DecisionReceiver is full")
+            .expect("proposal should decide");
+            assert_eq!(decided.slot, i as u64);
+        }
+
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), run_handle).await;
+    }
+
+    #[tokio::test]
     async fn propose_cancelled_on_drop() {
         use crate::config::PaxosConfig;
         // Build a Paxos node with a single peer it can never reach: any
@@ -922,12 +995,51 @@ mod tests {
         let mut pending: PendingMap<String> = PendingMap::new();
         let (tx0, rx0) = oneshot::channel();
         let (tx1, rx1) = oneshot::channel();
-        pending.insert(1, tx0);
-        pending.insert(2, tx1);
+        pending.insert(
+            Pending {
+                nonce: 1,
+                value: "a".to_string(),
+            },
+            tx0,
+        );
+        pending.insert(
+            Pending {
+                nonce: 2,
+                value: "b".to_string(),
+            },
+            tx1,
+        );
         assert_eq!(pending.len(), 2);
         drop(pending);
         assert!(matches!(rx0.await.unwrap(), Err(ProposeError::Cancelled)));
         assert!(matches!(rx1.await.unwrap(), Err(ProposeError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn pending_map_matches_recovered_nonce_by_value() {
+        let mut pending: PendingMap<String> = PendingMap::new();
+        let (tx, rx) = oneshot::channel();
+        pending.insert(
+            Pending {
+                nonce: 42,
+                value: "recovered".to_string(),
+            },
+            tx,
+        );
+
+        let tx = pending
+            .remove_for_decision(0, &"recovered".to_string())
+            .expect("synthetic recovered nonce should match by value");
+        tx.send(Ok(Decided {
+            slot: 7,
+            value: "recovered".to_string(),
+        }))
+        .expect("receiver should still be open");
+
+        let decided = rx.await.unwrap().unwrap();
+        assert_eq!(decided.slot, 7);
+        assert_eq!(decided.value, "recovered");
+        assert_eq!(pending.len(), 0);
     }
 
     #[tokio::test]
