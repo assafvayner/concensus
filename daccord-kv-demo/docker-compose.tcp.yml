@@ -1,0 +1,51 @@
+x-node: &node-base
+  build:
+    context: ..
+    dockerfile: daccord-kv-demo/Dockerfile
+  environment: &node-env
+    TRANSPORT: tcp
+    BIND_ADDR: "0.0.0.0:9000"
+    PEERS: "kv-1=kv-1:9000,kv-2=kv-2:9000,kv-3=kv-3:9000"
+    GRPC_PORT: "50051"
+    DATA_DIR: "/data"
+    RUST_LOG: info
+  healthcheck:
+    test: ["CMD", "daccord-kv-cli", "--addr", "localhost:50051", "health"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+  networks:
+    - kv-net
+
+services:
+  kv-1:
+    <<: *node-base
+    hostname: kv-1
+    ports:
+      - "50051:50051"
+    volumes:
+      - kv-1-data:/data
+  kv-2:
+    <<: *node-base
+    hostname: kv-2
+    ports:
+      - "50052:50051"
+    volumes:
+      - kv-2-data:/data
+  kv-3:
+    <<: *node-base
+    hostname: kv-3
+    ports:
+      - "50053:50051"
+    volumes:
+      - kv-3-data:/data
+
+networks:
+  kv-net:
+    driver: bridge
+
+volumes:
+  kv-1-data:
+  kv-2-data:
+  kv-3-data:
